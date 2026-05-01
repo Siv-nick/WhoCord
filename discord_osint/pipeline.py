@@ -1,6 +1,7 @@
 import re
 import time
 import json
+import shutil
 import os
 import sys
 import datetime
@@ -35,13 +36,12 @@ from .scraping import (
     is_likely_github_user
 )
 from .email_intel import (
-    generate_email_guesses,
     run_holehe, run_h8mail, run_ghunt, run_scylla,
     check_hibp, check_emailrep
 )
 from .username_search import (
     run_naminter, run_sherlock, run_social_analyzer,
-    run_sociopath, run_linkook, run_maigret
+    run_sociopath, run_linkook, run_maigret, run_blackbird
 )
 from .extras import (
     download_avatar, reverse_image_search, extract_metadata,
@@ -94,6 +94,7 @@ def run_osint_pipeline(config=None):
     intel_core = InvestigationCore(target_id)
     avatar_urls = set()
     clean_user = clean_username(username)
+    manual_email = getattr(config, 'MANUAL_EMAIL', '').strip()
 
     if config.ENABLE_CACHING:
         previous = intel_core.load_latest_state()
@@ -218,6 +219,37 @@ def run_osint_pipeline(config=None):
                     if location:
                         intel_core.add_intel("identity_clues", f"location_maigret_{item['site']}", location, source="maigret")
 
+        if config.ENABLE_BLACKBIRD:
+            print(f"\n-- blackbird on: {clean_user} --")
+            bb = run_blackbird(clean_user, mode="username")
+            if bb:
+                print(f"Blackbird found {len(bb)} profiles.")
+                existing = {d["url"] for d in discovery}
+                for r in bb:
+                    if r.get("url", "") not in existing:
+                        discovery.append(r)
+                        existing.add(r["url"])
+
+        if manual_email and is_valid_email(manual_email):
+            print(f"\n-- blackbird email search on: {manual_email} --")
+            bb_email = run_blackbird(manual_email, mode="email")
+            if bb_email:
+                existing = {d["url"] for d in discovery}
+                for r in bb_email:
+                    if r.get("url", "") not in existing:
+                        discovery.append(r)
+                        existing.add(r["url"])
+            intel_core.add_intel("emails", manual_email, manual_email, source="manual_input")
+
+        bb_output_dir = os.path.join(CACHE_DIR, "blackbird_output")
+        os.makedirs(bb_output_dir, exist_ok=True)
+        for fname in os.listdir(config.BLACKBIRD_DIR):
+            if fname.endswith("_blackbird.json"):
+                src = os.path.join(config.BLACKBIRD_DIR, fname)
+                dst = os.path.join(bb_output_dir, fname)
+                shutil.copy2(src, dst)
+                intel_core.add_intel("raw_tool_output", f"blackbird_{fname}", dst, source="blackbird")
+
         if mode == "discord":
             print("\n-- Searching messages for links (across all visible guilds) --")
             messages = multi_guild_message_search(config.DISCORD_TOKEN, target_user_id, target_guild_id)
@@ -243,19 +275,17 @@ def run_osint_pipeline(config=None):
         all_urls = list(set([e["url"] for e in discovery] + list(target_urls)))
         if config.ENABLE_SOCIALSCAN and tool_available("socialscan"):
             all_urls = socialscan_filter(all_urls)
+            socialscan_dir = os.path.join(CACHE_DIR, "socialscan_tmp")
+            if os.path.isdir(socialscan_dir):
+                scan_output_dir = os.path.join(CACHE_DIR, "socialscan_output")
+                os.makedirs(scan_output_dir, exist_ok=True)
+                for sf in os.listdir(socialscan_dir):
+                    if sf.startswith("scan_") and sf.endswith(".json"):
+                        src = os.path.join(socialscan_dir, sf)
+                        dst = os.path.join(scan_output_dir, sf)
+                        shutil.copy2(src, dst)
+                        intel_core.add_intel("raw_tool_output", f"socialscan_{sf}", dst, source="socialscan")
         scrape_tasks = []; generic_urls = []; seen = set()
-        for url in all_urls:
-            intel_core.add_intel("social_profiles",f"discovery_{url}", url, source="discovery")
-            pl, sl = classify_url(url)
-            if pl and sl:
-                if sl not in seen:
-                    scrape_tasks.append((pl, sl))
-                    seen.add(sl)
-            else:
-                if is_likely_profile_url_v2(url):
-                    generic_urls.append(url)
-
-        intel_core.intel["scraped_urls"] = all_urls
 
         print(f"\nEnriching {len(scrape_tasks)} known & {len(generic_urls)} generic profiles...")
         scraped = []
@@ -318,6 +348,21 @@ def run_osint_pipeline(config=None):
             if info.get("avatar"):
                 avatar_urls.add(info["avatar"])
 
+        extra_targets = getattr(config, 'EXTRA_TARGETS', [])
+        for t in extra_targets:
+            if is_valid_email(t):
+                print(f"\n-- blackbird email search on: {t} --")
+                bb = run_blackbird(t, mode="email")
+            else:
+                print(f"\n-- blackbird username search on: {t} --")
+                bb = run_blackbird(t, mode="username")
+            existing = {d["url"] for d in discovery}
+            for r in bb:
+                if r.get("url", "") not in existing:
+                    discovery.append(r)
+                    existing.add(r.get("url", ""))
+            if is_valid_email(t):
+                intel_core.add_intel("emails", t, t, source="manual_input")
         # ================================================================
         #             MID‑PIPELINE: all post‑scraping analysis
         # ================================================================
@@ -397,14 +442,6 @@ def run_osint_pipeline(config=None):
                                      source="nametrace")
 
         print("\n-- Email intelligence --")
-        discovered_names = list(name_set)
-        if len(discovered_names) >= 2:
-            first, last = discovered_names[0].split()[0], discovered_names[0].split()[-1]
-            domains = ["gmail.com","yahoo.com","outlook.com","hotmail.com","protonmail.com"]
-            guesses = generate_email_guesses(first, last, domains)
-            for guess in guesses:
-                intel_core.add_intel("emails", f"guess_{guess}", guess,
-                                     source="email_guesser")
 
         all_emails = set()
         for k, v in intel_core.intel.get("emails", {}).items():
