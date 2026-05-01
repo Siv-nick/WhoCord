@@ -4,13 +4,16 @@ import io
 import json
 import glob
 import time
+import tempfile
+import shutil
 import subprocess as _sp
 import warnings
 import concurrent.futures
 import re
+from datetime import datetime
 from importlib import import_module
 from . import utils
-from .utils import resilient_task, tool_available, clean_username
+from .utils import resilient_task, tool_available, clean_username, CACHE_DIR
 from .config import ENABLE_NAMINTER, ENABLE_SHERLOCK, ENABLE_SOCIAL_ANALYZER, ENABLE_LINKOOK, ENABLE_SOCIOPATH, ENABLE_MAIGRET
 from .scraping import is_likely_profile_url_v2
 
@@ -190,4 +193,110 @@ def run_maigret(username):
                 "bio": info.get("bio", ""),
                 "location": info.get("location", "")
             })
+    return results
+
+@resilient_task(max_retries=1)
+def run_blackbird(target, mode="username"):
+    """
+    Run Blackbird on a username or email.
+    Blackbird must be cloned into ./blackbird/.
+    Returns a list of dicts: [{"site": ..., "url": ...}].
+    
+    Blackbird's --json flag is a boolean (no filename argument).
+    Results are saved to: blackbird/results/<target>_<date>_blackbird/<target>_<date>_blackbird.json
+    """
+    from .config import ENABLE_BLACKBIRD, BLACKBIRD_DIR
+    if not ENABLE_BLACKBIRD:
+        return []
+    blackbird_py = os.path.join(BLACKBIRD_DIR, "blackbird.py")
+    if not os.path.isfile(blackbird_py):
+        print(f"  [!] Blackbird not found at {blackbird_py}. Skipping.")
+        print(f"  Clone it: git clone https://github.com/p1ngul1n0/blackbird")
+        return []
+
+    if mode == "username":
+        wmn_data = os.path.join(BLACKBIRD_DIR, "data", "wmn-data.json")
+        if not os.path.isfile(wmn_data):
+            print(f"  [!] Blackbird username data file not found: {wmn_data}")
+            print(f"  Ensure Git LFS is installed and run: cd {BLACKBIRD_DIR} && git lfs pull")
+            return []
+
+    # Record time BEFORE running so we can find files created after this
+    t0 = time.time()
+
+    if mode == "email":
+        cmd = [sys.executable, blackbird_py, "--email", target, "--json",
+               "--no-update", "--no-nsfw", "--timeout", "15"]
+    else:
+        cmd = [sys.executable, blackbird_py, "--username", target, "--json",
+               "--no-update", "--no-nsfw", "--timeout", "15"]
+
+    # Run from the Blackbird directory so it finds its data files
+    _, stdout, _ = utils.debug_subprocess(cmd, timeout=600, cwd=BLACKBIRD_DIR)
+
+    # Give the filesystem a moment to finish writing
+    time.sleep(1)
+
+    # Blackbird saves JSON to: blackbird/results/<target>_<date>_blackbird/<target>_<date>_blackbird.json
+    results_dir = os.path.join(BLACKBIRD_DIR, "results")
+    
+    # Find the most recently created JSON file matching our target
+    best_path = None
+    best_mtime = 0
+    if os.path.isdir(results_dir):
+        for dirpath, dirnames, filenames in os.walk(results_dir):
+            for fname in filenames:
+                if fname.endswith("_blackbird.json"):
+                    fpath = os.path.join(dirpath, fname)
+                    try:
+                        mtime = os.path.getmtime(fpath)
+                        if mtime >= t0 and mtime > best_mtime:
+                            best_mtime = mtime
+                            best_path = fpath
+                    except OSError:
+                        continue
+
+    # Fallback: also check the Blackbird root directory for standalone JSON files
+    if not best_path:
+        for fname in os.listdir(BLACKBIRD_DIR):
+            if fname.endswith("_blackbird.json"):
+                fpath = os.path.join(BLACKBIRD_DIR, fname)
+                try:
+                    mtime = os.path.getmtime(fpath)
+                    if mtime >= t0 and mtime > best_mtime:
+                        best_mtime = mtime
+                        best_path = fpath
+                except OSError:
+                    continue
+
+    if not best_path:
+        return []
+
+    try:
+        with open(best_path, 'r') as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"  Blackbird JSON read error: {e}")
+        return []
+
+    results = []
+    if isinstance(data, list):
+        for entry in data:
+            url = entry.get("url", "")
+            if url and url.startswith("http"):
+                results.append({
+                    "site": entry.get("name", entry.get("site", "unknown")),
+                    "url": url
+                })
+    elif isinstance(data, dict):
+        for key, val in data.items():
+            if isinstance(val, list):
+                for entry in val:
+                    if isinstance(entry, dict):
+                        url = entry.get("url", "")
+                        if url and url.startswith("http"):
+                            results.append({
+                                "site": entry.get("name", entry.get("site", key)),
+                                "url": url
+                            })
     return results
