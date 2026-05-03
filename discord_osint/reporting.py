@@ -161,7 +161,6 @@ def format_ai_report_markdown(report_dict):
     add_section("Identity Assessment", report_dict.get("identity_assessment",""))
     add_section("Digital Footprint", report_dict.get("digital_footprint",""))
     add_section("Risk Indicators", report_dict.get("risk_indicators",""))
-    add_section("Recommended Next Steps", report_dict.get("next_steps",""))
     return "\n".join(md)
 
 # -------------------------------------------------------------------
@@ -344,23 +343,25 @@ def _create_default_template(path):
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-    background: #0f0f1a; color: #e0e0f0;
+    background: #0a0a0a; color: #e0e0e0;
     padding: 2rem;
   }
   .container { max-width: 1200px; margin: 0 auto; }
-  h1 { color: #6c63ff; margin-bottom: 1rem; }
-  .meta { color: #aaa; font-size: 0.9rem; margin-bottom: 2rem; }
+  .header { display: flex; align-items: center; gap: 1rem; margin-bottom: 2rem; }
+  .header img { height: 50px; }
+  .header h1 { color: #ffffff; margin: 0; font-size: 2rem; }
+  .meta { color: #999; font-size: 0.9rem; margin-bottom: 2rem; }
   section {
-    background: #1a1a2e; border-radius: 12px;
+    background: #1a1a1a; border-radius: 12px;
     padding: 1.5rem; margin-bottom: 1.5rem;
-    border: 1px solid #2a2a4a;
+    border: 1px solid #2a2a2a;
   }
-  h2 { color: #6c63ff; margin-bottom: 1rem; font-size: 1.4rem; }
+  h2 { color: #ffffff; margin-bottom: 1rem; font-size: 1.4rem; }
   table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #2a2a4a; }
+  th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #2a2a2a; }
   th { color: #aaa; font-weight: 600; }
-  a { color: #6c63ff; text-decoration: none; }
-  a:hover { text-decoration: underline; }
+  a { color: #999; text-decoration: none; }
+  a:hover { color: #fff; text-decoration: underline; }
   .badge {
     display: inline-block; padding: 0.2rem 0.6rem;
     border-radius: 4px; font-size: 0.8rem; margin-right: 0.5rem;
@@ -371,24 +372,28 @@ def _create_default_template(path):
   ul { list-style: none; padding-left: 0; }
   li { margin-bottom: 0.5rem; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 1rem; }
-  .card { background: #12121d; border-radius: 8px; padding: 1rem; border: 1px solid #2a2a4a; overflow-wrap: break-word; word-break: break-all; }
-  .card h3 { margin-bottom: 0.5rem; color: #6c63ff; }
+  .card { background: #121212; border-radius: 8px; padding: 1rem; border: 1px solid #2a2a2a; overflow-wrap: break-word; word-break: break-all; }
+  .card h3 { margin-bottom: 0.5rem; color: #ffffff; }
   .footer { text-align: center; margin-top: 2rem; color: #555; }
-  .timeline-item { margin-bottom: 0.5rem; padding-left: 1rem; border-left: 2px solid #6c63ff; }
-  pre { white-space: pre-wrap; font-size: 0.8rem; }
+  .timeline-item { margin-bottom: 0.5rem; padding-left: 1rem; border-left: 2px solid #555; }
+  pre { white-space: pre-wrap; font-size: 0.8rem; background: #0e0e0e; padding: 0.5rem; border-radius: 4px; }
   details summary { cursor: pointer; color: #aaa; margin-top: 0.5rem; }
-  details pre { margin-top: 0.5rem; background: #0f0f1a; padding: 0.5rem; border-radius: 4px; }
+  details pre { margin-top: 0.5rem; background: #0e0e0e; padding: 0.5rem; border-radius: 4px; }
   img.avatar-thumb { max-width: 64px; max-height: 64px; border-radius: 4px; margin-top: 4px; display: block; }
 </style>
 </head>
 <body>
 <div class="container">
-  <h1>🕵️‍♂️ OSINT Investigation Report</h1>
+  <div class="header">
+    <img src="/static/images/logo.png" alt="WhoCord" style="height:50px;">
+    <h1>OSINT Investigation Report</h1>
+  </div>
   <div class="meta">
     <strong>Target ID:</strong> {{ target_id }}<br>
     <strong>Generated:</strong> {{ timestamp }}
   </div>
 
+  <!-- all sections remain exactly the same as before -->
   {% if discord_info and (discord_info.username or discord_info.account_created or discord_info.bio or discord_info.avatar_cdn) %}
   <section>
     <h2>📱 Discord Identity</h2>
