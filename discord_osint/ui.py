@@ -1,4 +1,5 @@
 import sys
+import logging
 from .config import Config, SENSITIVE_KEYS
 from .tools_config import TOOLS_LIST
 
@@ -29,6 +30,10 @@ def toggle_debug(config):
     config.DEBUG = not current
     print(f"Debug mode {'enabled' if not current else 'disabled'}.")
     config.save()
+
+    # Immediately change the log level so --debug and menu toggle behave identically
+    level = logging.DEBUG if config.DEBUG else logging.INFO
+    logging.getLogger().setLevel(level)
 
 def toggle_tools(config):
     while True:
