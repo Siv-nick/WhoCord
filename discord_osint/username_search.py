@@ -100,10 +100,10 @@ def run_social_analyzer(raw_username):
 def run_sociopath(seed_url, recursive=0):
     if not ENABLE_SOCIOPATH:
         return []
-    if not tool_available("sociopath"):
-        return []
-    cmd = ["sociopath", seed_url, "--json", "-r", str(recursive)]
+    # Use the current Python to run sociopath as a module – ensures venv is used
+    cmd = [sys.executable, "-m", "sociopath", seed_url, "--json", "-r", str(recursive)]
     _, stdout, _ = utils.debug_subprocess(cmd, timeout=60)
+    # ... rest of function stays identical
     if stdout is None:
         return []
 
@@ -214,11 +214,21 @@ def run_blackbird(target, mode="username"):
         print(f"  Clone it: git clone https://github.com/p1ngul1n0/blackbird")
         return []
 
-    if mode == "username":
-        wmn_data = os.path.join(BLACKBIRD_DIR, "data", "wmn-data.json")
-        if not os.path.isfile(wmn_data):
-            print(f"  [!] Blackbird username data file not found: {wmn_data}")
-            print(f"  Ensure Git LFS is installed and run: cd {BLACKBIRD_DIR} && git lfs pull")
+    # --- Blackbird data file: auto-download if missing ---
+    wmn_data = os.path.join(BLACKBIRD_DIR, "data", "wmn-data.json")
+    if not os.path.isfile(wmn_data):
+        print("  Blackbird data file not found – downloading (one‑time, ~1 MB) …")
+        try:
+            import urllib.request
+            os.makedirs(os.path.dirname(wmn_data), exist_ok=True)
+            urllib.request.urlretrieve(
+                "https://raw.githubusercontent.com/WebBreacher/WhatsMyName/main/wmn-data.json",
+                wmn_data
+            )
+            print("  Done – data file downloaded successfully.")
+        except Exception as e:
+            print(f"  Auto‑download failed: {e}")
+            print(f"  Please manually place wmn-data.json into: {os.path.dirname(wmn_data)}")
             return []
 
     # Record time BEFORE running so we can find files created after this
