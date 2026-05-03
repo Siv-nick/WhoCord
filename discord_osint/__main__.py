@@ -16,6 +16,8 @@ clear_pycache()
 
 def main():
     parser = argparse.ArgumentParser(description='Universal OSINT Pipeline')
+    parser.add_argument('--version', action='version',
+                        version='WhoCord 1.0.2')
     parser.add_argument('--mode', choices=['discord','manual'], help='operational mode')
     parser.add_argument('--target', help='manual username or discord user ID')
     parser.add_argument('--token', help='Discord user token')
@@ -44,6 +46,9 @@ def main():
     config.OUTPUT_FORMAT = args.output
     if args.debug:
         config.DEBUG = True
+
+    from .logger import setup_logging
+    setup_logging(config.DEBUG)
 
     if args.interactive or (len(sys.argv) == 1 and not args.mode):
         while True:
