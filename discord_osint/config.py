@@ -1,8 +1,9 @@
 import json
 import os
 import keyring
+from .utils import get_base_dir, get_data_dir
 
-CONFIG_FILE = "config.json"
+CONFIG_FILE = os.path.join(get_base_dir(), "config.json")
 
 DEFAULT_CONFIG = {
     "DISCORD_TOKEN":          "",
@@ -48,7 +49,8 @@ DEFAULT_CONFIG = {
     "MANUAL_EMAIL":           "",
     "EXTRA_TARGETS":          [],
     "ENABLE_BLACKBIRD":       True,
-    "BLACKBIRD_DIR":          os.path.join(os.path.dirname(__file__), "..", "blackbird"),
+    "ENABLE_EMAIL_VERIFY":    False,
+    "BLACKBIRD_DIR": os.path.join(get_data_dir(), "blackbird"),
 }
 
 SENSITIVE_KEYS = {
@@ -101,7 +103,8 @@ SMTP_CHECK          = False
 MANUAL_EMAIL        = ""
 EXTRA_TARGETS       = []
 ENABLE_BLACKBIRD    = True
-BLACKBIRD_DIR = os.path.join(os.path.dirname(__file__), "..", "blackbird")
+ENABLE_EMAIL_VERIFY = False
+BLACKBIRD_DIR = os.path.join(get_data_dir(), "blackbird")
 
 MODE                = "discord"
 TARGET_USER_ID      = None
@@ -118,7 +121,7 @@ def _sync_globals_from_dict(data):
     global ENABLE_AI_REPORT, ENABLE_MAIGRET, ENABLE_REVERSE_IMG, ENABLE_SOCIALSCAN, ENABLE_EXIF
     global ENABLE_WHOIS, ENABLE_WAYBACK, ENABLE_HIBP, ENABLE_EMAILREP, ENABLE_SCYLLA
     global ENABLE_LOCATION, ENABLE_LANGDETECT, ENABLE_PARALLEL_EMAIL, ENABLE_CACHING, SMTP_CHECK
-    global MANUAL_EMAIL, EXTRA_TARGETS, ENABLE_BLACKBIRD, BLACKBIRD_DIR
+    global MANUAL_EMAIL, EXTRA_TARGETS, ENABLE_BLACKBIRD, ENABLE_EMAIL_VERIFY, BLACKBIRD_DIR
 
     mapping = {
         "DISCORD_TOKEN": "USER_TOKEN",
@@ -163,6 +166,7 @@ def _sync_globals_from_dict(data):
         "MANUAL_EMAIL":     "MANUAL_EMAIL",
         "EXTRA_TARGETS":    "EXTRA_TARGETS",
         "ENABLE_BLACKBIRD": "ENABLE_BLACKBIRD",
+        "ENABLE_EMAIL_VERIFY": "ENABLE_EMAIL_VERIFY",
         "BLACKBIRD_DIR":    "BLACKBIRD_DIR",
     }
     for key, val in data.items():
@@ -232,7 +236,6 @@ class Config:
         raise AttributeError(f"Config has no attribute '{name}'")
 
     def __setattr__(self, name, value):
-        # allowed investigation keys
         allowed = ("MODE", "TARGET_USER_ID", "TARGET_GUILD_ID", "MANUAL_USERNAME",
                    "MANUAL_EMAIL", "OUTPUT_FORMAT")
         if name.startswith("_") or name in allowed:
