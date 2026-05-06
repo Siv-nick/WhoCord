@@ -1,16 +1,20 @@
 import subprocess
+import queue
+import threading
 import os
 import glob
 import json
 import time
+import sys
 import shutil
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context, url_for
 from werkzeug.utils import secure_filename
+from discord_osint.utils import get_base_dir
 
 current_process = None
 app = Flask(__name__)
-CACHE_DIR = "./investigation_cache"
-CONFIG_FILE = "config.json"
+CACHE_DIR = os.path.join(get_base_dir(), "investigation_cache")
+CONFIG_FILE = os.path.join(get_base_dir(), "config.json")
 REPORT_HTML = None
 
 # -------------------------------------------------------------------
@@ -65,6 +69,177 @@ def set_token(key, value):
             except:
                 pass
 
+def toggle_tool(key, enable):
+    cfg = load_config()
+    cfg[key] = enable
+    save_config(cfg)
+
+# -------------------------------------------------------------------
+# Routes
+# -------------------------------------------------------------------
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+@app.route("/config", methods=["POST"])
+def config():
+    data = request.get_json()
+    if not data:
+        return jsonify({"success": False, "error": "no data"})
+    action = data.get("action")
+    if action == "set_token":
+        key = data.get("key")
+        value = data.get("value", "")
+        if key in ("DISCORD_TOKEN", "GITHUB_TOKEN", "GROQ_API_KEY", "INSTAGRAM_SESSION"):
+            set_token(key, value)
+            return jsonify({"success": True})
+        else:
+            return jsonify({"success": False, "error": "invalid key"})
+    elif action == "toggle_tool":
+        key = data.get("key")
+        enable = data.get("enable", True)
+        try:
+            toggle_tool(key, enable)
+            return jsonify({"success": True})
+        except Exception:
+            import logging
+            logging.getLogger(__name__).error("Tool toggle failed", exc_info=True)
+            return jsonify({"success": False, "error": "Internal error"})
+    elif action == "set_mode":
+        mode = data.get("mode")
+        if mode in ("discord", "manual"):
+            cfg = load_config()
+            cfg["MODE"] = mode
+            save_config(cfg)
+            return jsonify({"success": True})
+        else:
+            return jsonify({"success": False, "error": "invalid mode"})
+    elif action == "set_multi_guild":
+        multi = data.get("multi", False)
+        cfg = load_config()
+        cfg["MULTI_GUILD_SEARCH"] = multi
+        save_config(cfg)
+        return jsonify({"success": True})
+    return jsonify({"success": False, "error": "unknown action"})
+
+@app.route("/get_config")
+def get_config():
+    return jsonify(get_current_config())
+
+@app.route("/run", methods=["GET"])
+def run():
+    target = request.args.get("username", "").strip()
+    email = request.args.get("email", "").strip()
+    mode = request.args.get("mode", "manual").strip()
+
+    # --- Sanitise inputs (prevent command injection) ---
+    import re
+    target = re.sub(r'[^a-zA-Z0-9._@+\-]', '', target)
+    email = re.sub(r'[^a-zA-Z0-9._@+\-]', '', email)
+    mode = 'manual' if mode not in ('discord', 'manual') else mode
+
+    if mode == "discord":
+        user_id = request.args.get("user_id", "").strip()
+        guild_id = request.args.get("guild_id", "").strip()
+        if not user_id:
+            return "User ID required for Discord mode.", 400
+        cmd = [sys.executable, "--mode", "discord", "--target", user_id, "--output", "html", "--debug"]
+        if guild_id:
+            cmd.extend(["--guild", guild_id])
+    else:
+        cmd = [sys.executable, "--mode", "manual", "--target", target, "--output", "html", "--debug"]
+
+    # Set email on config directly so pipeline can use it
+    from discord_osint.config import config as app_config
+    if email:
+        app_config.MANUAL_EMAIL = email
+    else:
+        app_config.MANUAL_EMAIL = ""
+
+    env = os.environ.copy()
+    # Still pass via env for legacy support (pipeline also uses config)
+    if email:
+        env["MANUAL_EMAIL"] = email
+    env['PYTHONUNBUFFERED'] = '1'         # force unbuffered output
+    env['WHOCORD_PIPELINE'] = '1' 
+
+    def generate():
+        global REPORT_HTML, current_process
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            env=env, bufsize=1, cwd=os.getcwd()
+        )
+        current_process = process
+        for line in iter(process.stdout.readline, ''):
+            yield f"data: {line}\n\n"
+        process.stdout.close()
+        process.wait()
+        current_process = None
+
+        html_files = sorted(
+            glob.glob(os.path.join(CACHE_DIR, "report_*.html")),
+            key=os.path.getmtime, reverse=True
+        )
+        if html_files:
+            REPORT_HTML = html_files[0]
+            yield "event: done\ndata: /report\n\n"
+        else:
+            yield "event: error\ndata: No report generated\n\n"
+
+    return Response(stream_with_context(generate()), mimetype='text/event-stream')
+
+@app.route("/report")
+def report():
+    global REPORT_HTML
+    if REPORT_HTML and os.path.exists(REPORT_HTML):
+        with open(REPORT_HTML) as f:
+            return f.read()
+    return "No report available.", 404
+
+@app.route("/stop", methods=["POST"])
+def stop():
+    global current_process
+    if current_process and current_process.poll() is None:
+        current_process.kill()
+        current_process.wait()
+        current_process = None
+        return jsonify({"success": True})
+    return jsonify({"success": False, "error": "No running investigation"})
+
+from discord_osint.utils import upgrade_tools
+
+@app.route("/upgrade_tools", methods=["POST"])
+def upgrade_route():
+    def generate():
+        q = queue.Queue()
+        def callback(msg):
+            q.put(msg)
+        def run_upgrade():
+            try:
+                upgrade_tools(interactive=False, log_callback=callback)
+            except Exception as e:
+                q.put(f"Error: {str(e)}")
+            q.put(None)  # signal done
+        threading.Thread(target=run_upgrade).start()
+        while True:
+            msg = q.get()
+            if msg is None:
+                yield "event: done\ndata: Upgrade completed.\n\n"
+                break
+            yield f"data: {msg}\n\n"
+    return Response(stream_with_context(generate()), mimetype='text/event-stream')
+
+import os
+
+@app.route("/shutdown", methods=["POST"])
+def shutdown():
+    """Terminate the Flask server and the whole app."""
+    os._exit(0)
+
+if __name__ == "__main__":
+    import sys
+    sys.path.insert(0, os.getcwd())
+    app.run(debug=False, host="127.0.0.1", port=5000)
 def toggle_tool(key, enable):
     cfg = load_config()
     cfg[key] = enable
