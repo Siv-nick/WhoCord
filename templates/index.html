@@ -97,7 +97,8 @@ button.danger { background: var(--danger); }
   <a onclick="switchTab('config')">⚙️ Configuration</a>
   <a onclick="switchTab('logs')">📜 Live Logs</a>
   <a onclick="switchTab('report')">📊 Report</a>
-  <div style="margin-top:auto; font-size:0.8rem; opacity:0.7;">WhoCord v1.0.2</div>
+  <a onclick="shutdownServer()" style="color: var(--danger); cursor: pointer; margin-bottom: 0.5rem;">⏻ Shut Down</a>
+  <div style="margin-top:auto; font-size:0.8rem; opacity:0.7;">WhoCord v1.0.3</div>
 </nav>
 
 <main>
@@ -154,6 +155,7 @@ button.danger { background: var(--danger); }
     <div class="card">
       <h2>Tool Toggles</h2>
       <div id="tools-list" class="tool-grid"></div>
+      <button id="upgrade-tools-btn" style="margin-top:1rem;">⬆ Upgrade All Tools</button>
     </div>
   </div>
 
@@ -325,267 +327,60 @@ document.getElementById('stop-button').addEventListener('click', async function(
   document.getElementById('log-container').innerHTML += '\nInvestigation stopped by user.\n';
   document.getElementById('stop-button').style.display = 'none';
 });
-</script>
-</body>
-</html>  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-  gap: 0.8rem;
-}
-.tool-item {
-  display: flex; justify-content: space-between; align-items: center;
-  background: var(--bg); padding: 0.6rem 0.9rem;
-  border-radius: var(--radius); border: 1px solid var(--border);
-}
-.tool-item label { margin: 0; font-size: 0.9rem; }
-.hidden { display: none; }
-
-#log-container {
-  height: 60vh; overflow-y: auto; background: #12121d;
-  padding: 1rem; font-family: monospace; font-size: 0.85rem;
-  border-radius: var(--radius); border: 1px solid var(--border);
-  white-space: pre-wrap;
-}
-#report-frame {
-  width: 100%; height: 70vh; border: none;
-  background: white; border-radius: var(--radius);
-}
-.badge {
-  padding: 0.2rem 0.6rem; border-radius: 4px; font-size: 0.75rem;
-  background: var(--success); color: #000; margin-left: 0.5rem;
-}
-.badge.off { background: var(--danger); }
-</style>
-</head>
-<body>
-<nav>
-  <a class="active" onclick="switchTab('investigate')">🔍 Investigate</a>
-  <a onclick="switchTab('config')">⚙️ Configuration</a>
-  <a onclick="switchTab('logs')">📜 Live Logs</a>
-  <a onclick="switchTab('report')">📊 Report</a>
-  <div style="margin-top:auto; font-size:0.8rem; opacity:0.7;">WhoCord v1.0.2</div>
-</nav>
-
-<main>
-  <!-- Investigation Tab -->
-  <div id="tab-investigate" class="tab-content active">
-    <div class="card">
-      <h2>New Investigation</h2>
-      <form id="investigate-form">
-        <label>Mode:</label>
-        <select name="mode" id="mode-select">
-          <option value="manual">Manual (username)</option>
-          <option value="discord">Discord (user ID)</option>
-        </select>
-        <div id="manual-fields">
-          <label>Username:</label>
-          <input type="text" name="username" placeholder="target">
-          <label>Email (optional):</label>
-          <input type="email" name="email" placeholder="email@example.com">
-        </div>
-        <div id="discord-fields" class="hidden">
-          <label>Target User ID:</label>
-          <input type="text" name="user_id" placeholder="User ID">
-          <label>Guild ID:</label>
-          <input type="text" name="guild_id" placeholder="Guild ID (optional)">
-          <label>
-            <input type="checkbox" name="multi_guild"> Search all guilds
-          </label>
-        </div>
-        <button type="submit">Start Investigation</button>
-        <button type="button" id="stop-button" style="background:var(--danger); display:none;">⏹️ Stop Investigation</button>
-      </form>
-    </div>
-  </div>
-
-  <!-- Configuration Tab -->
-  <div id="tab-config" class="tab-content">
-    <div class="card">
-      <h2>Tokens / API Keys</h2>
-      <form id="token-form">
-        <label>Discord Token <span id="disc-token-status" class="badge off">not set</span></label>
-        <input type="password" name="DISCORD_TOKEN" placeholder="Enter token">
-        <label>GitHub Token <span id="gh-token-status" class="badge off">not set</span></label>
-        <input type="password" name="GITHUB_TOKEN" placeholder="Enter token">
-        <label>Groq API Key <span id="groq-token-status" class="badge off">not set</span></label>
-        <input type="password" name="GROQ_API_KEY" placeholder="Enter key">
-        <label>Instagram Session <span id="insta-token-status" class="badge off">not set</span></label>
-        <input type="password" name="INSTAGRAM_SESSION" placeholder="Enter session">
-        <button type="submit">Save Tokens</button>
-      </form>
-    </div>
-    <div class="card">
-      <h2>Tool Toggles</h2>
-      <div id="tools-list" class="tool-grid"></div>
-    </div>
-  </div>
-
-  <!-- Live Logs Tab -->
-  <div id="tab-logs" class="tab-content">
-    <div class="card">
-      <h2>Live Progress</h2>
-      <div id="log-container"></div>
-    </div>
-  </div>
-
-  <!-- Report Tab -->
-  <div id="tab-report" class="tab-content">
-    <div class="card">
-      <h2>Report</h2>
-      <iframe id="report-frame" srcdoc="<p style='color:white;text-align:center;margin-top:2em;'>Run an investigation first.</p>"></iframe>
-    </div>
-  </div>
-</main>
-
-<script>
-// --- Global var for active SSE ---
-let eventSource = null;
-
-// --- Tab switching ---
-function switchTab(name) {
-  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-  document.getElementById('tab-'+name).classList.add('active');
-  document.querySelectorAll('nav a').forEach(a => a.classList.remove('active'));
-  event.target.classList.add('active');
-}
-
-// --- Show/hide Discord fields ---
-document.getElementById('mode-select').addEventListener('change', function(e) {
-  if (e.target.value === 'discord') {
-    document.getElementById('manual-fields').classList.add('hidden');
-    document.getElementById('discord-fields').classList.remove('hidden');
-  } else {
-    document.getElementById('manual-fields').classList.remove('hidden');
-    document.getElementById('discord-fields').classList.add('hidden');
-  }
-});
-
-// --- Load current config & set token badges / tool toggles ---
-async function loadConfig() {
-  const res = await fetch('/get_config');
-  const cfg = await res.json();
-  const statusMap = {
-    'DISCORD_TOKEN': 'disc-token-status',
-    'GITHUB_TOKEN': 'gh-token-status',
-    'GROQ_API_KEY': 'groq-token-status',
-    'INSTAGRAM_SESSION': 'insta-token-status'
-  };
-  for (const [key, badgeId] of Object.entries(statusMap)) {
-    const badge = document.getElementById(badgeId);
-    if (badge) {
-      if (cfg.tokens[key]) {
-        badge.textContent = 'set';
-        badge.classList.remove('off');
-      } else {
-        badge.textContent = 'not set';
-        badge.classList.add('off');
-      }
-    }
-  }
-  // Populate tool toggles
-  const toolsDiv = document.getElementById('tools-list');
-  toolsDiv.innerHTML = '';
-  cfg.tools.forEach(tool => {
-    const div = document.createElement('div');
-    div.className = 'tool-item';
-    const label = document.createElement('label');
-    label.textContent = tool.desc;
-    const checkbox = document.createElement('input');
-    checkbox.type = 'checkbox';
-    checkbox.checked = tool.enabled;
-    checkbox.dataset.key = tool.key;
-    checkbox.addEventListener('change', function(e) {
-      toggleTool(tool.key, e.target.checked);
-    });
-    div.appendChild(label);
-    div.appendChild(checkbox);
-    toolsDiv.appendChild(div);
-  });
-}
-
-function toggleTool(key, enable) {
-  fetch('/config', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'toggle_tool', key, enable})
-  });
-}
-
-// Call config load on page load
-window.addEventListener('DOMContentLoaded', loadConfig);
-
-// --- Token form (live update, no reload) ---
-document.getElementById('token-form').addEventListener('submit', async function(e) {
-  e.preventDefault();
-  const formData = new FormData(e.target);
-  let anySent = false;
-  for (let [key, value] of formData.entries()) {
-    if (value) {
-      await fetch('/config', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({action: 'set_token', key, value})
-      });
-      anySent = true;
-    }
-  }
-  if (anySent) {
-    // Refresh token status badges without reload
-    await loadConfig();
-    // Clear password fields for safety
-    e.target.reset();
-    alert('Tokens saved!');
-  }
-});
-
-// --- Start investigation (SSE) ---
-document.getElementById('investigate-form').addEventListener('submit', function(e) {
-  e.preventDefault();
-  const formData = new FormData(e.target);
-  const logContainer = document.getElementById('log-container');
-  logContainer.innerHTML = '';
-
+// Upgrade tools button – stream output into the Live Logs tab
+document.getElementById('upgrade-tools-btn').addEventListener('click', function() {
   // Switch to logs tab
   document.querySelectorAll('nav a')[2].click();
+  const logContainer = document.getElementById('log-container');
+  logContainer.innerHTML = '';
+  document.getElementById('stop-button').style.display = 'none'; // stop is only for investigations
 
-  // Show stop button
-  document.getElementById('stop-button').style.display = 'inline-block';
+  fetch('/upgrade_tools', { method: 'POST' })
+    .then(response => {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      function read() {
+        reader.read().then(({ done, value }) => {
+          if (done) {
+            logContainer.innerHTML += '\nUpgrade finished.\n';
+            logContainer.scrollTop = logContainer.scrollHeight;
+            return;
+          }
+          const chunk = decoder.decode(value, { stream: true });
+          // Process SSE lines (each "data: ...\n\n")
+          chunk.split('\n').forEach(line => {
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6);
+              if (data) {
+                logContainer.innerHTML += data + '\n';
+                logContainer.scrollTop = logContainer.scrollHeight;
+              }
+            }
+          });
+          read();
+        });
+      }
+      read();
+    })
+    .catch(err => {
+      logContainer.innerHTML += 'ERROR: ' + err + '\n';
+    });
+});
 
-  eventSource = new EventSource('/run?' + new URLSearchParams(formData));
-  eventSource.onmessage = function(event) {
-    logContainer.innerHTML += event.data + '\n';
-    logContainer.scrollTop = logContainer.scrollHeight;
-  };
-  eventSource.addEventListener('done', function(event) {
-    const reportUrl = event.data;
-    // Fetch the report content and inject into iframe
-    fetch(reportUrl)
-      .then(res => res.text())
-      .then(html => {
-        document.getElementById('report-frame').srcdoc = html;
-        // Switch to report tab
-        document.querySelectorAll('nav a')[3].click();
+function shutdownServer() {
+  if (confirm('Shut down WhoCord server?')) {
+    fetch('/shutdown', { method: 'POST' })
+      .then(() => {
+        // Give the server a tiny moment to actually shut down, then close the tab
+        setTimeout(() => window.close(), 400);
+      })
+      .catch(() => {
+        // Even if the request fails, still close the tab
+        window.close();
       });
-    eventSource.close();
-    eventSource = null;
-    document.getElementById('stop-button').style.display = 'none';
-  });
-  eventSource.addEventListener('error', function(event) {
-    logContainer.innerHTML += 'ERROR: ' + event.data + '\n';
-    eventSource.close();
-    eventSource = null;
-    document.getElementById('stop-button').style.display = 'none';
-  });
-});
-
-// --- Stop Investigation button ---
-document.getElementById('stop-button').addEventListener('click', async function() {
-  if (eventSource) {
-    await fetch('/stop', { method: 'POST' });
-    eventSource.close();
-    eventSource = null;
   }
-  document.getElementById('log-container').innerHTML += '\nInvestigation stopped by user.\n';
-  document.getElementById('stop-button').style.display = 'none';
-});
+}
+
 </script>
 </body>
 </html>
