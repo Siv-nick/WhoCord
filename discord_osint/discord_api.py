@@ -132,7 +132,12 @@ def resolve_tracking_links(tracked):
         pr = []
         for url in urls:
             print(f"  Resolving {plat} link: {url[:60]}...")
-            cmd = [sys.executable, "-m", "sharetrace", url, "--json"]
+            if getattr(sys, 'frozen', False):
+                python_exe = utils._get_frozen_python()
+                sharetrace_script = os.path.join(os.path.dirname(sys.executable), "sharetrace")
+                cmd = [python_exe, sharetrace_script, url, "--json"]
+            else:
+                cmd = [sys.executable, "-m", "sharetrace", url, "--json"]
             try:
                 if utils.DEBUG_MODE:
                     utils.debug_subprocess(cmd, cwd=sharetrace_dir, timeout=30)
