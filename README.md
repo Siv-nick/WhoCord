@@ -24,70 +24,29 @@ Most OSINT tools stop at finding profiles. WhoCord goes further:
 
 ---
 
-## ✨ Features
+## 🚀 Quick Start (recommended)
 
-### Discord link extraction
-* Searches messages across **all mutual guilds** (or a specific guild) for shared links.
-* Identifies tracking parameters (`igshid`, `fbclid`, `ttclid`, etc.) in Instagram, TikTok, Facebook, and Twitter URLs.
-* Resolves those tracking links using ShareTrace to reveal the original sharer’s profile.
+1. **Download the portable zip** from the [Releases page](https://github.com/Siv-nick/WhoCord/releases) (Linux 64‑bit, ~250 MB).
+2. **Extract** the archive anywhere:
+   ```bash
+   unzip WhoCord.zip -d WhoCord
+   ```
+3. **Run** the executable:
+   ```bash
+   cd WhoCord
+   ./WhoCord
+   ```
+4. If you prefer the web interface:
+   ```bash
+   ./run.sh
+   ```
+   *(opens your browser automatically)*
 
-### Username discovery
-* Scans **700+ websites** using Sherlock, Maigret, Naminter, Blackbird, and Social‑Analyzer.
-* Spiders discovered URLs with Sociopath and Linkook to uncover even more related accounts.
-* Filters false positives with Socialscan before scraping.
-* **Blackbird** brings 600+ additional sites with email‑based search and avatar extraction.
-* Blackbird results appear in their own dedicated HTML report section with avatars.
-
-### ✉️ Manual email input
-* You can optionally provide an email address in manual mode; it will be searched via Blackbird’s email detection and also forwarded to the email intelligence pipeline (Holehe, h8mail, etc.).
-* No more automatic email guessing – only real, user‑supplied emails are processed.
-
-### Profile scraping & enrichment
-* Pulls public profile pages (GitHub, Twitter, Reddit, YouTube, etc.) with built‑in scrapers.
-* Extracts display names, bios, avatars, follower counts, blog links, and embedded emails.
-* Uses **Socid‑Extractor** to mine structured identity data from generic pages.
-* Enriched profile data (account IDs, join dates, bios, avatar URLs) is displayed in a dedicated report section.
-
-### ✉️ Email intelligence
-* Runs each email through:
-  * **Holehe** – checks which sites the email is registered on
-  * **h8mail** – breach/compromise status
-  * **HIBP** (HaveIBeenPwned) – known data breaches
-  * **Emailrep.io** – reputation and risk score
-  * **GHunt** – Google account information (requires `ghunt login` once)
-  * **Scylla** – breach database lookup
-* Breach results are presented in clean, readable cards with optional raw detail toggles.
-
-### GitHub deep dive
-* Collects public GitHub activity, pinned repositories, and profile details.
-* Uses **GitFive** to dig up commit history, possible email addresses, and full name history.
-
-### Avatar analysis
-* Downloads avatar images and extracts **EXIF metadata** (GPS coordinates, camera model, date taken).
-* Runs **reverse image search** via SauceNAO to find where else the image appears.
-
-### Domain & history checks
-* **WHOIS** lookups on blog domains found in profiles.
-* **Wayback Machine** snapshot availability for all discovered URLs.
-
-### Name analysis & identity scoring
-* Predicts name origin, gender, and subregion using Nametrace.
-* Computes fuzzy similarity between discovered names.
-* Generates **confidence scores** to rank the most likely real‑world identity.
-
-### AI report
-With a Groq API key, WhoCord sends the collected evidence to LLaMA 3.3 and gets back a structured markdown report containing:
-* Executive summary
-* Identity assessment
-* Digital footprint
-* Risk indicators
-* **Relationship analysis** – connections between data points (username reuse, email‑platform linking)
-* **Critical points of attention** – most important findings requiring immediate action
-* Recommended next steps
+**No Python, pip, or any tool installation is required** – everything is bundled inside.
 
 ---
 
-## 📦 Installation
+## 📦 Installation (from source – for developers)
 
 ### 1. Clone the repository
 ```bash
@@ -167,6 +126,7 @@ Or use the one‑click launcher: `./run.sh` (starts server + opens browser, no t
 3. Start investigation
 4. Save config and exit
 5. Toggle debug mode
+6. Upgrade external tools
 ==================================================
 ```
 * **Option 1** – Enable or disable any of the 33 tools with a single keypress.
@@ -178,6 +138,7 @@ Or use the one‑click launcher: `./run.sh` (starts server + opens browser, no t
 * **Option 3** – Choose `Manual` (investigate a username) or `Discord` (investigate a Discord user ID). In Manual mode you can optionally provide an email.
 * **Option 4** – Save current configuration to `config.json` and exit.
 * **Option 5** – Toggle debug mode for live subprocess output and debug logs.
+* **Option 6** – Check for updates to installed pip‑based tools.
 
 ### Command‑line mode
 ```bash
@@ -219,6 +180,7 @@ Raw outputs are archived in:
 
 ### HTML report sections
 * 📱 Discord Identity
+* 🧑 Persona Summary (AI)
 * 🌐 Discovered Social Profiles
 * ✉️ Emails
 * 🔓 Breach Intelligence
@@ -262,24 +224,7 @@ WhoCord orchestrates these fantastic open‑source OSINT projects:
 
 ## 🔄 Updates
 
-1.0.3: currently working on it to make the installation as easy as extracting a zip file
-
-### 1.0.2
-* **Web dashboard** – run investigations from your browser with live streaming.
-* **Enhanced AI report** – now includes relationship analysis and critical points of attention.
-* **Enriched profile data** – socid‑extractor results displayed in a dedicated report section.
-* **Blackbird results** – dedicated report section with avatars for all discovered accounts.
-* **Formatted breaches** – clean, readable cards with optional raw detail toggles.
-* **Live log streaming** – SSE‑based real‑time output in the web dashboard.
-* **One‑click launcher** – `run.sh` starts the dashboard without a terminal.
-* **Stop button** – kill any running investigation from the web UI.
-* **Token status** – dashboard badges update instantly when tokens are saved.
-* **Centralised logging** – structured logging via `logger.py`.
-
-### 1.0.1
-* Blackbird integration – email‑based discovery and 600+ additional username sites.
-* Email guesser removed.
-* GHunt now requires one‑time `ghunt login`.
+check changelog.md
 
 ---
 
