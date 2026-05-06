@@ -1,23 +1,31 @@
 import sys
-import pathlib, shutil
+import os
+import pathlib
+import shutil
 import argparse
-from .config import Config
-from .ui import print_menu, toggle_tools, set_tokens, start_pipeline, toggle_debug
-from .pipeline import run_osint_pipeline
-from .utils import check_dependencies
 
+# ---- Make bundled tools available ----
+if getattr(sys, 'frozen', False):
+    tool_dir = os.path.dirname(sys.executable)
+    os.environ["PATH"] = tool_dir + os.pathsep + os.environ.get("PATH", "")
+
+# ---- Clear stale bytecode cache ----
 def clear_pycache():
     root = pathlib.Path(__file__).resolve().parent
     for pycache in root.rglob("__pycache__"):
         if pycache.is_dir():
             shutil.rmtree(pycache)
-
 clear_pycache()
+
+from .config import Config
+from .ui import print_menu, toggle_tools, set_tokens, start_pipeline, toggle_debug
+from .pipeline import run_osint_pipeline
+from .utils import check_dependencies
 
 def main():
     parser = argparse.ArgumentParser(description='Universal OSINT Pipeline')
     parser.add_argument('--version', action='version',
-                        version='WhoCord 1.0.2')
+                        version='WhoCord 1.0.3')
     parser.add_argument('--mode', choices=['discord','manual'], help='operational mode')
     parser.add_argument('--target', help='manual username or discord user ID')
     parser.add_argument('--token', help='Discord user token')
@@ -68,6 +76,9 @@ def main():
                 sys.exit(0)
             elif choice == '5':
                 toggle_debug(config)
+            elif choice == '6':
+                from .utils import upgrade_tools
+                upgrade_tools()
             else:
                 print("Invalid option.")
     else:
