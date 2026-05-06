@@ -3,6 +3,7 @@ import re
 import subprocess as _sp
 import json
 import time
+import sys
 from urllib.parse import urlparse
 from collections import Counter
 from .utils import http_session, tool_available, REQUEST_DELAY, CACHE_DIR
@@ -136,7 +137,12 @@ def socialscan_filter(urls):
     os.makedirs(temp_dir, exist_ok=True)
     outfile = os.path.join(temp_dir, f"scan_{username}.json")
 
-    cmd = ["socialscan", username, "--json", outfile]
+    if getattr(sys, 'frozen', False):
+        python_exe = utils._get_frozen_python()
+        script = os.path.join(os.path.dirname(sys.executable), "socialscan")
+        cmd = [python_exe, script, username, "--json", outfile]
+    else:
+        cmd = ["socialscan", username, "--json", outfile]
     if utils.DEBUG_MODE:
         utils.debug_subprocess(cmd, timeout=60)
         # debug mode: skip parsing, return all URLs
