@@ -1,4 +1,5 @@
 TOOLS_LIST = [
+    ("ENABLE_EMAIL_VERIFY", "Advanced email verification (SMTP)"),
     ("ENABLE_NAMINTER", "Naminter (username search)"),
     ("ENABLE_SHERLOCK", "Sherlock (username search)"),
     ("ENABLE_SOCIAL_ANALYZER", "Social Analyzer (fast check)"),
