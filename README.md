@@ -136,6 +136,8 @@ python web_app.py
 Then open `http://127.0.0.1:5000`.  
 Or use the one‑click launcher: `./run.sh`.
 
+<p align="center"> <img src="dashboard.png" alt="WhoCord Dashboard" width="700"> </p>
+
 ---
 
 ## 🚀 Usage
