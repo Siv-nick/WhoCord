@@ -51,6 +51,12 @@ DEFAULT_CONFIG = {
     "ENABLE_BLACKBIRD":       True,
     "ENABLE_EMAIL_VERIFY":    False,
     "BLACKBIRD_DIR": os.path.join(get_data_dir(), "blackbird"),
+    # Phase 2 – Adaptive Recursive Pivoting
+    "ENABLE_PIVOTING":        False,
+    "PIVOT_EMAIL":            True,
+    "PIVOT_USERNAME":         True,
+    "PIVOT_MAX_DEPTH":        3,
+    "PIVOT_MAX_SEEDS":        5,
 }
 
 SENSITIVE_KEYS = {
@@ -105,6 +111,12 @@ EXTRA_TARGETS       = []
 ENABLE_BLACKBIRD    = True
 ENABLE_EMAIL_VERIFY = False
 BLACKBIRD_DIR = os.path.join(get_data_dir(), "blackbird")
+# Phase 2 globals
+ENABLE_PIVOTING     = False
+PIVOT_EMAIL         = True
+PIVOT_USERNAME      = True
+PIVOT_MAX_DEPTH     = 3
+PIVOT_MAX_SEEDS     = 5
 
 MODE                = "discord"
 TARGET_USER_ID      = None
@@ -122,6 +134,7 @@ def _sync_globals_from_dict(data):
     global ENABLE_WHOIS, ENABLE_WAYBACK, ENABLE_HIBP, ENABLE_EMAILREP, ENABLE_SCYLLA
     global ENABLE_LOCATION, ENABLE_LANGDETECT, ENABLE_PARALLEL_EMAIL, ENABLE_CACHING, SMTP_CHECK
     global MANUAL_EMAIL, EXTRA_TARGETS, ENABLE_BLACKBIRD, ENABLE_EMAIL_VERIFY, BLACKBIRD_DIR
+    global ENABLE_PIVOTING, PIVOT_EMAIL, PIVOT_USERNAME, PIVOT_MAX_DEPTH, PIVOT_MAX_SEEDS
 
     mapping = {
         "DISCORD_TOKEN": "USER_TOKEN",
@@ -168,6 +181,11 @@ def _sync_globals_from_dict(data):
         "ENABLE_BLACKBIRD": "ENABLE_BLACKBIRD",
         "ENABLE_EMAIL_VERIFY": "ENABLE_EMAIL_VERIFY",
         "BLACKBIRD_DIR":    "BLACKBIRD_DIR",
+        "ENABLE_PIVOTING":  "ENABLE_PIVOTING",
+        "PIVOT_EMAIL":      "PIVOT_EMAIL",
+        "PIVOT_USERNAME":   "PIVOT_USERNAME",
+        "PIVOT_MAX_DEPTH":  "PIVOT_MAX_DEPTH",
+        "PIVOT_MAX_SEEDS":  "PIVOT_MAX_SEEDS",
     }
     for key, val in data.items():
         global_name = mapping.get(key, key)
