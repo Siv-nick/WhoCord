@@ -8,23 +8,32 @@
   <img src="logo.png" alt="WhoCord" width="1000">
 </p>
 
-# 🕵️‍♂️ WhoCord
+# 🕵️‍♂️ WhoCord v1.1
 
-**Turn any username or Discord ID into a full identity profile.**
+**Turn any username, email, domain, phone number, image, URL, or probe string into a full identity profile.**
 
-WhoCord automatically scans Discord messages across mutual guilds for tracking links, resolves them to find connected social media accounts, cross‑references **700+ sites**, runs deep email intelligence, extracts EXIF data from avatars, and generates a polished AI‑powered OSINT report — all from a simple interactive menu or a **dark‑themed web dashboard**.
+WhoCord is a modular OSINT investigation platform that runs dozens of open‑source tools, builds a knowledge graph, detects correlations, and generates an AI‑enhanced dark‑themed HTML report – all streamed live to a modern React dashboard.
 
 ---
 
 ## ⚡ Features
 
+* **8 investigation modules** – Username / Manual, Discord, Email, Domain, Phone, Image, URL, Data Probe (auto‑detect).
 * **Discord‑native link resolution** – extracts and resolves Instagram, TikTok, Facebook, and Twitter tracking links shared by a target user.
-* **Full identity pipeline** – names, emails, locations, breach data, GitHub history, and even avatar metadata are pulled together into one structured intelligence snapshot.
-* **30+ integrated tools** – Sherlock, Maigret, Naminter, Blackbird, Holehe, h8mail, GitFive, GHunt, Scylla, Socialscan, and more, all controlled from a single interface.
-* **AI‑generated reports** – LLaMA 3.3 (via Groq) produces a structured markdown summary with **relationship analysis** and **critical points of attention**.
-* **Beautiful HTML report** – dark‑themed, responsive, with all intel displayed in collapsible sections (emails, breaches, Blackbird results, enriched profile data, timeline, and more).
-* **Secure token storage** – API keys are stored in your operating system’s encrypted keyring, never in plain text.
-* **Web dashboard** – run investigations from your browser with live progress streaming, tool toggles, token management, and in‑app report viewing.
+* **Full identity pipeline** – names, emails, locations, breach data, GitHub history, avatar metadata, and Google account info (GHunt).
+* **Email intelligence** – Holehe (site registrations), h8mail, HIBP, EmailRep, GHunt, Blackbird email search, MOSINT (social account flags).
+* **Domain investigation** – WHOIS, DNS records, SSL certificate, IP geolocation, subdomain enumeration, theHarvester.
+* **Phone investigation** – number validation, carrier lookup, PhoneInfoga OSINT.
+* **Image analysis** – EXIF metadata, perceptual hash, reverse image search, OCR text extraction.
+* **URL analysis** – HTTP metadata, redirect trace, page metadata, Open Graph tags, Safe Browsing check, Wayback snapshot.
+* **Data Probe** – paste anything (email, domain, phone, URL, username) and WhoCord auto‑detects the type.
+* **Knowledge graph & correlations** – 5 detectors (avatar reuse, email‑platform cluster, username variants, name‑email link, location consistency).
+* **AI‑generated reports** – LLaMA 3.3 (via Groq) produces structured narrative and persona summary.
+* **Dark‑themed HTML report** – collapsible platform cards, avatar display, breach tags, pivot sub‑reports, technical data.
+* **Live SSE streaming** – watch investigations in real time with stage list, finding cards, and console logs.
+* **Pivot system** – recursive investigation of discovered emails/usernames with user confirmation modal.
+* **Secure token storage** – API keys stored in your OS keyring, never in plain text.
+* **Web dashboard** – run investigations from your browser, toggle tools, manage tokens, view history.
 
 ---
 
@@ -35,18 +44,14 @@ WhoCord automatically scans Discord messages across mutual guilds for tracking l
    ```bash
    unzip WhoCord.zip -d WhoCord
    ```
-3. **Run** the executable:
+3. **Run the web dashboard**:
    ```bash
    cd WhoCord
-   ./WhoCord
-   ```
-4. If you prefer the web interface:
-   ```bash
    ./run.sh
    ```
    *(opens your browser automatically)*
 
-**No Python, pip, or any tool installation is required** – everything is bundled inside.
+**No Python, pip, or tool installation is required** – everything is bundled inside.
 
 ---
 
@@ -57,26 +62,37 @@ WhoCord automatically scans Discord messages across mutual guilds for tracking l
 git clone https://github.com/Siv-nick/WhoCord.git
 cd WhoCord
 ```
-If you don’t have `git`, download the ZIP from the green **< > Code** button and extract it.
 
-### 2. Create a Python virtual environment (highly recommended)
+### 2. Create a Python virtual environment
 ```bash
 python3 -m venv venv
+source venv/bin/activate   # Linux / macOS
 ```
-Activate the environment:
-* **Linux / macOS**: `source venv/bin/activate`
-* **Windows (Command Prompt)**: `venv\Scripts\activate`
-* **Windows (PowerShell)**: `.\venv\Scripts\Activate`
 
 ### 3. Install WhoCord and its Python dependencies
 ```bash
 pip install -e .
 ```
-This installs WhoCord **and** all required Python libraries (`requests`, `beautifulsoup4`, `flask`, `keyring`, `jinja2`, `openai`, `socid-extractor`, etc.).
 
-### 4. Install external command‑line tools
+### 4. Install external command‑line tools (most via pip)
+
+All required tools can be installed with a single `pip install` command:
+
 ```bash
-pip install sherlock-project maigret holehe h8mail gitfive naminter linkook sociopath
+# Username search tools
+pip install sherlock-project maigret naminter linkook
+
+# Email intelligence tools
+pip install holehe h8mail theHarvester
+
+# GitHub & Google tools
+pip install gitfive ghunt
+
+# Phone & image analysis
+pip install phoneinfoga pillow imagehash pytesseract
+
+# Domain investigation
+pip install dnspython
 ```
 
 ### 5. Install Blackbird (email & username search on 600+ sites)
@@ -86,31 +102,26 @@ cd blackbird
 pip install -r requirements.txt
 cd ..
 ```
-> **Note:** Blackbird's data file (`wmn-data.json`) is auto‑downloaded on first use. If that fails, download it manually from [WhatsMyName](https://raw.githubusercontent.com/WebBreacher/WhatsMyName/main/wmn-data.json) and place it in `blackbird/data/`.
+> The required data file (`wmn-data.json`) is auto‑downloaded on first use. If that fails, download it manually from [WhatsMyName](https://raw.githubusercontent.com/WebBreacher/WhatsMyName/main/wmn-data.json) and place it in `blackbird/data/`.
 
-### 6. Optional but powerful extras
+### 6. Install system WHOIS (required for domain investigations)
 ```bash
-# WHOIS lookups
-sudo apt install whois    # Linux
-brew install whois        # macOS
+sudo apt install whois          # Debian/Ubuntu
+# brew install whois            # macOS
+```
 
-# GHunt for Google account info (requires `ghunt login` after install)
-pip install ghunt
+### 7. (Optional) Authenticate GHunt for Google account intelligence
+```bash
 ghunt login
 ```
+Follow the instructions to authenticate with your Google account.
 
-### 7. Launch WhoCord
+### 8. Launch the web dashboard
 ```bash
-discord-osint
-```
-The interactive menu will appear.
-
-### 8. Launch the web dashboard (optional)
-```bash
-python3 web_app.py
+python web_app.py
 ```
 Then open `http://127.0.0.1:5000`.  
-Or use the one‑click launcher: `./run.sh` (starts server + opens browser, no terminal visible).
+Or use the one‑click launcher: `./run.sh`.
 
 <p align="center">
   <img src="dashboard.png" alt="WhoCord Dashboard" width="700">
@@ -120,123 +131,98 @@ Or use the one‑click launcher: `./run.sh` (starts server + opens browser, no t
 
 ## 🚀 Usage
 
-### Interactive menu (recommended)
-```
-==================================================
-        OSINT IDENTITY PROFILING PIPELINE
-==================================================
-1. Toggle investigation tools
-2. Set tokens / API keys
-3. Start investigation
-4. Save config and exit
-5. Toggle debug mode
-6. Upgrade external tools
-==================================================
-```
-* **Option 1** – Enable or disable any of the 33 tools with a single keypress.
-* **Option 2** – Enter your API tokens (stored securely in your OS keyring).
-  * Discord token (required for Discord mode)
-  * GitHub token (increases API rate limits)
-  * Groq API key (enables AI report)
-  * Instagram session (optional, reserved for future Toutatis integration)
-* **Option 3** – Choose `Manual` (investigate a username) or `Discord` (investigate a Discord user ID). In Manual mode you can optionally provide an email.
-* **Option 4** – Save current configuration to `config.json` and exit.
-* **Option 5** – Toggle debug mode for live subprocess output and debug logs.
-* **Option 6** – Check for updates to installed pip‑based tools.
+### Web Dashboard (primary interface)
 
-### Command‑line mode
+The dashboard offers eight investigation modules:
+
+| Module | Input | Tools run |
+|--------|-------|------------|
+| **Username / Manual** | username (optional email) | Sherlock, Maigret, Blackbird, Naminter, Linkook, Sociopath, scraping, analysis, intelligence, email tools |
+| **Discord User** | user ID + guild ID | Discord profile fetch, message crawling, tracking‑link resolution |
+| **Email Address** | email | Holehe, h8mail, HIBP, EmailRep, GHunt, SMTP, Gravatar, Scylla, Blackbird email, MOSINT |
+| **Domain** | domain | WHOIS, DNS, SSL, IP geolocation, subdomain enumeration, theHarvester |
+| **Phone Number** | phone | phonenumbers library, carrier lookup, PhoneInfoga |
+| **Image Analysis** | image URL | EXIF, perceptual hash, reverse search, OCR |
+| **URL Analysis** | URL | HTTP meta, redirects, page metadata, Open Graph, Safe Browsing, Wayback |
+| **Data Probe** | any string | auto‑detects type and runs the appropriate module |
+
+**Live investigation page** shows:
+- Stage list with real‑time status
+- Finding cards (emails, names, breaches, correlations)
+- Console logs (raw tool output)
+- Pivot confirmation modal (when enabled)
+
+**History page** – list all past investigations with links to reports and JSON intel.
+
+**Config page** – manage API tokens, toggle tools, set pivot options, upgrade tools.
+
+### Interactive menu (legacy CLI)
+
+```bash
+discord-osint
+```
+
+Then use the numbered menu to toggle tools, set tokens, and start investigations.
+
+### Command‑line mode (limited to manual/discord)
 ```bash
 discord-osint --mode manual --target someusername --output html --debug
 ```
-
-| Argument | Description |
-|---|---|
-| `--mode` | `discord` or `manual` |
-| `--target` | username (manual) or Discord user ID (discord) |
-| `--token` | Discord user token (overrides saved one) |
-| `--guild` | Discord guild ID (for single‑guild search) |
-| `--output` | `json`, `markdown`, or `html` |
-| `--debug` | Enable debug logging |
-| `--interactive` | Force the interactive menu |
-
-### Web dashboard
-* **Investigate tab** – enter username/email (manual mode) or user/guild IDs (Discord mode), start with one click, and view live streaming output.
-* **Configuration tab** – set tokens and toggle tools right in the browser; badges update instantly.
-* **Live Logs tab** – watch the investigation unfold in real time (SSE streaming).
-* **Report tab** – view the generated HTML report inside the dashboard.
-* **Stop button** – kill any running investigation immediately.
 
 ---
 
 ## 📁 Output files
 
-All results are saved in the **`investigation_cache/`** folder:
+All results are saved in **`investigation_cache/`**:
 
 | File | Description |
 |---|---|
 | `intel_*.json` | Complete intelligence snapshot (structured JSON) |
-| `report_*.md` | AI‑generated markdown report (if Groq is enabled) |
-| `report_*.html` | Interactive HTML report (if `--output html` is used) |
-
-Raw outputs are archived in:
-* `investigation_cache/blackbird_output/`
-* `investigation_cache/socialscan_output/`
+| `report_*.md` | AI‑generated markdown report (if Groq enabled) |
+| `report_*.html` | Interactive dark‑themed HTML report |
+| `blackbird_output/` | Raw Blackbird JSON results |
+| `socialscan_output/` | Socialscan results |
+| `debug_*.log` | Detailed debug logs (when debug mode is on) |
 
 ### HTML report sections
-* 📱 Discord Identity
-* 🧑 Persona Summary (AI)
-* 🌐 Discovered Social Profiles
-* ✉️ Emails
-* 🔓 Breach Intelligence
-* 🧪 Enriched Profile Data
-* 🧩 Identity Clues
-* 🌍 WHOIS Information
-* 📸 Media / EXIF
-* 🔬 Name Analysis
-* 🏆 Identity Confidence Scores
-* 🕰️ Wayback Machine Snapshots
-* 🐦 Blackbird Search Results
-* ⏱️ Investigation Timeline
+- Identity (Discord handle, name clues, location, language, confidence scores)
+- Persona Summary (AI)
+- Social Profiles (collapsible platform cards with avatars, bios, extra fields)
+- Email Intelligence (breach tags, MOSINT flags)
+- Intelligence Analysis (graph stats, narrative, correlations)
+- Pivot Sub‑Investigations
+- Technical Data (WHOIS, DNS, SSL, IP geolocation, subdomains, theHarvester, phone, URL analysis, GHunt)
 
 ---
 
 ## 🛠️ Tools & technologies
 
-WhoCord orchestrates these fantastic open‑source OSINT projects:
+WhoCord integrates these open‑source OSINT projects:
 
-| Tool | Purpose |
-|---|---|
-| [Sherlock](https://github.com/sherlock-project/sherlock) | Username search across 400+ sites |
-| [Maigret](https://github.com/soxoj/maigret) | Full‑spectrum username search with metadata |
-| [Blackbird](https://github.com/p1ngul1n0/blackbird) | Email & username search on 600+ sites |
-| [Holehe](https://github.com/megadose/holehe) | Checks which sites an email is registered on |
-| [h8mail](https://github.com/khast3x/h8mail) | Email breach & compromise checker |
-| [GitFive](https://github.com/mxrch/gitfive) | GitHub user intelligence |
-| [Naminter](https://github.com/s0md3v/naminter) | Username search with smart filtering |
-| [Linkook](https://github.com/JackJu1y/Linkook) | Deep URL discovery across platforms |
-| [Sociopath](https://github.com/s0md3v/sociopath) | Profile spider & identity enrichment |
-| [Socid‑Extractor](https://github.com/soxoj/socid-extractor) | Extracts structured identity data |
-| [Socialscan](https://github.com/iojw/socialscan) | Validates social media profile availability |
-| [ShareTrace](https://github.com/s0md3v/sharetrace) | Resolves social media tracking links |
-| [Scylla](https://github.com/MandConsultingGroup/Scylla) | Leak database query |
-| [NameTrace](https://github.com/s0md3v/nametrace) | Name origin & gender prediction |
-| [ExifRead](https://github.com/ianare/exif-py) | EXIF metadata extraction from images |
-| [SauceNAO](https://saucenao.com/) | Reverse image search (via API) |
-| [Groq](https://groq.com) | LLaMA 3.3 AI report generation |
+| Category | Tools |
+|----------|-------|
+| **Username search** | Sherlock, Maigret, Blackbird, Naminter, Linkook, Sociopath, Social Analyzer, Toutatis |
+| **Email intelligence** | Holehe, h8mail, HIBP, EmailRep, GHunt, MOSINT, Scylla, Gravatar, SMTP verification |
+| **Domain & DNS** | WHOIS (system), dnspython, theHarvester, sublist3r (fallback wordlist) |
+| **Phone** | phonenumbers, PhoneInfoga, AbstractAPI (free) |
+| **Image** | Pillow, imagehash, exifread, SauceNAO (reverse image), Tesseract OCR |
+| **URL** | requests, BeautifulSoup, Google Safe Browsing, Wayback Machine |
+| **Intelligence** | networkx, socid‑extractor, Groq (LLaMA 3.3) |
+| **Web dashboard** | Flask, React, TypeScript, Tailwind CSS, SSE |
 
 ---
 
 ## 🔄 Updates
 
-check changelog.md
+Check [CHANGELOG.md](CHANGELOG.md) for version history.
 
 ---
 
 ## 🔒 Security & privacy
 
-* **Tokens are never stored in plain text.** They are kept in your OS keyring (Windows Credential Manager, macOS Keychain, or Linux Secret Service / KWallet).
-* The `config.json` file only contains tool toggles and preferences – no secrets.
-* All investigation data stays on your machine inside the `investigation_cache/` folder.
+- **Tokens are never stored in plain text** – kept in your OS keyring.
+- `config.json` only contains non‑sensitive toggles.
+- All investigation data stays on your machine inside `investigation_cache/`.
 
 ---
 
@@ -251,3 +237,4 @@ The author assumes no liability for misuse.
 ## 📄 License
 
 MIT License
+```
