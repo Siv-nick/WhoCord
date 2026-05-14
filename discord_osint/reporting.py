@@ -266,119 +266,154 @@ def _load_blackbird_results():
                 pass
     return results
 
-def generate_html_report(intel_core, target_id):
-    if not os.path.exists(TEMPLATE_DIR):
-        os.makedirs(TEMPLATE_DIR)
+def generate_persona_summary(intel, groq_api_key):
+    """Ask LLM to summarise the subject's persona based on ALL available intel."""
+    if not groq_api_key:
+        return None
+    try:
+        from openai import OpenAI
+        client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=groq_api_key)
 
-    template_path = os.path.join(TEMPLATE_DIR, "report.html")
-    _create_default_template(template_path)
-
-    env = Environment(
-        loader=FileSystemLoader(TEMPLATE_DIR),
-        autoescape=select_autoescape(['html', 'xml'])
-    )
-    template = env.get_template("report.html")
-
-    intel = intel_core.intel
-
-    # --- Discord info (only show what exists) ---
-    discord_info = intel.get("discord", {})
-    discord_clean = {
-        "username": discord_info.get("username", {}).get("value", None),
-        "account_created": discord_info.get("account_created", {}).get("value", None),
-        "bio": discord_info.get("bio", {}).get("value", None),
-        "avatar_cdn": discord_info.get("avatar_cdn", {}).get("value", None),
-    }
-
-    # Build enrichment lookup by URL (Sociopath, etc.)
-    enrichment_lookup = {}
-    for k, v in intel.get("social_enrichment", {}).items():
-        enrichment_lookup[k] = v.get("value", {})
-
-    # --- Social profiles (unchanged but we keep the nice site names) ---
-    social_profiles = []
-    for k, v in intel.get("social_profiles", {}).items():
-        val = v.get("value", "")
-        if val and val.startswith("http"):
-            # Clean platform name
-            raw = k.replace("discovery_", "", 1)
-            http_pos = raw.find("http")
-            if http_pos > 0:
-                site = raw[:http_pos].strip("_").replace("_", " ")
+        # ── 1. Emails + breach context ──────────────────────────────────
+        emails = intel.get("emails", {})
+        email_lines = []
+        breaches = intel.get("breaches", {})
+        for key, entry in emails.items():
+            email_val = entry.get("value", "") if isinstance(entry, dict) else ""
+            if not email_val or "@" not in email_val:
+                continue
+            # Find associated breach sites
+            sites = []
+            for bk, bv in breaches.items():
+                if email_val in bk:
+                    bval = bv.get("value", {}) if isinstance(bv, dict) else bv
+                    if isinstance(bval, dict) and bval.get("used_on"):
+                        sites.extend(bval["used_on"])
+            if sites:
+                email_lines.append(f"Email {email_val} registered on: {', '.join(set(sites[:5]))}")
             else:
-                site = raw.replace("_", " ")
-            if not site:
-                site = "Unknown"
-            # Get enrichment data for this URL (if any)
-            enrich = enrichment_lookup.get(val, {})
-            social_profiles.append({
-                "site": site,
-                "url": val,
-                "display_name": enrich.get("display_name", ""),
-                "bio": enrich.get("bio", ""),
-                "email": enrich.get("email", ""),
-            })
+                email_lines.append(f"Email {email_val} (no registrations found)")
 
-    # --- Enrichment (socid data from scraped profiles) ---
-    enrichment = []
-    for k, v in intel.get("social_profiles", {}).items():
-        if "/socid_raw" in k:
-            try:
-                data = json.loads(v.get("value", "{}"))
-                clean = {}
-                for field in ["fullname", "bio", "image", "twitchtracker_channel_id", "twitchtracker_username", "twitchtracker_created_at"]:
-                    if field in data:
-                        clean[field] = data[field]
-                if clean:
-                    enrichment.append({"source": k.replace("_https://", "https://"), "data": clean})
-            except:
-                pass
-    emails = [{"email": v.get("value", ""), "source": v.get("source", "")}
-              for k, v in intel.get("emails", {}).items()]
+        # ── 2. Bios (existing) ─────────────────────────────────────────
+        bios = []
+        for k, v in intel.get("social_profiles", {}).items():
+            if "bio" in k.lower() or "desc" in k.lower():
+                val = v.get("value", "") if isinstance(v, dict) else ""
+                if val:
+                    bios.append(val[:500])
+        for k, v in intel.get("social_profiles", {}).items():
+            if "socid_raw" in k:
+                try:
+                    socid_data = json.loads(v.get("value", "{}"))
+                    if isinstance(socid_data, dict) and socid_data.get("bio"):
+                        bios.append(socid_data["bio"][:500])
+                except Exception:
+                    pass
 
-    # --- Breach intelligence – reformat for readability ---
-    raw_breaches = intel.get("breaches", {})
-    clean_breaches = _format_breach_data(raw_breaches)
+        # ── 3. Identity clues ──────────────────────────────────────────
+        identity = intel.get("identity_clues", {})
+        names = [v.get("value", "") for k, v in identity.items() if k.startswith("name_") and v.get("value")]
+        location = ""
+        lang = ""
+        for k, v in identity.items():
+            if k == "inferred_location":
+                location = v.get("value", "")
+            if k == "language":
+                lang = v.get("value", "")
 
-    identity_clues = intel.get("identity_clues", {})
-    whois = intel.get("whois", {})
-    media = intel.get("media", {})
-    name_analysis = intel.get("name_analysis", {})
-    confidence_scores = intel.get("confidence_scores", [])
-    timeline = intel.get("timeline", [])
-    wayback_clean = {}
-    for url, data in intel.get("wayback", {}).items():
-        if isinstance(data, dict) and "value" in data:
-            wayback_clean[url] = data["value"]
+        # ── 4. Phone ───────────────────────────────────────────────────
+        phone = intel.get("phone", {})
+        phone_str = ""
+        if phone:
+            num = phone.get("number", {})
+            num_val = num.get("value", "") if isinstance(num, dict) else ""
+            carr = phone.get("carrier", {})
+            carr_val = carr.get("value", "") if isinstance(carr, dict) else ""
+            if num_val:
+                phone_str = f"Phone number: {num_val} (carrier: {carr_val})"
 
-    # --- Blackbird data (only fresh scan) ---
-    blackbird_data = _load_blackbird_results()
+        # ── 5. Domain WHOIS ────────────────────────────────────────────
+        whois = intel.get("whois", {})
+        whois_str = ""
+        for domain, data in whois.items():
+            if isinstance(data, dict):
+                reg = data.get("registrant_org", "") or data.get("registrant_name", "")
+                if reg:
+                    whois_str = f"Domain {domain} registered to {reg}"
+                else:
+                    whois_str = f"Domain {domain} (no public registrant)"
 
-    # --- Persona summary from AI (new) ---
-    persona_summary = intel.get("persona_summary", {}).get("persona", {}).get("value", "")
+        # ── 6. URL page metadata ───────────────────────────────────────
+        url_intel = intel.get("url_intel", {})
+        url_title = ""
+        url_desc = ""
+        if url_intel:
+            page_meta = url_intel.get("page_meta", {})
+            if isinstance(page_meta, dict):
+                val = page_meta.get("value", {}) if "value" in page_meta else page_meta
+                if isinstance(val, dict):
+                    url_title = val.get("title", "")
+                    url_desc = val.get("description", "")
 
-    html = template.render(
-        target_id=target_id,
-        timestamp=datetime.datetime.now().isoformat(),
-        discord_info=discord_clean,
-        social_profiles=social_profiles,
-        emails=emails,
-        breaches=clean_breaches,
-        identity_clues=identity_clues,
-        whois=whois,
-        media=media,
-        name_analysis=name_analysis,
-        confidence_scores=confidence_scores,
-        timeline=timeline,
-        wayback=wayback_clean,
-        blackbird=blackbird_data,
-        enrichment=enrichment,
-        persona_summary=persona_summary,
-    )
-    return html
+        # ── 7. GHunt (Google account) ──────────────────────────────────
+        ghunt = intel.get("ghunt", {})
+        ghunt_str = ""
+        for email, data in ghunt.items():
+            if isinstance(data, dict):
+                services = data.get("activated_services", [])
+                if services:
+                    ghunt_str = f"Google account with services: {', '.join(services)}"
+                break
+
+        # ── 8. Pivot sub‑reports ───────────────────────────────────────
+        pivot_reports = intel.get("pivot_reports", [])
+        pivot_count = len(pivot_reports)
+
+        # ── Build the prompt ───────────────────────────────────────────
+        prompt_parts = [
+            "You are an experienced OSINT investigator. Based on the following collected data, write a single concise paragraph describing the person's online persona, interests, profession, and any notable characteristics. Use clear, factual language.",
+            "",
+            "=== DATA ===",
+        ]
+        if email_lines:
+            prompt_parts.append("Emails and registrations:\n" + "\n".join(email_lines))
+        if bios:
+            prompt_parts.append("Profile biographies:\n" + "\n---\n".join(bios[:15]))
+        if names:
+            prompt_parts.append(f"Possible names: {', '.join(names[:5])}")
+        if location:
+            prompt_parts.append(f"Inferred location: {location}")
+        if lang:
+            prompt_parts.append(f"Language: {lang}")
+        if phone_str:
+            prompt_parts.append(phone_str)
+        if whois_str:
+            prompt_parts.append(whois_str)
+        if url_title or url_desc:
+            prompt_parts.append(f"Page title: {url_title[:200]}\nPage description: {url_desc[:300]}")
+        if ghunt_str:
+            prompt_parts.append(ghunt_str)
+        if pivot_count:
+            prompt_parts.append(f"Number of pivot sub‑investigations: {pivot_count}")
+
+        if not any([email_lines, bios, names, location, lang, phone_str, whois_str, url_title, ghunt_str]):
+            return "Insufficient data to form a persona."
+
+        prompt = "\n".join(prompt_parts)
+
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1000,
+            temperature=0.3
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"  Persona summary error: {e}")
+        return None
 
 def _create_default_template(path):
-    """Comprehensive dark‑themed report template – WhoCord v1.0.3"""
+    """Comprehensive dark‑themed report template – WhoCord v1.1"""
     template_content = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
