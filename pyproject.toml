@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "discord-osint"
-version = "1.0.2"
+version = "1.1.0"
 description = "Universal OSINT identity profiling pipeline – CLI, interactive menu, and web dashboard"
 readme = "README.md"
 license = "MIT"
@@ -24,6 +24,16 @@ dependencies = [
     "validate-email-address",
     "flask",
     "werkzeug",
+    # Phase 4 domain & phone modules
+    "dnspython",
+    "phonenumbers",
+    "pyOpenSSL",
+    # Image analysis
+    "pillow",
+    "imagehash",
+    "pytesseract",   # optional – OCR
+    # Additional network utilities
+    "dns.resolver",  # part of dnspython
 ]
 requires-python = ">=3.9"
 
