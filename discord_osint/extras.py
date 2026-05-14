@@ -65,23 +65,65 @@ def extract_metadata(filepath):
 
 def whois_domain(domain):
     try:
-        res = subprocess.run(["whois", domain], capture_output=True, text=True, timeout=20)
-        if res.returncode == 0 and res.stdout.strip():
-            raw = res.stdout
-            name = email = creation = ""
-            for line in raw.splitlines():
-                line_lower = line.lower()
-                if "registrant name" in line_lower or "organisation" in line_lower:
-                    name = line.split(":", 1)[-1].strip()
-                if "registrant email" in line_lower or "e-mail" in line_lower:
-                    candidate = line.split(":", 1)[-1].strip()
-                    if re.match(r'[^@]+@[^@]+\.[^@]+', candidate):
-                        email = candidate
-                if "creation date" in line_lower or "created" in line_lower:
-                    creation = line.split(":", 1)[-1].strip()
-            return {"registrant_name": name, "registrant_email": email, "creation_date": creation}
-    except Exception: pass
-    return {}
+        res = _sp.run(["whois", domain], capture_output=True, text=True, timeout=20)
+        if res.returncode != 0 or not res.stdout.strip():
+            return {}
+
+        lines = res.stdout.splitlines()
+        data = {}
+
+        # Common labels (case-insensitive)
+        labels = {
+            "registrar":                "registrar",
+            "creation date":            "creation_date",
+            "registry expiry date":     "expiry_date",
+            "registrar registration expiration date": "expiry_date",
+            "name server":              "name_servers",
+            "domain status":            "domain_status",
+            "registrant organization":  "registrant_org",
+            "registrant country":       "registrant_country",
+            "dnssec":                   "dnssec",
+        }
+
+        name_servers = []
+        statuses = []
+
+        for line in lines:
+            line_lower = line.lower()
+            for label, key in labels.items():
+                if line_lower.startswith(label):
+                    value = line.split(":", 1)[-1].strip()
+                    if key == "name_servers":
+                        if value and value not in name_servers:
+                            name_servers.append(value)
+                    elif key == "domain_status":
+                        # Extract status code (e.g., "clientDeleteProhibited")
+                        # Often format: "Domain Status: clientDeleteProhibited https://..."
+                        status_code = value.split()[0] if value else ""
+                        if status_code and status_code not in statuses:
+                            statuses.append(status_code)
+                    else:
+                        if key in data:
+                            # Keep the first non-empty value
+                            continue
+                        data[key] = value
+
+        if name_servers:
+            data["name_servers"] = name_servers[:10]  # limit
+        if statuses:
+            data["domain_status"] = statuses
+
+        # Fallback: if creation_date still missing, try pattern "Creation Date:"
+        if not data.get("creation_date"):
+            for line in lines:
+                if "creation date:" in line.lower():
+                    data["creation_date"] = line.split(":", 1)[-1].strip()
+                    break
+
+        return data
+
+    except Exception:
+        return {}
 
 def wayback_available(url):
     try:
