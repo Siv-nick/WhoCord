@@ -37,7 +37,7 @@ WhoCord is a modular OSINT investigation platform that runs dozens of open‑sou
 
 ---
 
-## 🚀 Quick Start (recommended)
+## 🚀 Quick Start (recommended) outdated version 1.0.3
 
 1. **Download the portable zip** (currentily for version 1.0.3 only) from the [Releases page](https://github.com/Siv-nick/WhoCord/releases) (Linux 64‑bit, ~500 MB).
 2. **Extract** the archive anywhere:
@@ -55,8 +55,7 @@ WhoCord is a modular OSINT investigation platform that runs dozens of open‑sou
 
 ---
 
-## 📦 Installation (from source – for developers)
-
+## 📦 Installation latest version 1.1
 ### 1. Clone the repository
 ```bash
 git clone https://github.com/Siv-nick/WhoCord.git
