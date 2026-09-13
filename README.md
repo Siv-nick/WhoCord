@@ -1,4 +1,4 @@
-```markdown
+
 <div align="center">
   <img src="canvas_banner.png" alt="WhoCord" width="100%">
 </div>
