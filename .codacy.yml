@@ -1,0 +1,23 @@
+version: 2
+
+exclude-paths:
+  - '**/*.min.js'
+  - '**/*.min.css'
+  - '.git/**'
+  - 'node_modules/**'
+  - '__pycache__/**'
+  - '.pytest_cache/**'
+  - '.venv/**'
+  - 'venv/**'
+
+tools:
+  pmd:
+    enabled: false
+  pmd-legacy:
+    enabled: false
+  eslint:
+    enabled: false
+  prospector:
+    enabled: true
+    patterns:
+      - '**/*.py'
