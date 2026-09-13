@@ -1,0 +1,74 @@
+# ── Python ─────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+htmlcov/
+.coverage
+.coverage.*
+
+# ── Virtual envs ───────────────────────────────────────────
+venv/
+.venv/
+env/
+.env
+
+# ── Node / Vite ────────────────────────────────────────────
+node_modules/
+frontend/dist/
+frontend/.vite/
+.vite/
+dist/
+build/
+coverage/
+test-results/
+playwright-report/
+
+# ── IDE ────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+
+# ── WhoCord runtime artefacts ──────────────────────────────
+investigation_cache/
+debug_logs/
+socialscan_output/
+socialscan_tmp/
+blackbird_output/
+avatars/
+reports/
+results/
+output/
+
+# ── Cloned OSINT tools (never commit these) ────────────────
+blackbird/
+theHarvester/
+sherlock/
+maigret/
+holehe/
+h8mail/
+gitfive/
+naminter/
+linkook/
+sociopath/
+sharetrace/
+scylla/
+phoneinfoga/
+toutatis/
+socialscan/
+
+# ── Secrets / local config ─────────────────────────────────
+config.json
+discord_osint/config.json
+.env.local
+
+# ── Source dumps (regenerated on demand) ───────────────────
+whocord_source*.txt
+
+# ── OS noise ───────────────────────────────────────────────
+.DS_Store
+Thumbs.db

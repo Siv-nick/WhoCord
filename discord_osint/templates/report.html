@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OSINT Report – {{ target_id }}</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background: #0a0a0a; color: #e0e0e0;
+    padding: 2rem;
+  }
+  .container { max-width: 1200px; margin: 0 auto; }
+  .header { display: flex; align-items: center; gap: 1rem; margin-bottom: 2rem; }
+  .header img { height: 50px; }
+  .header h1 { color: #ffffff; margin: 0; font-size: 2rem; }
+  .meta { color: #999; font-size: 0.9rem; margin-bottom: 2rem; }
+  section {
+    background: #1a1a1a; border-radius: 12px;
+    padding: 1.5rem; margin-bottom: 1.5rem;
+    border: 1px solid #2a2a2a;
+  }
+  h2 { color: #ffffff; margin-bottom: 1rem; font-size: 1.4rem; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #2a2a2a; }
+  th { color: #aaa; font-weight: 600; }
+  a { color: #999; text-decoration: none; }
+  a:hover { color: #fff; text-decoration: underline; }
+  .badge {
+    display: inline-block; padding: 0.2rem 0.6rem;
+    border-radius: 4px; font-size: 0.8rem; margin-right: 0.5rem;
+  }
+  .badge.success { background: #00c896; color: #000; }
+  .badge.warning { background: #ffb347; color: #000; }
+  .badge.danger { background: #ff4d6a; color: #fff; }
+  ul { list-style: none; padding-left: 0; }
+  li { margin-bottom: 0.5rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 1rem; }
+  .card { background: #121212; border-radius: 8px; padding: 1rem; border: 1px solid #2a2a2a; overflow-wrap: break-word; word-break: break-all; }
+  .card h3 { margin-bottom: 0.5rem; color: #ffffff; }
+  .footer { text-align: center; margin-top: 2rem; color: #555; }
+  .timeline-item { margin-bottom: 0.5rem; padding-left: 1rem; border-left: 2px solid #555; }
+  pre { white-space: pre-wrap; font-size: 0.8rem; background: #0e0e0e; padding: 0.5rem; border-radius: 4px; }
+  details summary { cursor: pointer; color: #aaa; margin-top: 0.5rem; }
+  details pre { margin-top: 0.5rem; background: #0e0e0e; padding: 0.5rem; border-radius: 4px; }
+  img.avatar-thumb { max-width: 64px; max-height: 64px; border-radius: 4px; margin-top: 4px; display: block; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <img src="/static/images/logo.png" alt="WhoCord" style="height:50px;">
+    <h1>OSINT Investigation Report</h1>
+  </div>
+  <div class="meta">
+    <strong>Target ID:</strong> {{ target_id }}<br>
+    <strong>Generated:</strong> {{ timestamp }}
+  </div>
+
+  {% if persona_summary %}
+  <section>
+    <h2>🧑 Persona Summary (AI)</h2>
+    <p>{{ persona_summary }}</p>
+  </section>
+  {% endif %}
+
+  {% if discord_info and (discord_info.username or discord_info.account_created or discord_info.bio or discord_info.avatar_cdn) %}
+  <section>
+    <h2>📱 Discord Identity</h2>
+    <table>
+      {% if discord_info.username %}<tr><th>Username</th><td>{{ discord_info.username }}</td></tr>{% endif %}
+      {% if discord_info.account_created %}<tr><th>Account Created</th><td>{{ discord_info.account_created }}</td></tr>{% endif %}
+      {% if discord_info.bio %}<tr><th>Bio</th><td>{{ discord_info.bio }}</td></tr>{% endif %}
+      {% if discord_info.avatar_cdn %}<tr><th>Avatar</th><td><a href="{{ discord_info.avatar_cdn }}" target="_blank">View</a></td></tr>{% endif %}
+    </table>
+  </section>
+  {% endif %}
+
+  {% if social_profiles %}
+  <section>
+    <h2>🌐 Discovered Social Profiles</h2>
+    <div class="grid">
+  {% for p in social_profiles %}
+  <div class="card">
+    <h3>{{ p.site }}</h3>
+    <a href="{{ p.url }}" target="_blank">{{ p.url }}</a>
+    {% if p.display_name %}<p style="margin-top:0.3em;"><strong>Name:</strong> {{ p.display_name }}</p>{% endif %}
+    {% if p.bio %}<p style="margin-top:0.3em;">{{ p.bio }}</p>{% endif %}
+    {% if p.email %}<p style="margin-top:0.3em;"><strong>Email:</strong> {{ p.email }}</p>{% endif %}
+  </div>
+  {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
+  {% if emails %}
+  <section>
+    <h2>✉️ Emails</h2>
+    <table>
+      <tr><th>Email</th><th>Source</th></tr>
+      {% for e in emails %}
+      <tr>
+        <td>{{ e.email }}</td>
+        <td>{{ e.source }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </section>
+  {% endif %}
+
+  {% if breaches %}
+  <section>
+    <h2>🔓 Breach Intelligence</h2>
+    {% for breach in breaches %}
+    <div class="card" style="margin-bottom:0.5em;">
+      <strong>{{ breach.source | title }}</strong>
+      <p>{{ breach.summary }}</p>
+      {% if breach.details %}
+      <details style="margin-top:0.3em;">
+        <summary>Show raw details</summary>
+        <pre>{{ breach.details | tojson(indent=2) }}</pre>
+      </details>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </section>
+  {% endif %}
+
+  {% if enrichment %}
+  <section>
+    <h2>🧪 Enriched Profile Data</h2>
+    {% for item in enrichment %}
+    <div class="card" style="margin-bottom:0.5em;">
+      <h3>{{ item.source[:60] }}…</h3>
+      <ul>
+        {% for key, val in item.data.items() %}
+        <li><strong>{{ key }}:</strong> {{ val }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endfor %}
+  </section>
+  {% endif %}
+
+  {% if identity_clues %}
+  <section>
+    <h2>🧩 Identity Clues</h2>
+    <table>
+      <tr><th>Clue</th><th>Value</th></tr>
+      {% for key, val in identity_clues.items() %}
+      <tr>
+        <td>{{ key }}</td>
+        <td>{{ val.get('value', '') }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </section>
+  {% endif %}
+
+  {% if whois %}
+  <section>
+    <h2>🌍 WHOIS Information</h2>
+    {% for domain, info in whois.items() %}
+    <div class="card" style="margin-bottom:1em;">
+      <h3>{{ domain }}</h3>
+      <ul>
+        <li><strong>Registrant:</strong> {{ info.get('registrant_name', '') }}</li>
+        <li><strong>Email:</strong> {{ info.get('registrant_email', '') }}</li>
+        <li><strong>Creation Date:</strong> {{ info.get('creation_date', '') }}</li>
+      </ul>
+    </div>
+    {% endfor %}
+  </section>
+  {% endif %}
+
+  {% if media %}
+  <section>
+    <h2>📸 Media / EXIF</h2>
+    {% for key, val in media.items() %}
+    <div class="card" style="margin-bottom:1em;">
+      <strong>{{ key }}</strong> : {{ val }}
+    </div>
+    {% endfor %}
+  </section>
+  {% endif %}
+
+  {% if name_analysis %}
+  <section>
+    <h2>🔬 Name Analysis</h2>
+    <table>
+      <tr><th>Name</th><th>Origin</th><th>Gender</th><th>Subregion</th></tr>
+      {% for name, details in name_analysis.get('name_origins', {}).items() %}
+      <tr>
+        <td>{{ name }}</td>
+        <td>{{ details.is_human }}</td>
+        <td>{{ details.gender }}</td>
+        <td>{{ details.subregion }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% if name_analysis.get('similarity_matrix') %}
+    <h3 style="margin-top:1em;">Name Similarities</h3>
+    <ul>
+      {% for pair, score in name_analysis.similarity_matrix.items() %}
+      <li>{{ pair }} → {{ score }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+  {% endif %}
+
+  {% if confidence_scores %}
+  <section>
+    <h2>🏆 Identity Confidence Scores</h2>
+    {% for c in confidence_scores %}
+    <div class="card" style="margin-bottom:0.5em;">
+      <strong>{{ c.name }}</strong> – score: {{ c.score }}
+      <br>Platforms: {{ c.platforms }}
+      <br>Breakdown: {{ c.breakdown }}
+    </div>
+    {% endfor %}
+  </section>
+  {% endif %}
+
+  {% if wayback %}
+  <section>
+    <h2>🕰️ Wayback Machine Snapshots</h2>
+    <ul>
+      {% for url, snap in wayback.items() %}
+      <li><a href="{{ snap }}">{{ url }}</a></li>
+      {% endfor %}
+    </ul>
+  </section>
+  {% endif %}
+
+  {% if blackbird %}
+  <section>
+    <h2>🐦 Blackbird Search Results (fresh scan)</h2>
+    {% for file in blackbird %}
+      <details style="margin-bottom:0.5em;">
+        <summary>{{ file.filename }}</summary>
+        {% if file.entries %}
+          <ul>
+          {% for entry in file.entries %}
+            <li style="margin-bottom:0.5em;">
+              <strong>{{ entry.get("name", "?") }}</strong> – 
+              <a href="{{ entry.get('url', '#') }}" target="_blank">{{ entry.get("url", '') }}</a>
+            </li>
+          {% endfor %}
+          </ul>
+        {% else %}
+          <p>No entries found.</p>
+        {% endif %}
+      </details>
+    {% endfor %}
+  </section>
+  {% endif %}
+
+  {% if timeline %}
+  <section>
+    <h2>⏱️ Investigation Timeline</h2>
+    <ul>
+      {% for event in timeline %}
+      <li class="timeline-item">{{ event }}</li>
+      {% endfor %}
+    </ul>
+  </section>
+  {% endif %}
+
+  <div class="footer">🔎 Generated by WhoCord v1.0.3 – Universal OSINT Pipeline</div>
+</div>
+</body>
+</html>
