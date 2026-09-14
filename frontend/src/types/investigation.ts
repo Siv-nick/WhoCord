@@ -1,6 +1,4 @@
 // src/types/investigation.ts
-// All structured types – Phase 4 extended.
-
 import type { IconName } from "../components/Icons";
 
 // ---------------------------------------------------------------------------
@@ -16,6 +14,18 @@ export type InvestigationMode =
   | "image"
   | "url"
   | "probe";
+
+// ---------------------------------------------------------------------------
+// Investigation status
+// ---------------------------------------------------------------------------
+
+export type InvestigationStatus =
+  | "idle"
+  | "running"
+  | "stopping"
+  | "done"
+  | "cancelled"
+  | "error";
 
 // ---------------------------------------------------------------------------
 // SSE event envelope
@@ -177,10 +187,14 @@ export interface Job {
 // ---------------------------------------------------------------------------
 
 export interface TokenStatus {
-  DISCORD_TOKEN:     boolean;
-  GITHUB_TOKEN:      boolean;
-  GROQ_API_KEY:      boolean;
-  INSTAGRAM_SESSION: boolean;
+  DISCORD_TOKEN:      boolean;
+  GITHUB_TOKEN:       boolean;
+  GROQ_API_KEY:       boolean;
+  OPENROUTER_API_KEY: boolean;
+  HIBP_API_KEY:       boolean;
+  INSTAGRAM_SESSION:  boolean;
+  APOLLO_API_KEY:     boolean;
+  LUSHA_API_KEY:      boolean;
 }
 
 export interface ToolConfig {
@@ -198,6 +212,42 @@ export interface PivotConfig {
   require_confirm: boolean;
 }
 
+export type LLMProvider = "groq" | "openrouter";
+
+export interface LLMConfig {
+  provider:            LLMProvider;
+  model:               string;
+  temperature:         number;
+  max_tokens:          number;
+  system_prompt:       string;
+  intel_budget:        number;
+  intel_include_raw:   boolean;
+  intel_exclude_meta:  boolean;
+}
+
+// ── Contact-enrichment configuration ──────────────────────────────────────
+
+export type EnrichmentProvider = "apollo" | "lusha";
+
+export interface EnrichmentConfig {
+  max_identifiers: number;
+  phone_reveal:    boolean;
+  enabled: {
+    apollo: boolean;
+    lusha:  boolean;
+  };
+  keys_stored: {
+    apollo: boolean;
+    lusha:  boolean;
+  };
+}
+
+export interface EnrichmentTestResult {
+  ok:      boolean;
+  balance: number | Record<string, number | null> | null;
+  error:   string | null;
+}
+
 export interface AppConfig {
   tokens:             TokenStatus;
   tools:              ToolConfig[];
@@ -205,6 +255,8 @@ export interface AppConfig {
   multi_guild_search: boolean;
   debug:              boolean;
   pivot:              PivotConfig;
+  llm:                LLMConfig;
+  enrichment:         EnrichmentConfig;
 }
 
 // ---------------------------------------------------------------------------
@@ -222,12 +274,11 @@ export interface RunParams {
 }
 
 // ---------------------------------------------------------------------------
-// Module metadata (used by Dashboard module cards)
+// Module metadata
 // ---------------------------------------------------------------------------
 
 export interface ModuleMeta {
   id:               InvestigationMode;
-  /** Icon name from the Icons registry (not an emoji). */
   icon:             IconName;
   title:            string;
   description:      string;

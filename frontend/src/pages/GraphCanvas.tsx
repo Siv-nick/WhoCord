@@ -1,15 +1,4 @@
 // src/pages/GraphCanvas.tsx
-// ─────────────────────────────────────────────────────────────────────────────
-// Interactive investigation canvas.
-//
-// Perf notes
-//   • nodeById: Map<id, GraphNode> memoized once; edge loop is now O(E)
-//     instead of O(E × N).
-//   • compactMode: above 200 nodes, node labels are suppressed on
-//     non-selected nodes.
-//   • A single shared <radialGradient id="node-glass"> is defined here and
-//     referenced from every GraphNode.
-
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 
@@ -44,7 +33,6 @@ import type { InvestigationMode, RunParams } from "../types/investigation";
 import { classifyInput, MODULE_LABELS } from "../utils/classify";
 import { childPosition } from "../utils/graphLayout";
 
-// ── Threshold above which nodes hide their labels ────────────────────
 const COMPACT_NODE_THRESHOLD = 200;
 
 const MODULE_INPUTS: Array<{
@@ -87,7 +75,6 @@ export default function GraphCanvas() {
   const selectedNode = useSelectedNode();
   const filteredIds  = useFilteredNodeIds();
 
-  // ── Memoized id → node lookup.  Edge render loop becomes O(E). ──────
   const nodeById = useMemo(() => {
     const m = new Map<string, GraphNode>();
     for (const n of nodes) m.set(n.id, n);
@@ -96,7 +83,6 @@ export default function GraphCanvas() {
 
   const compactMode = nodes.length > COMPACT_NODE_THRESHOLD;
 
-  // ── UI state ───────────────────────────────────────────────────────
   const [showPopup,     setShowPopup]     = useState(false);
   const [showInfo,      setShowInfo]      = useState(false);
   const [showExport,    setShowExport]    = useState(false);
@@ -108,7 +94,6 @@ export default function GraphCanvas() {
   const [paletteOpen,   setPaletteOpen]   = useState(false);
   const [highlightedNodeId, setHighlighted] = useState<string | null>(null);
 
-  // ── Module form ────────────────────────────────────────────────────
   const [moduleFormOpen,     setModuleFormOpen]     = useState(false);
   const [moduleFormParentId, setModuleFormParentId] = useState<string | null>(null);
   const [moduleFormSelected, setModuleFormSelected] = useState<NodeModule | null>(null);
@@ -120,13 +105,16 @@ export default function GraphCanvas() {
   const vpDragging = useRef(false);
   const vpLast     = useRef({ x: 0, y: 0 });
 
-  const { start: startInvestigation, running, logs, currentStage } = useInvestigation();
+  const inv = useInvestigation();
+  const {
+    running, logs, currentStage,
+    status: invStatus, target: invTarget, mode: invMode,
+    jobId: invJobId, pivotDepth: invPivotDepth,
+    pivots: invPivots, findings: invFindings,
+  } = inv;
+  const { start: startInvestigation } = inv;
 
   const rightPanelWidth = showChat ? 380 : showCardList ? 400 : showLogPanel ? 340 : 0;
-
-  // ─────────────────────────────────────────────────────────────────
-  // Effects
-  // ─────────────────────────────────────────────────────────────────
 
   useEffect(() => {
     if (navState?.rootNode && nodes.length === 0) {
@@ -162,9 +150,6 @@ export default function GraphCanvas() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [running]);
 
-  // ─────────────────────────────────────────────────────────────────
-  // Focus helper
-  // ─────────────────────────────────────────────────────────────────
   const focusNode = useCallback((nodeId: string) => {
     const node = nodes.find(n => n.id === nodeId);
     if (!node) return;
@@ -176,9 +161,6 @@ export default function GraphCanvas() {
     });
   }, [nodes, size, viewport.zoom, setViewport]);
 
-  // ─────────────────────────────────────────────────────────────────
-  // Background pan handlers
-  // ─────────────────────────────────────────────────────────────────
   const onBgPointerDown = useCallback((e: React.PointerEvent<SVGRectElement>) => {
     if (e.button !== 0) return;
     vpDragging.current = true;
@@ -206,9 +188,6 @@ export default function GraphCanvas() {
     zoomTo(viewport.zoom * delta);
   }, [viewport.zoom, zoomTo]);
 
-  // ─────────────────────────────────────────────────────────────────
-  // Node handlers — stable identities so memoized nodes skip re-renders
-  // ─────────────────────────────────────────────────────────────────
   const handleNodeDragEnd = useCallback(
     (id: string, pos: { x: number; y: number }) => {
       updateNode(id, { position: pos });
@@ -255,9 +234,6 @@ export default function GraphCanvas() {
     openModuleForm(nodeId, { module, input: node.label });
   }, [nodeById, openModuleForm]);
 
-  // ─────────────────────────────────────────────────────────────────
-  // Submit module form → add child node + start SSE
-  // ─────────────────────────────────────────────────────────────────
   const handleModuleFormSubmit = useCallback(() => {
     const parentId = moduleFormParentId;
     const modId    = moduleFormSelected;
@@ -335,9 +311,6 @@ export default function GraphCanvas() {
   }, [moduleFormParentId, moduleFormSelected, moduleFormInput, nodes,
       nodeById, addNode, addEdge, startInvestigation, toast]);
 
-  // ─────────────────────────────────────────────────────────────────
-  // Info field edit
-  // ─────────────────────────────────────────────────────────────────
   const handleInfoFieldChange = useCallback((
     nodeId: string, key: string, value: string,
   ) => {
@@ -348,9 +321,6 @@ export default function GraphCanvas() {
     });
   }, [nodeById, updateNode]);
 
-  // ─────────────────────────────────────────────────────────────────
-  // Cascade delete
-  // ─────────────────────────────────────────────────────────────────
   const handleDeleteNode = useCallback((nodeId: string) => {
     const doomed = new Set<string>([nodeId]);
     let changed = true;
@@ -367,9 +337,6 @@ export default function GraphCanvas() {
     toast.push("info", "Node deleted", `Removed ${doomed.size} node${doomed.size !== 1 ? "s" : ""}.`);
   }, [edges, removeNode, toast]);
 
-  // ─────────────────────────────────────────────────────────────────
-  // Derived positions
-  // ─────────────────────────────────────────────────────────────────
   const selectedScreenPos = selectedNode
     ? {
         x: selectedNode.position.x * viewport.zoom + viewport.x,
@@ -381,9 +348,6 @@ export default function GraphCanvas() {
     ? edges.some(e => e.sourceId === selectedNode.id)
     : false;
 
-  // ─────────────────────────────────────────────────────────────────
-  // Command palette actions
-  // ─────────────────────────────────────────────────────────────────
   const paletteActions: PaletteAction[] = [
     { id: "new", group: "Investigate", icon: "sparkle", label: "New investigation", hint: "Add a seed", run: () => openModuleForm(null) },
     { id: "reset", group: "View", icon: "target", label: "Reset viewport", run: () => setViewport({ x: 0, y: 0, zoom: 1 }) },
@@ -398,9 +362,6 @@ export default function GraphCanvas() {
     { id: "home", group: "Navigation", icon: "arrowLeft", label: "Back to home", run: () => navigate("/") },
   ];
 
-  // ─────────────────────────────────────────────────────────────────
-  // Render
-  // ─────────────────────────────────────────────────────────────────
   return (
     <div
       ref={canvasRef}
@@ -419,7 +380,6 @@ export default function GraphCanvas() {
         style={{ overflow: "visible" }}
         onWheel={onWheel}
       >
-        {/* Shared paint servers — referenced by every GraphNode. */}
         <defs>
           <radialGradient id="node-glass" cx="50%" cy="30%">
             <stop offset="0%"   stopColor="#ffffff" stopOpacity="0.28" />
@@ -601,7 +561,6 @@ export default function GraphCanvas() {
         </>
       )}
 
-      {/* Left toolbar */}
       <div className="absolute top-4 left-4 z-10 flex items-center gap-2 flex-wrap">
         <button onClick={() => navigate("/")} className="btn">
           <Icon name="arrowLeft" size={14} /> Home
@@ -648,7 +607,6 @@ export default function GraphCanvas() {
         </button>
       </div>
 
-      {/* Right toolbar */}
       <div
         className="absolute top-4 z-10 flex items-center gap-2"
         style={{ right: rightPanelWidth + 16 }}
@@ -684,7 +642,6 @@ export default function GraphCanvas() {
         </button>
       </div>
 
-      {/* Filter panel */}
       <div
         className="absolute top-16 z-10"
         style={{ right: rightPanelWidth + 16 }}
@@ -692,7 +649,6 @@ export default function GraphCanvas() {
         <FilterPanel nodeCount={nodes.length} />
       </div>
 
-      {/* Side panels */}
       <LiveLogPanel
         logs={logs}
         isOpen={showLogPanel && !showChat && !showCardList}
@@ -708,6 +664,15 @@ export default function GraphCanvas() {
         onClose={() => setShowChat(false)}
         nodes={nodes}
         edges={edges}
+        invStatus={invStatus}
+        invStage={currentStage}
+        invJobId={invJobId}
+        invTarget={invTarget}
+        invMode={invMode}
+        invPivotDepth={invPivotDepth}
+        invPivots={invPivots}
+        invLogs={logs}
+        invFindings={invFindings}
       />
       <CardListPanel
         nodes={nodes}
@@ -716,7 +681,6 @@ export default function GraphCanvas() {
         isOpen={showCardList}
       />
 
-      {/* Modals */}
       <CanvasConfigPanel
         isOpen={showConfig}
         onClose={() => setShowConfig(false)}
@@ -740,7 +704,6 @@ export default function GraphCanvas() {
         />
       )}
 
-      {/* Empty state */}
       {nodes.length === 0 && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
           <div className="text-center anim-rise">

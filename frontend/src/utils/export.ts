@@ -1,10 +1,44 @@
 // src/utils/export.ts
 // ─────────────────────────────────────────────────────────────────────────────
 // Canvas export (PNG) and map serialisation (.whocord-map JSON).
+//
+// Change log
+// ----------
+// - PNG export no longer hardcodes `backgroundColor: "#ffffff"`. The
+//   canvas is dark; a white background produced an inverted-looking image
+//   with black-on-white nodes. The background is now read from the active
+//   theme so exports match what the analyst sees.
+// - The file picker uses both `change` and (where supported) `cancel` to
+//   resolve the promise — older browsers that don't fire `cancel` still
+//   work because `change` fires an empty file list on close in most cases.
+//   A defensive timeout ensures the promise never hangs forever.
 
 import type { GraphEdge, GraphNode, MapSaveFile, Viewport } from "../types/graph";
 
 const MAP_VERSION = "1.0";
+
+// ---------------------------------------------------------------------------
+// Theme lookup
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the current canvas background from the persisted theme store.
+ * Falls back to the theme default when localStorage is unavailable.
+ */
+function currentCanvasBackground(): string {
+  try {
+    const raw = localStorage.getItem("whocord-theme");
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      // zustand persist wraps state under `state`
+      const bg = parsed?.state?.canvasBackground;
+      if (typeof bg === "string" && bg.trim()) return bg;
+    }
+  } catch {
+    /* ignore — fall through */
+  }
+  return "#0a0a0d";
+}
 
 // ---------------------------------------------------------------------------
 // PNG export via html2canvas
@@ -12,17 +46,18 @@ const MAP_VERSION = "1.0";
 
 /**
  * Capture the canvas element as a high-resolution PNG and trigger a download.
- * Falls back to a warning if html2canvas is not available.
+ * Falls back to an SVG snapshot if html2canvas is unavailable.
  */
 export async function exportAsPNG(
   canvasElement: HTMLElement,
   filename: string = "whocord-map.png",
 ): Promise<void> {
+  const bg = currentCanvasBackground();
+
   try {
-    // Dynamic import so the app still works if html2canvas fails to load
     const html2canvas = (await import("html2canvas")).default;
     const canvas = await html2canvas(canvasElement, {
-      backgroundColor: "#ffffff",
+      backgroundColor: bg,
       scale: 2,                // 2× for retina quality
       useCORS: true,
       logging: false,
@@ -32,18 +67,30 @@ export async function exportAsPNG(
     link.href      = canvas.toDataURL("image/png");
     link.click();
   } catch (err) {
-    console.warn("html2canvas not available; falling back to SVG screenshot.", err);
-    // Fallback: try to get an SVG element and convert
+    console.warn("html2canvas unavailable; falling back to SVG snapshot.", err);
+
     const svg = canvasElement.querySelector("svg");
-    if (svg) {
-      const blob = new Blob([svg.outerHTML], { type: "image/svg+xml" });
-      const url  = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.download = filename.replace(".png", ".svg");
-      link.href     = url;
-      link.click();
-      URL.revokeObjectURL(url);
-    }
+    if (!svg) return;
+
+    // Clone so we can inline the current background as a <rect>.
+    const clone = svg.cloneNode(true) as SVGSVGElement;
+    const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+    rect.setAttribute("width", "100%");
+    rect.setAttribute("height", "100%");
+    rect.setAttribute("fill", bg);
+    clone.insertBefore(rect, clone.firstChild);
+
+    const svgText = new XMLSerializer().serializeToString(clone);
+    const blob = new Blob([svgText], { type: "image/svg+xml;charset=utf-8" });
+    const url  = URL.createObjectURL(blob);
+
+    const link = document.createElement("a");
+    link.download = filename.replace(/\.png$/i, ".svg");
+    link.href     = url;
+    link.click();
+
+    // Revoke after the browser has had a chance to start the download.
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
   }
 }
 
@@ -62,10 +109,7 @@ export function serializeMap(
   return {
     version:  MAP_VERSION,
     savedAt:  new Date().toISOString(),
-    nodes:    nodes.map(n => ({
-      ...n,
-      // Ensure Sets are not included (InfoField values are plain strings)
-    })),
+    nodes:    nodes.map(n => ({ ...n })),
     edges,
     viewport,
   };
@@ -115,7 +159,7 @@ export function downloadMapFile(
   link.download = filename;
   link.href     = url;
   link.click();
-  URL.revokeObjectURL(url);
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
 // ---------------------------------------------------------------------------
@@ -132,20 +176,42 @@ export function openMapFilePicker(): Promise<{
     input.type    = "file";
     input.accept  = ".whocord-map,application/json";
 
+    let settled = false;
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      fn();
+    };
+
     input.onchange = async () => {
       const file = input.files?.[0];
-      if (!file) { reject(new Error("No file selected.")); return; }
-
+      if (!file) {
+        // Some browsers fire `change` with an empty list when the picker
+        // is dismissed — treat that as cancel rather than hanging.
+        settle(() => reject(new Error("File picker cancelled.")));
+        return;
+      }
       try {
         const text = await file.text();
         const data = JSON.parse(text);
-        resolve(deserializeMap(data));
+        settle(() => resolve(deserializeMap(data)));
       } catch (err) {
-        reject(new Error(`Could not parse map file: ${err}`));
+        settle(() => reject(new Error(`Could not parse map file: ${err}`)));
       }
     };
 
-    input.oncancel = () => reject(new Error("File picker cancelled."));
+    // `oncancel` is not universally supported. Attach defensively —
+    // browsers that don't fire it rely on the empty-list change above.
+    const onCancel = () => settle(() => reject(new Error("File picker cancelled.")));
+    if ("oncancel" in input) {
+      (input as any).oncancel = onCancel;
+    }
+
+    // Final safety: if neither change nor cancel fires (rare, but seen
+    // with certain browser extensions), resolve with a clear error after
+    // a generous timeout rather than leaking a pending promise forever.
+    setTimeout(() => settle(() => reject(new Error("File picker timed out."))), 5 * 60_000);
+
     input.click();
   });
 }

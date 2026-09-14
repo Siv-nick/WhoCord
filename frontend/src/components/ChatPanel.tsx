@@ -1,14 +1,28 @@
 // src/components/ChatPanel.tsx
 import React, { useEffect, useRef, useState } from "react";
 import type { ChatMessage, GraphEdge, GraphNode } from "../types/graph";
+import type {
+  Finding,
+  InvestigationStatus,
+  PivotInfo,
+} from "../types/investigation";
 import { useChat } from "../hooks/useChat";
 import { Icon } from "./Icons";
 
 interface Props {
-  isOpen: boolean;
+  isOpen:  boolean;
   onClose: () => void;
-  nodes: GraphNode[];
-  edges: GraphEdge[];
+  nodes:   GraphNode[];
+  edges:   GraphEdge[];
+  invStatus?:     InvestigationStatus;
+  invStage?:      string | null;
+  invJobId?:      string | null;
+  invTarget?:     string;
+  invMode?:       string;
+  invPivotDepth?: number;
+  invPivots?:     PivotInfo[];
+  invLogs?:       string[];
+  invFindings?:   Finding[];
 }
 
 function Bubble({ msg }: { msg: ChatMessage }) {
@@ -39,7 +53,11 @@ function Bubble({ msg }: { msg: ChatMessage }) {
   );
 }
 
-export default function ChatPanel({ isOpen, onClose, nodes, edges }: Props) {
+export default function ChatPanel({
+  isOpen, onClose, nodes, edges,
+  invStatus, invStage, invJobId, invTarget, invMode,
+  invPivotDepth, invPivots, invLogs, invFindings,
+}: Props) {
   const { messages, streaming, sendMessage, clearChat } = useChat();
   const [input, setInput] = useState("");
   const endRef   = useRef<HTMLDivElement>(null);
@@ -57,7 +75,17 @@ export default function ChatPanel({ isOpen, onClose, nodes, edges }: Props) {
     const t = input.trim();
     if (!t || streaming) return;
     setInput("");
-    await sendMessage(t, nodes, edges);
+    await sendMessage(t, nodes, edges, {
+      status:       invStatus,
+      currentStage: invStage,
+      jobId:        invJobId,
+      target:       invTarget,
+      mode:         invMode,
+      pivotDepth:   invPivotDepth,
+      pivots:       invPivots,
+      logs:         invLogs,
+      findings:     invFindings,
+    });
   };
 
   const SUGGESTIONS = [
@@ -90,7 +118,7 @@ export default function ChatPanel({ isOpen, onClose, nodes, edges }: Props) {
         </div>
         <div className="flex-1 min-w-0">
           <p className="text-[13px] font-bold text-white">AI Analyst</p>
-          <p className="text-[10px] text-zinc-500">Contextual to your canvas</p>
+          <p className="text-[10px] text-zinc-500">Full intel + canvas context</p>
         </div>
         {messages.length > 0 && (
           <button
@@ -114,6 +142,7 @@ export default function ChatPanel({ isOpen, onClose, nodes, edges }: Props) {
           </span>
           <span className="text-[11px] text-violet-200 font-medium">
             {nodes.length} nodes · {edges.length} edges
+            {invJobId ? " · intel dump loaded" : ""}
           </span>
           <span className="ml-auto text-[10px] text-violet-400/70">in context</span>
         </div>
@@ -132,7 +161,8 @@ export default function ChatPanel({ isOpen, onClose, nodes, edges }: Props) {
               </p>
               <p className="text-[11px] text-zinc-500 mt-1 max-w-[220px]
                             leading-relaxed mx-auto">
-                Summaries, patterns, next steps — anything about the current map.
+                The model sees your canvas, live logs, findings, pivots,
+                and the full persisted intel dump.
               </p>
             </div>
             <div className="w-full space-y-1.5 mt-1">

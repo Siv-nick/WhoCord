@@ -3,6 +3,16 @@ discord_osint/pipeline/stages/url_analysis.py
 ----------------------------------------------
 URLAnalysisStage – Phase 4 URL analysis module.
 
+Changes in this revision
+------------------------
+- Every outbound request (initial fetch + each redirect hop) is routed
+  through ``utils.url_safety.safe_get`` so a URL pointing at
+  ``127.0.0.1``, ``169.254.169.254``, ``10.0.0.0/8``, or an
+  internal hostname cannot be reached.
+- Stage honours the pipeline-wide cancellation token by checking it at
+  entry (the runner already checks between stages; a check here means a
+  cancel during the previous stage aborts before any network work).
+
 Reads from ctx
 --------------
 ctx.manual_url   – the target URL
@@ -22,6 +32,7 @@ from ..base import Stage, EmitFn
 from ..context import InvestigationContext
 from ...extras import wayback_available
 from ...scraping import is_valid_email
+from ...utils.url_safety import safe_get, UnsafeURLError
 
 # Max page content to parse (bytes)
 _MAX_CONTENT = 500_000
@@ -34,6 +45,13 @@ class URLAnalysisStage(Stage):
     name = "url_analysis"
 
     def run(self, ctx: InvestigationContext, emit: EmitFn = lambda *_: None) -> None:
+        # Respect the pipeline-wide cancellation token before doing
+        # any network work.
+        cancel_event = getattr(ctx.config, "_cancel_event", None)
+        if cancel_event is not None and cancel_event.is_set():
+            print("  [URLAnalysis] cancellation requested – skipping.")
+            return
+
         url = ctx.manual_url.strip()
 
         if not url or not url.startswith("http"):
@@ -101,7 +119,8 @@ class URLAnalysisStage(Stage):
                     "url_intel", "interesting_links",
                     interesting_links, source="html_parse",
                 )
-                emit("finding", {"type": "interesting_links", "url": url, "count": len(interesting_links)})
+                emit("finding", {"type": "interesting_links", "url": url,
+                                 "count": len(interesting_links)})
                 print(f"  Interesting links found: {len(interesting_links)}")
                 for link in interesting_links[:5]:
                     ctx.add_discovery("url_page", link)
@@ -163,7 +182,9 @@ class URLAnalysisStage(Stage):
     @staticmethod
     def _fetch_url(url: str) -> tuple[dict, str, str]:
         """
-        Perform HTTP GET with redirect following.
+        Perform HTTP GET with redirect following, guarded by the SSRF
+        checks in ``safe_get``.
+
         Returns (http_meta_dict, page_content, final_url).
         """
         try:
@@ -175,21 +196,33 @@ class URLAnalysisStage(Stage):
                     "AppleWebKit/537.36 Chrome/120 Safari/537.36"
                 )
             })
-            resp = session.get(url, timeout=15, stream=True, allow_redirects=True)
-            # Collect redirect chain
-            redirects = [r.url for r in resp.history]
+
+            # safe_get validates the initial URL and every redirect hop.
+            resp = safe_get(
+                url,
+                session=session,
+                timeout=15,
+                stream=True,
+            )
+
+            # Collect redirect chain — safe_get follows manually, so the
+            # response doesn't include resp.history; we reconstruct the
+            # chain by looking at what the final URL is versus the start.
+            final_url    = resp.url
+            redirect_chain = [] if final_url == url else [final_url]
+
             content_type = resp.headers.get("Content-Type", "")
 
             meta = {
-                "status_code":    resp.status_code,
-                "final_url":      resp.url,
-                "redirect_count": len(redirects),
-                "redirect_chain": redirects,
-                "content_type":   content_type,
-                "server":         resp.headers.get("Server", ""),
-                "x_powered_by":   resp.headers.get("X-Powered-By", ""),
-                "content_length": resp.headers.get("Content-Length", ""),
-                "last_modified":  resp.headers.get("Last-Modified", ""),
+                "status_code":      resp.status_code,
+                "final_url":        final_url,
+                "redirect_count":   len(redirect_chain),
+                "redirect_chain":   redirect_chain,
+                "content_type":     content_type,
+                "server":           resp.headers.get("Server", ""),
+                "x_powered_by":     resp.headers.get("X-Powered-By", ""),
+                "content_length":   resp.headers.get("Content-Length", ""),
+                "last_modified":    resp.headers.get("Last-Modified", ""),
                 "strict_transport": resp.headers.get("Strict-Transport-Security", ""),
             }
 
@@ -199,8 +232,11 @@ class URLAnalysisStage(Stage):
             else:
                 content = ""
 
-            return meta, content, resp.url
+            return meta, content, final_url
 
+        except UnsafeURLError as exc:
+            print(f"  HTTP fetch blocked: {exc}")
+            return {}, "", ""
         except Exception as exc:
             print(f"  HTTP fetch error: {exc}")
             return {}, "", ""
@@ -263,7 +299,8 @@ class URLAnalysisStage(Stage):
             payload = {
                 "client":    {"clientId": "whocord", "clientVersion": "3.0"},
                 "threatInfo": {
-                    "threatTypes":      ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE",
+                    "threatTypes":      ["MALWARE", "SOCIAL_ENGINEERING",
+                                         "UNWANTED_SOFTWARE",
                                          "POTENTIALLY_HARMFUL_APPLICATION"],
                     "platformTypes":    ["ANY_PLATFORM"],
                     "threatEntryTypes": ["URL"],
@@ -285,8 +322,8 @@ class URLAnalysisStage(Stage):
 
     def _extract_interesting_links(self, html: str, base_url: str) -> list[str]:
         """
-        Extract URLs from the page that look like social profiles, GitHub repos,
-        or other interesting resources. Uses a simple heuristic.
+        Extract URLs from the page that look like social profiles, GitHub
+        repos, or other interesting resources. Uses a simple heuristic.
         """
         import re
         interesting = set()
@@ -309,4 +346,3 @@ class URLAnalysisStage(Stage):
                 url = url.rstrip(".,;:!?")
                 interesting.add(url)
         return list(interesting)[:20]  # limit
-

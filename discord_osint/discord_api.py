@@ -4,15 +4,17 @@ import json
 import sys
 import os
 import subprocess as _sp
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
+
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from . import utils
 from .utils import http_session, REQUEST_DELAY, clean_username
 
 # ── Bug 3 fix: never bind tool flags at import time. ──────────────────
-# The original module-level import bound MULTI_GUILD_SEARCH to a
-# snapshot at import time. We now read it dynamically via _flag().
 from . import config as _config_module
 
 
@@ -69,8 +71,19 @@ def get_all_user_guilds(token):
     return guilds
 
 
-def search_user_messages(token, gid, uid):
-    h = {"Authorization": token, "Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+def search_user_messages(token, gid, uid, quiet: bool = False):
+    """
+    Search one guild for messages authored by *uid*.
+
+    Parameters
+    ----------
+    quiet:
+        When True, suppress the in-place progress print. Set by the
+        parallel guild search so concurrent workers don't interleave
+        carriage-return progress on the same line.
+    """
+    h = {"Authorization": token, "Content-Type": "application/json",
+         "User-Agent": "Mozilla/5.0"}
     base = f"https://discord.com/api/v9/guilds/{gid}/messages/search"
     all_msgs, offset, limit, mret = [], 0, 25, 3
     while True:
@@ -81,7 +94,8 @@ def search_user_messages(token, gid, uid):
                 r = http_session.get(base, headers=h, params=params)
                 if r.status_code == 429:
                     wait = int(r.headers.get("Retry-After", 5))
-                    print(f"Rate limited – waiting {wait}s")
+                    if not quiet:
+                        print(f"Rate limited – waiting {wait}s")
                     time.sleep(wait)
                     continue
                 if r.status_code != 200:
@@ -92,45 +106,84 @@ def search_user_messages(token, gid, uid):
                 data = r.json()
                 break
             except requests.exceptions.ConnectionError as e:
-                print(f"Connection error: {e}, retrying ({attempt + 1}/{mret})...")
+                if not quiet:
+                    print(f"Connection error: {e}, retrying ({attempt + 1}/{mret})...")
                 time.sleep(2)
             except Exception as e:
-                print(f"Unexpected error: {e}, retrying ({attempt + 1}/{mret})...")
+                if not quiet:
+                    print(f"Unexpected error: {e}, retrying ({attempt + 1}/{mret})...")
                 time.sleep(2)
         if data is None:
             break
         for grp in data.get("messages", []):
             all_msgs.extend(grp)
         total = data.get("total_results", 0)
-        print(f"Progress: {min(offset + limit, total)} / {total}", end="\r")
+        if not quiet:
+            print(f"Progress: {min(offset + limit, total)} / {total}", end="\r")
         if offset + limit >= total:
             break
         offset += limit
         time.sleep(REQUEST_DELAY)
-    print()
+    if not quiet:
+        print()
     return all_msgs
 
 
 def multi_guild_message_search(token, uid, preferred_gid=None):
+    """
+    Search every guild the token belongs to for messages by *uid*.
+
+    Change log
+    ----------
+    The previous implementation iterated guilds serially with a fixed
+    ``time.sleep(5)`` between each — an account in 40 guilds took 200+
+    seconds of pure sleep, on top of the actual API work. Each guild's
+    search is independent, so they now run in a small worker pool.
+
+    Concurrency is capped at 5 because Discord rate-limits per token,
+    not per guild. Each ``search_user_messages`` call still backs off on
+    429 (Retry-After header) so a burst doesn't get the token banned.
+    """
     # <<< Bug 3 fix: read the flag dynamically >>>
     if preferred_gid and not _flag("MULTI_GUILD_SEARCH"):
         return search_user_messages(token, preferred_gid, uid)
+
     guilds = get_all_user_guilds(token)
     if not guilds:
         if preferred_gid:
             return search_user_messages(token, preferred_gid, uid)
         return []
-    guilds_to_search = guilds
-    all_messages = []
-    for gid in guilds_to_search:
-        print(f"  Searching guild {gid}...")
+
+    # If the caller asked to search a specific guild too, include it even
+    # if it's already in the list (the list contains every guild the user
+    # is a member of, which may or may not include the target's guild).
+    if preferred_gid and preferred_gid not in guilds:
+        guilds = [preferred_gid] + list(guilds)
+
+    max_workers = min(5, max(1, len(guilds)))
+    print(f"  Searching {len(guilds)} guild(s) with {max_workers} worker(s)…")
+
+    all_messages: list = []
+    _print_lock = threading.Lock()
+
+    def _search_one(gid: str):
         try:
-            msgs = search_user_messages(token, gid, uid)
+            msgs = search_user_messages(token, gid, uid, quiet=True)
+            return gid, msgs or []
+        except Exception as e:
+            with _print_lock:
+                print(f"  Guild {gid} search failed: {e}")
+            return gid, []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_search_one, gid): gid for gid in guilds}
+        for fut in as_completed(futures):
+            gid, msgs = fut.result()
             if msgs:
                 all_messages.extend(msgs)
-        except Exception as e:
-            print(f"  Guild {gid} search failed: {e}")
-        time.sleep(5)
+                with _print_lock:
+                    print(f"  Guild {gid}: {len(msgs)} message(s) matched")
+
     return all_messages
 
 

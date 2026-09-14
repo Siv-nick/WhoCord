@@ -4,10 +4,16 @@
 //
 // Change log
 // ----------
-// - Added `hoveredNodeId` so EdgeLine can glow edges whose endpoint is
-//   the hovered node (the glow is driven by node hover, not line hover).
-// - `useSelectedNode` / `useFilteredNodeIds` are now memoized so they no
-//   longer force every GraphNode to re-render on unrelated state changes.
+// - New `removeNodes(ids)` batched method. Deleting a branch used to call
+//   `removeNode(id)` once per node in a `.forEach`, producing N store
+//   updates and N re-renders of every subscriber (edges, nodes, cards,
+//   chat context). Bulk deletion now happens in one set() call.
+// - `useSelectedNode` / `useFilteredNodeIds` remain memoized — the
+//   original version built a fresh Set on every render which gave every
+//   `<GraphNode>` a new `dimmed` prop identity and forced a full
+//   re-render of the canvas on any state change. That fix is retained.
+// - `removeNode` (singular) is preserved for the popup's single-node
+//   deletion path where the N=1 case is trivially fine.
 
 import { useMemo } from "react";
 import { create } from "zustand";
@@ -50,6 +56,7 @@ interface GraphState {
   // ── Node mutations ───────────────────────────────────────────────────
   addNode:    (node: GraphNode) => void;
   removeNode: (id: string) => void;
+  removeNodes:(ids: string[]) => void;   // batched
   updateNode: (id: string, patch: Partial<GraphNode>) => void;
 
   // ── Edge mutations ───────────────────────────────────────────────────
@@ -109,8 +116,35 @@ export const useGraphState = create<GraphState>((set, get) => ({
       nodes:          s.nodes.filter((n) => n.id !== id),
       edges:          s.edges.filter((e) => e.sourceId !== id && e.targetId !== id),
       selectedNodeId: s.selectedNodeId === id ? null : s.selectedNodeId,
-      hoveredNodeId:  s.hoveredNodeId === id ? null : s.hoveredNodeId,
+      hoveredNodeId:  s.hoveredNodeId  === id ? null : s.hoveredNodeId,
     })),
+
+  /**
+   * Batched removal. Given a set of node ids, drops them and every edge
+   * incident to any of them in a single state update. Use this when
+   * deleting a whole branch — the singular removeNode() fires one
+   * subscription notification per call which is fine for N=1 but
+   * wasteful for the ten-to-fifty nodes a branch can have.
+   */
+  removeNodes: (ids) =>
+    set((s) => {
+      if (ids.length === 0) return s;
+      const dropSet = new Set(ids);
+      const nextSelected = dropSet.has(s.selectedNodeId ?? "")
+        ? null
+        : s.selectedNodeId;
+      const nextHovered = dropSet.has(s.hoveredNodeId ?? "")
+        ? null
+        : s.hoveredNodeId;
+      return {
+        nodes: s.nodes.filter((n) => !dropSet.has(n.id)),
+        edges: s.edges.filter(
+          (e) => !dropSet.has(e.sourceId) && !dropSet.has(e.targetId),
+        ),
+        selectedNodeId: nextSelected,
+        hoveredNodeId:  nextHovered,
+      };
+    }),
 
   updateNode: (id, patch) =>
     set((s) => ({
@@ -208,7 +242,7 @@ export function useSelectedNode(): GraphNode | null {
  * Memoized on the node array and the filter object — the original version
  * rebuilt a fresh `Set` on every render, which gave every `<GraphNode>` a
  * new `dimmed` prop identity and forced a full re-render of the canvas on
- * any state change.  Now it recomputes only when nodes or filters change.
+ * any state change. Now it recomputes only when nodes or filters change.
  */
 export function useFilteredNodeIds(): Set<string> {
   const nodes  = useGraphState((s) => s.nodes);

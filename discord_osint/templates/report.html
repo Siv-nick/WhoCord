@@ -48,6 +48,41 @@
 </style>
 </head>
 <body>
+{#
+  Scheme-safe href helper.
+
+  Jinja autoescape (which Flask enables for .html templates) prevents
+  raw markup injection, but it does NOT stop `javascript:`-scheme URLs
+  from being valid clickable href targets — the browser treats the
+  scheme check as orthogonal to HTML escaping.
+
+  Every URL-valued field in this template goes through `safe_href()`,
+  which:
+    • allows http, https, mailto (and relative paths starting with /)
+    • collapses everything else (javascript:, data:, vbscript:, file:,
+      unparseable) to "#"
+
+  This block is defined inline because Jinja macros can't easily be
+  used for the pure-python-style checks we need.
+#}
+{% macro safe_href(value) -%}
+  {%- set v = (value or '') | string | trim -%}
+  {%- set low = v | lower -%}
+  {%- if low.startswith('http://') or low.startswith('https://') or low.startswith('mailto:') or v.startswith('/') -%}
+    {{- v | e -}}
+  {%- else -%}
+    #
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro safe_img_src(value) -%}
+  {%- set v = (value or '') | string | trim -%}
+  {%- set low = v | lower -%}
+  {%- if low.startswith('http://') or low.startswith('https://') -%}
+    {{- v | e -}}
+  {%- endif -%}
+{%- endmacro %}
+
 <div class="container">
   <div class="header">
     <img src="/static/images/logo.png" alt="WhoCord" style="height:50px;">
@@ -72,7 +107,19 @@
       {% if discord_info.username %}<tr><th>Username</th><td>{{ discord_info.username }}</td></tr>{% endif %}
       {% if discord_info.account_created %}<tr><th>Account Created</th><td>{{ discord_info.account_created }}</td></tr>{% endif %}
       {% if discord_info.bio %}<tr><th>Bio</th><td>{{ discord_info.bio }}</td></tr>{% endif %}
-      {% if discord_info.avatar_cdn %}<tr><th>Avatar</th><td><a href="{{ discord_info.avatar_cdn }}" target="_blank">View</a></td></tr>{% endif %}
+      {% if discord_info.avatar_cdn %}
+      <tr>
+        <th>Avatar</th>
+        <td>
+          {% set safe = safe_href(discord_info.avatar_cdn) %}
+          {% if safe and safe != '#' %}
+            <a href="{{ safe }}" target="_blank" rel="noopener noreferrer">View</a>
+          {% else %}
+            <span class="badge warning">invalid URL</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endif %}
     </table>
   </section>
   {% endif %}
@@ -84,7 +131,13 @@
   {% for p in social_profiles %}
   <div class="card">
     <h3>{{ p.site }}</h3>
-    <a href="{{ p.url }}" target="_blank">{{ p.url }}</a>
+    {% set safe = safe_href(p.url) %}
+    {% if safe and safe != '#' %}
+      <a href="{{ safe }}" target="_blank" rel="noopener noreferrer">{{ p.url }}</a>
+    {% else %}
+      <span style="color:#999;">{{ p.url }}</span>
+      <span class="badge warning">invalid link</span>
+    {% endif %}
     {% if p.display_name %}<p style="margin-top:0.3em;"><strong>Name:</strong> {{ p.display_name }}</p>{% endif %}
     {% if p.bio %}<p style="margin-top:0.3em;">{{ p.bio }}</p>{% endif %}
     {% if p.email %}<p style="margin-top:0.3em;"><strong>Email:</strong> {{ p.email }}</p>{% endif %}
@@ -228,7 +281,14 @@
     <h2>🕰️ Wayback Machine Snapshots</h2>
     <ul>
       {% for url, snap in wayback.items() %}
-      <li><a href="{{ snap }}">{{ url }}</a></li>
+      <li>
+        {% set safe = safe_href(snap) %}
+        {% if safe and safe != '#' %}
+          <a href="{{ safe }}" target="_blank" rel="noopener noreferrer">{{ url }}</a>
+        {% else %}
+          {{ url }}
+        {% endif %}
+      </li>
       {% endfor %}
     </ul>
   </section>
@@ -244,8 +304,13 @@
           <ul>
           {% for entry in file.entries %}
             <li style="margin-bottom:0.5em;">
-              <strong>{{ entry.get("name", "?") }}</strong> – 
-              <a href="{{ entry.get('url', '#') }}" target="_blank">{{ entry.get("url", '') }}</a>
+              <strong>{{ entry.get("name", "?") }}</strong> –
+              {% set safe = safe_href(entry.get('url', '')) %}
+              {% if safe and safe != '#' %}
+                <a href="{{ safe }}" target="_blank" rel="noopener noreferrer">{{ entry.get("url", '') }}</a>
+              {% else %}
+                {{ entry.get("url", '') }}
+              {% endif %}
             </li>
           {% endfor %}
           </ul>

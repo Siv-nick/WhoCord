@@ -2,13 +2,25 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
   fetchConfig,
+  fetchLLMModels,
+  saveLLMConfig,
   savePivotConfig,
+  saveEnrichmentConfig,
   setToken,
+  testEnrichmentProvider,
   toggleDebug,
   toggleTool,
   upgradeToolsUrl,
+  type LLMModel,
+  type LLMConfig,
 } from "../utils/api";
-import type { AppConfig, PivotConfig, ToolConfig } from "../types/investigation";
+import type {
+  AppConfig,
+  EnrichmentTestResult,
+  LLMProvider,
+  PivotConfig,
+  ToolConfig,
+} from "../types/investigation";
 import { Icon } from "./Icons";
 
 const DEFAULT_PIVOT: PivotConfig = {
@@ -20,16 +32,36 @@ const DEFAULT_PIVOT: PivotConfig = {
   require_confirm: false,
 };
 
+const DEFAULT_LLM: LLMConfig = {
+  provider:           "groq",
+  model:              "llama3-8b-8192",
+  temperature:        0.25,
+  max_tokens:         4096,
+  system_prompt:      "",
+  intel_budget:       60000,
+  intel_include_raw:  true,
+  intel_exclude_meta: true,
+};
+
+const PROVIDER_DESCRIPTIONS: Record<LLMProvider, string> = {
+  groq:       "Ultra-fast inference. Free tier is per-minute token limited — pick a small model on big graphs.",
+  openrouter: "Routes to hundreds of models. Free tier is request-count limited (50/day) — no per-minute token cap.",
+};
+
+const PROVIDER_DEFAULT_MODEL: Record<LLMProvider, string> = {
+  groq:       "llama3-8b-8192",
+  openrouter: "deepseek/deepseek-chat-v3.1:free",
+};
+
 interface Props {
-  isOpen: boolean;
+  isOpen:  boolean;
   onClose: () => void;
 }
 
-// ── Toggle ───────────────────────────────────────────────────────────
 interface ToggleProps {
-  on: boolean;
-  onToggle: () => void;
-  label: string;
+  on:        boolean;
+  onToggle:  () => void;
+  label:     string;
   sublabel?: string;
 }
 
@@ -73,12 +105,36 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
   const [upgrading,  setUpgrading]  = useState(false);
   const logEndRef = useRef<HTMLDivElement>(null);
 
+  const [llm,          setLLM]          = useState<LLMConfig>(DEFAULT_LLM);
+  const [llmModels,    setLLMModels]    = useState<LLMModel[]>([]);
+  const [llmModelsSrc, setLLMModelsSrc] = useState<"live" | "fallback" | null>(null);
+  const [llmModelsMsg, setLLMModelsMsg] = useState<string>("");
+  const [llmLoading,   setLLMLoading]   = useState(false);
+  const [llmSaved,     setLLMSaved]     = useState(false);
+
+  // ── Enrichment UI state ────────────────────────────────────────────
+  const [enrMaxIdents, setEnrMaxIdents] = useState<number>(25);
+  const [enrPhone,     setEnrPhone]     = useState<boolean>(false);
+  const [enrSaved,     setEnrSaved]     = useState(false);
+  const [testState,    setTestState]    = useState<Record<
+    "apollo" | "lusha",
+    { busy: boolean; result: EnrichmentTestResult | null }
+  >>({
+    apollo: { busy: false, result: null },
+    lusha:  { busy: false, result: null },
+  });
+
   const load = async () => {
     setLoading(true);
     try {
       const data = await fetchConfig();
       setCfg(data);
       setPivot(data.pivot ?? DEFAULT_PIVOT);
+      if (data.llm) setLLM({ ...DEFAULT_LLM, ...data.llm });
+      if (data.enrichment) {
+        setEnrMaxIdents(data.enrichment.max_identifiers ?? 25);
+        setEnrPhone(data.enrichment.phone_reveal ?? false);
+      }
     } catch {
       /* ignore */
     } finally {
@@ -86,8 +142,26 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
     }
   };
 
+  const loadModels = async () => {
+    setLLMLoading(true);
+    try {
+      const res = await fetchLLMModels();
+      setLLMModels(res.models);
+      setLLMModelsSrc(res.source);
+      setLLMModelsMsg(res.reason ?? "");
+    } catch (err) {
+      setLLMModels([]);
+      setLLMModelsSrc(null);
+      setLLMModelsMsg(String(err));
+    } finally {
+      setLLMLoading(false);
+    }
+  };
+
   useEffect(() => {
-    if (isOpen) load();
+    if (isOpen) {
+      load().then(() => loadModels());
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
 
@@ -117,6 +191,64 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
     await savePivotConfig(pivot);
     setPivotSaved(true);
     setTimeout(() => setPivotSaved(false), 2500);
+  };
+
+  const handleSaveLLM = async () => {
+    try {
+      await saveLLMConfig(llm);
+      setLLMSaved(true);
+      setTimeout(() => setLLMSaved(false), 2500);
+    } catch (err) {
+      console.warn("saveLLMConfig failed:", err);
+    }
+  };
+
+  const handleSwitchProvider = async (next: LLMProvider) => {
+    if (next === llm.provider) return;
+
+    const looksLikeGroq = !llm.model.includes("/");
+    const looksLikeOpenRouter = llm.model.includes("/");
+
+    let nextModel = llm.model;
+    if (next === "openrouter" && looksLikeGroq) {
+      nextModel = PROVIDER_DEFAULT_MODEL.openrouter;
+    } else if (next === "groq" && looksLikeOpenRouter) {
+      nextModel = PROVIDER_DEFAULT_MODEL.groq;
+    }
+
+    const nextLlm: LLMConfig = { ...llm, provider: next, model: nextModel };
+    setLLM(nextLlm);
+    try {
+      await saveLLMConfig(nextLlm);
+    } catch (err) {
+      console.warn("provider switch save failed:", err);
+    }
+    await loadModels();
+  };
+
+  const handleSaveEnrichment = async () => {
+    try {
+      await saveEnrichmentConfig({
+        max_identifiers: enrMaxIdents,
+        phone_reveal:    enrPhone,
+      });
+      setEnrSaved(true);
+      setTimeout(() => setEnrSaved(false), 2500);
+    } catch (err) {
+      console.warn("saveEnrichmentConfig failed:", err);
+    }
+  };
+
+  const handleTestEnrichment = async (provider: "apollo" | "lusha") => {
+    setTestState(prev => ({
+      ...prev,
+      [provider]: { busy: true, result: null },
+    }));
+    const res = await testEnrichmentProvider(provider);
+    setTestState(prev => ({
+      ...prev,
+      [provider]: { busy: false, result: res },
+    }));
   };
 
   const handleUpgrade = async () => {
@@ -163,29 +295,42 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
   };
 
   const TOKEN_LABELS: Record<string, string> = {
-    DISCORD_TOKEN:     "Discord Token",
-    GITHUB_TOKEN:      "GitHub Token",
-    GROQ_API_KEY:      "Groq API Key",
-    INSTAGRAM_SESSION: "Instagram Session",
+    DISCORD_TOKEN:      "Discord Token",
+    GITHUB_TOKEN:       "GitHub Token",
+    GROQ_API_KEY:       "Groq API Key",
+    OPENROUTER_API_KEY: "OpenRouter API Key",
+    HIBP_API_KEY:       "HIBP API Key (v3)",
+    INSTAGRAM_SESSION:  "Instagram Session",
+    APOLLO_API_KEY:     "Apollo.io API Key (paid credits)",
+    LUSHA_API_KEY:      "Lusha API Key (paid credits)",
   };
+
+  const llmModelOptions = (() => {
+    if (llmModels.length === 0) return [{ id: llm.model, owned_by: "custom" }];
+    if (llmModels.some(m => m.id === llm.model)) return llmModels;
+    return [{ id: llm.model, owned_by: "custom" }, ...llmModels];
+  })();
+
+  const providerKeyStored = (() => {
+    if (!cfg) return false;
+    return llm.provider === "groq"
+      ? cfg.tokens.GROQ_API_KEY
+      : cfg.tokens.OPENROUTER_API_KEY;
+  })();
 
   return (
     <>
-      {/* Backdrop */}
       <div
         className="fixed inset-0 z-40 bg-black/50 backdrop-blur-sm anim-in"
         onClick={onClose}
       />
 
-      {/* Centering wrapper — the animation runs on the inner panel,
-          so its keyframe can't clobber a centering transform. */}
       <div className="fixed inset-0 z-50 flex items-center justify-center p-4 pointer-events-none">
         <div
           className="surface anim-pop flex flex-col pointer-events-auto w-full"
           style={{ maxWidth: "min(720px, 96vw)", maxHeight: "86vh" }}
           onClick={e => e.stopPropagation()}
         >
-          {/* Header */}
           <div className="flex items-center justify-between px-6 py-4
                           border-b border-edge-0 shrink-0">
             <div className="flex items-center gap-2.5">
@@ -207,38 +352,46 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
 
           {!loading && (
             <div className="flex-1 overflow-y-auto px-6 py-5 space-y-8">
-              {/* API Tokens */}
+
               <section>
                 <h3 className="text-[13px] font-bold text-white mb-3 flex items-center gap-2">
                   <Icon name="key" size={14} className="text-violet-300" />
                   API Tokens
                 </h3>
+                <p className="text-[11px] text-zinc-500 -mt-1 mb-3 leading-snug">
+                  Tokens are stored in the OS keyring. The badge shows
+                  whether a value is present — it does not validate that the
+                  value is currently accepted by the provider.
+                </p>
                 <div className="space-y-3">
-                  {cfg && Object.entries(TOKEN_LABELS).map(([key, label]) => (
-                    <div key={key}>
-                      <label className="flex items-center justify-between text-[11px] text-zinc-500 mb-1">
-                        <span>{label}</span>
-                        <span
-                          className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
-                            cfg.tokens[key as keyof typeof cfg.tokens]
-                              ? "bg-emerald-500/15 text-emerald-300"
-                              : "bg-white/[.03] text-zinc-500"
-                          }`}
-                        >
-                          {cfg.tokens[key as keyof typeof cfg.tokens] ? "set" : "not set"}
-                        </span>
-                      </label>
-                      <input
-                        type="password"
-                        placeholder={`Enter ${label}…`}
-                        value={tokenInputs[key] ?? ""}
-                        onChange={e =>
-                          setTI(p => ({ ...p, [key]: e.target.value }))
-                        }
-                        className="field !py-1.5 !text-sm"
-                      />
-                    </div>
-                  ))}
+                  {cfg && Object.entries(TOKEN_LABELS).map(([key, label]) => {
+                    const isStored = Boolean(cfg.tokens[key as keyof typeof cfg.tokens]);
+                    return (
+                      <div key={key}>
+                        <label className="flex items-center justify-between text-[11px] text-zinc-500 mb-1">
+                          <span>{label}</span>
+                          <span
+                            className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                              isStored
+                                ? "bg-emerald-500/15 text-emerald-300"
+                                : "bg-white/[.03] text-zinc-500"
+                            }`}
+                          >
+                            {isStored ? "stored" : "empty"}
+                          </span>
+                        </label>
+                        <input
+                          type="password"
+                          placeholder={isStored ? "Replace stored value…" : `Enter ${label}…`}
+                          value={tokenInputs[key] ?? ""}
+                          onChange={e =>
+                            setTI(p => ({ ...p, [key]: e.target.value }))
+                          }
+                          className="field !py-1.5 !text-sm"
+                        />
+                      </div>
+                    );
+                  })}
                 </div>
                 <div className="flex items-center gap-3 mt-3">
                   <button onClick={handleSaveTokens} className="btn btn-primary">
@@ -250,7 +403,6 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
                 </div>
               </section>
 
-              {/* Debug */}
               {cfg && (
                 <section>
                   <h3 className="text-[13px] font-bold text-white mb-3 flex items-center gap-2">
@@ -266,7 +418,351 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
                 </section>
               )}
 
-              {/* Pivoting */}
+              <section>
+                <h3 className="text-[13px] font-bold text-white mb-1 flex items-center gap-2">
+                  <Icon name="sparkle" size={14} className="text-violet-300" />
+                  AI Model &amp; Prompt
+                  {llmModelsSrc === "live" && (
+                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded
+                                     bg-emerald-500/15 text-emerald-300">
+                      LIVE
+                    </span>
+                  )}
+                  {llmModelsSrc === "fallback" && (
+                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded
+                                     bg-amber-500/15 text-amber-300"
+                          title={llmModelsMsg}>
+                      FALLBACK
+                    </span>
+                  )}
+                </h3>
+                <p className="text-[11px] text-zinc-500 mb-4">
+                  Applies to the AI persona summary, structured report,
+                  intelligence narrative, and the canvas chat.
+                </p>
+
+                <div className="mb-4">
+                  <label className="block text-[11px] text-zinc-500 mb-1.5">
+                    Provider
+                  </label>
+                  <div className="grid grid-cols-2 gap-2">
+                    {(["groq", "openrouter"] as LLMProvider[]).map(p => {
+                      const active = llm.provider === p;
+                      return (
+                        <button
+                          key={p}
+                          type="button"
+                          onClick={() => handleSwitchProvider(p)}
+                          className={[
+                            "rounded-lg border px-3 py-2 text-left transition-all",
+                            active
+                              ? "border-violet-500/60 bg-violet-500/15 text-violet-100"
+                              : "border-edge-1 bg-ink-800/50 text-zinc-300 hover:border-edge-2",
+                          ].join(" ")}
+                        >
+                          <p className="text-[12px] font-bold">
+                            {p === "groq" ? "Groq" : "OpenRouter"}
+                          </p>
+                          <p className="text-[10px] text-zinc-500 leading-snug mt-0.5">
+                            {p === "groq" ? "Fast, TPM-limited" : "Broad catalog, request-limited"}
+                          </p>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <p className="mt-1.5 text-[10px] text-zinc-500 leading-snug">
+                    {PROVIDER_DESCRIPTIONS[llm.provider]}
+                  </p>
+                  {!providerKeyStored && (
+                    <p className="mt-1.5 text-[10px] text-amber-400/80 leading-snug">
+                      {llm.provider === "groq"
+                        ? "No Groq API key stored. Add one in the API Tokens section above."
+                        : "No OpenRouter API key stored. Add one in the API Tokens section above."}
+                    </p>
+                  )}
+                </div>
+
+                <div className="mb-4">
+                  <label className="flex items-center justify-between text-[11px] text-zinc-500 mb-1">
+                    <span>Model</span>
+                    <button
+                      type="button"
+                      onClick={loadModels}
+                      disabled={llmLoading}
+                      className="text-[10px] text-violet-300 hover:text-violet-200
+                                 disabled:opacity-40"
+                    >
+                      {llmLoading ? "Refreshing…" : "↻ Refresh list"}
+                    </button>
+                  </label>
+                  <select
+                    value={llm.model}
+                    onChange={e => setLLM(p => ({ ...p, model: e.target.value }))}
+                    className="field !py-1.5 !text-sm font-mono"
+                    disabled={llmLoading}
+                  >
+                    {llmModelOptions.map(m => (
+                      <option key={m.id} value={m.id}>
+                        {m.id}{m.owned_by === "custom" ? "  (custom)" : ""}
+                        {(m as LLMModel).free ? "  · free" : ""}
+                      </option>
+                    ))}
+                  </select>
+                  {llmModelsSrc === "fallback" && llmModelsMsg && (
+                    <p className="mt-1 text-[10px] text-amber-400/80 leading-snug">
+                      {llmModelsMsg}
+                    </p>
+                  )}
+                </div>
+
+                <div className="mb-4">
+                  <label className="flex justify-between text-[11px] text-zinc-500 mb-1">
+                    <span>Temperature</span>
+                    <span className="font-bold text-white tabular-nums">
+                      {llm.temperature.toFixed(2)}
+                    </span>
+                  </label>
+                  <input
+                    type="range"
+                    min={0}
+                    max={2}
+                    step={0.05}
+                    value={llm.temperature}
+                    onChange={e =>
+                      setLLM(p => ({ ...p, temperature: Number(e.target.value) }))
+                    }
+                    className="w-full accent-violet-500"
+                  />
+                  <div className="flex justify-between text-[10px] text-zinc-600 mt-0.5">
+                    <span>0.0 · deterministic</span>
+                    <span>2.0 · chaotic</span>
+                  </div>
+                </div>
+
+                <div className="mb-4">
+                  <label className="flex justify-between text-[11px] text-zinc-500 mb-1">
+                    <span>Max output tokens</span>
+                    <span className="font-bold text-white tabular-nums">
+                      {llm.max_tokens}
+                    </span>
+                  </label>
+                  <input
+                    type="range"
+                    min={256}
+                    max={16384}
+                    step={256}
+                    value={llm.max_tokens}
+                    onChange={e =>
+                      setLLM(p => ({ ...p, max_tokens: Number(e.target.value) }))
+                    }
+                    className="w-full accent-violet-500"
+                  />
+                </div>
+
+                <div className="mb-4">
+                  <label className="flex items-center justify-between text-[11px] text-zinc-500 mb-1">
+                    <span>System prompt</span>
+                    <span className="text-[10px] text-zinc-600">
+                      {llm.system_prompt.length} chars
+                    </span>
+                  </label>
+                  <textarea
+                    value={llm.system_prompt}
+                    onChange={e =>
+                      setLLM(p => ({ ...p, system_prompt: e.target.value }))
+                    }
+                    placeholder="Leave blank to use each tool's built-in default prompt."
+                    rows={5}
+                    className="field !text-[12px] font-mono resize-y leading-relaxed !py-2"
+                  />
+                  <p className="mt-1 text-[10px] text-zinc-600 leading-snug">
+                    Applied to every AI call. The untrusted-data contract is
+                    always appended regardless of what you enter here.
+                  </p>
+                </div>
+
+                <div className="mb-4 pt-3 border-t border-edge-0">
+                  <label className="flex justify-between text-[11px] text-zinc-500 mb-1">
+                    <span>Intel dump budget</span>
+                    <span className="font-bold text-white tabular-nums">
+                      {llm.intel_budget.toLocaleString()} chars
+                    </span>
+                  </label>
+                  <input
+                    type="range"
+                    min={5000}
+                    max={200000}
+                    step={5000}
+                    value={llm.intel_budget}
+                    onChange={e =>
+                      setLLM(p => ({
+                        ...p,
+                        intel_budget: Number(e.target.value),
+                      }))
+                    }
+                    className="w-full accent-violet-500"
+                  />
+                  <p className="mt-1 text-[10px] text-zinc-600 leading-snug">
+                    Split between the canvas map and the intel dump sent with
+                    each AI call. Larger = more context = slower.
+                  </p>
+                </div>
+
+                <div className="mb-4 space-y-2">
+                  <Toggle
+                    on={llm.intel_include_raw}
+                    onToggle={() =>
+                      setLLM(p => ({
+                        ...p,
+                        intel_include_raw: !p.intel_include_raw,
+                      }))
+                    }
+                    label="Include raw API responses"
+                    sublabel="Adds api_data and raw_tool_output sections"
+                  />
+                  <Toggle
+                    on={llm.intel_exclude_meta}
+                    onToggle={() =>
+                      setLLM(p => ({
+                        ...p,
+                        intel_exclude_meta: !p.intel_exclude_meta,
+                      }))
+                    }
+                    label="Exclude prior AI output"
+                    sublabel="Skip intelligence_report and persona_summary to avoid feedback loops"
+                  />
+                </div>
+
+                <div className="flex items-center gap-3">
+                  <button onClick={handleSaveLLM} className="btn btn-primary">
+                    <Icon name="check" size={12} /> Save AI settings
+                  </button>
+                  {llmSaved && (
+                    <span className="text-[12px] text-emerald-400">Saved</span>
+                  )}
+                </div>
+              </section>
+
+              {/* ── Contact Enrichment ─────────────────────────────── */}
+              {cfg && (
+                <section>
+                  <h3 className="text-[13px] font-bold text-white mb-1 flex items-center gap-2">
+                    <Icon name="globe" size={14} className="text-violet-300" />
+                    Contact Enrichment
+                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded
+                                     bg-amber-500/15 text-amber-300">
+                      PAID CREDITS
+                    </span>
+                  </h3>
+                  <p className="text-[11px] text-zinc-500 mb-4 leading-snug">
+                    Apollo and Lusha both charge per successful match. Every
+                    identifier passes through the trust filter before it is
+                    submitted; rejects are logged in the report with a reason.
+                    Both providers are opt-in and default to off.
+                  </p>
+
+                  <div className="space-y-3 mb-4">
+                    {(["apollo", "lusha"] as const).map(provider => {
+                      const enabled = cfg.enrichment.enabled[provider];
+                      const stored  = cfg.enrichment.keys_stored[provider];
+                      const toggleKey = provider === "apollo" ? "ENABLE_APOLLO" : "ENABLE_LUSHA";
+                      const tool = cfg.tools.find(t => t.key === toggleKey);
+                      const tstate = testState[provider];
+
+                      return (
+                        <div key={provider} className="rounded-lg border border-edge-1
+                                                       bg-ink-800/50 px-3 py-3 space-y-2">
+                          <Toggle
+                            on={Boolean(tool?.enabled ?? enabled)}
+                            onToggle={async () => {
+                              if (tool) {
+                                await toggleTool(tool.key, !tool.enabled);
+                                await load();
+                              }
+                            }}
+                            label={provider === "apollo" ? "Apollo.io" : "Lusha"}
+                            sublabel={
+                              stored
+                                ? "API key stored — ready to enrich"
+                                : "No API key stored — add one in API Tokens above"
+                            }
+                          />
+                          <div className="flex items-center gap-2 pl-12">
+                            <button
+                              type="button"
+                              onClick={() => handleTestEnrichment(provider)}
+                              disabled={!stored || tstate.busy}
+                              className="btn !text-[10px] !px-2 !py-1
+                                         disabled:!opacity-40"
+                            >
+                              <Icon name="refresh" size={11} />
+                              {tstate.busy ? "Testing…" : "Test connection"}
+                            </button>
+                            {tstate.result && (
+                              <span
+                                className={`text-[10px] ${
+                                  tstate.result.ok ? "text-emerald-400" : "text-rose-400"
+                                }`}
+                              >
+                                {tstate.result.ok
+                                  ? tstate.result.balance !== null &&
+                                    tstate.result.balance !== undefined
+                                    ? `✓ OK · balance ${
+                                        typeof tstate.result.balance === "number"
+                                          ? tstate.result.balance
+                                          : JSON.stringify(tstate.result.balance)
+                                      }`
+                                    : "✓ OK"
+                                  : `✗ ${tstate.result.error ?? "failed"}`}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div className="mb-4">
+                    <label className="flex justify-between text-[11px] text-zinc-500 mb-1">
+                      <span>Max identifiers submitted per provider</span>
+                      <span className="font-bold text-white tabular-nums">
+                        {enrMaxIdents}
+                      </span>
+                    </label>
+                    <input
+                      type="range"
+                      min={1}
+                      max={100}
+                      step={1}
+                      value={enrMaxIdents}
+                      onChange={e => setEnrMaxIdents(Number(e.target.value))}
+                      className="w-full accent-violet-500"
+                    />
+                    <p className="mt-1 text-[10px] text-zinc-600 leading-snug">
+                      Hard cap on how many identifiers can be submitted to
+                      each provider per run. Rejected identifiers do not
+                      count against this cap.
+                    </p>
+                  </div>
+
+                  <Toggle
+                    on={enrPhone}
+                    onToggle={() => setEnrPhone(v => !v)}
+                    label="Reveal phone numbers (Lusha)"
+                    sublabel="Costs 5 extra credits per contact. Neither provider accepts phones as input — phones are only revealed for already-matched people."
+                  />
+
+                  <div className="flex items-center gap-3 mt-4">
+                    <button onClick={handleSaveEnrichment} className="btn btn-primary">
+                      <Icon name="check" size={12} /> Save enrichment settings
+                    </button>
+                    {enrSaved && (
+                      <span className="text-[12px] text-emerald-400">Saved</span>
+                    )}
+                  </div>
+                </section>
+              )}
+
               <section>
                 <h3 className="text-[13px] font-bold text-white mb-1 flex items-center gap-2">
                   <Icon name="refresh" size={14} className="text-violet-300" />
@@ -327,7 +823,7 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
                       </div>
                       <div>
                         <label className="flex justify-between text-[11px] text-zinc-500 mb-1">
-                          <span>Max seeds per depth</span>
+                          <span>Batch size per pivot wave</span>
                           <span className="font-bold text-white">{pivot.max_seeds}</span>
                         </label>
                         <input
@@ -341,6 +837,10 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
                           }
                           className="w-full accent-violet-500"
                         />
+                        <p className="mt-1 text-[10px] text-zinc-600 leading-snug">
+                          Seeds beyond this number are investigated in a
+                          subsequent wave at the same depth — none are dropped.
+                        </p>
                       </div>
                       <Toggle
                         on={pivot.require_confirm}
@@ -351,6 +851,7 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
                           }))
                         }
                         label="Confirm before each pivot"
+                        sublabel="Show all seeds at a depth, then wait for your approval (45s default)"
                       />
                     </div>
                   )}
@@ -366,7 +867,6 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
                 </div>
               </section>
 
-              {/* Tools */}
               {cfg && (
                 <section>
                   <h3 className="text-[13px] font-bold text-white mb-3 flex items-center gap-2">
@@ -375,18 +875,20 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
                   </h3>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                     {cfg.tools.map(tool => (
-                      <label
+                      <button
                         key={tool.key}
+                        type="button"
+                        onClick={() => handleToggleTool(tool)}
                         className="flex items-center justify-between rounded-lg
                                    border border-edge-1 bg-ink-800/50 px-3 py-2 cursor-pointer
-                                   hover:border-edge-2 transition-colors"
+                                   hover:border-edge-2 transition-colors text-left"
                       >
                         <span className="text-[11px] text-zinc-300">{tool.desc}</span>
                         <div
-                          onClick={() => handleToggleTool(tool)}
                           className={`relative w-8 h-4 rounded-full transition-colors shrink-0 ml-2 ${
                             tool.enabled ? "bg-violet-600" : "bg-edge-2"
                           }`}
+                          aria-hidden="true"
                         >
                           <div
                             className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white
@@ -395,13 +897,12 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
                                         }`}
                           />
                         </div>
-                      </label>
+                      </button>
                     ))}
                   </div>
                 </section>
               )}
 
-              {/* Upgrade */}
               <section>
                 <h3 className="text-[13px] font-bold text-white mb-2 flex items-center gap-2">
                   <Icon name="upload" size={14} className="text-violet-300" />
@@ -431,6 +932,7 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
                   </div>
                 )}
               </section>
+
             </div>
           )}
         </div>

@@ -3,13 +3,17 @@ import tempfile
 import os
 import json
 import subprocess as _sp
+
 import requests
+
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
+
 from . import utils
 from .utils import http_session, github_session, resilient_task
 from .utils.mosint_wrapper import mosint_confirms_link
 from .utils import clean_username
+from .utils.url_safety import safe_get, UnsafeURLError
 
 # ── Bug 3 fix: never bind tool flags at import time. ──────────────────
 from . import config as _config_module
@@ -221,6 +225,12 @@ def scrape_profile_info(platform, username):
     (location / company / followers / created_at / twitter_username /
     public_repos / public_gists) that ScrapingStage._emit_enrichment
     expects.
+
+    SSRF note: GitHub's API endpoint is a fixed host, so no guard is
+    needed there. The GitHub profile *HTML* fetch (for socid) and the
+    Twitter/Reddit/YouTube fetches are also fixed hosts. Only the
+    ``scrape_generic_url`` path and the derived-API fetches accept
+    arbitrary hosts and are guarded.
     """
     info = {
         "name": "", "email": "", "bio": "", "blog": "",
@@ -328,6 +338,17 @@ def scrape_profile_info(platform, username):
 
 @resilient_task(max_retries=1)
 def scrape_generic_url(url):
+    """
+    Fetch a generic profile URL discovered by the discovery stage.
+
+    SSRF guard
+    ----------
+    The URL comes from scraped content — it is attacker-controlled. Every
+    request goes through ``safe_get``, which rejects private / loopback /
+    link-local / metadata targets on the initial URL and on every
+    redirect hop. A profile that links to ``http://127.0.0.1:8080`` no
+    longer causes the tool to probe its own host.
+    """
     info = {
         "name": "", "email": "", "bio": "", "blog": url,
         "socid": None, "avatar": None,
@@ -346,7 +367,7 @@ def scrape_generic_url(url):
 
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        r = http_session.get(url, headers=headers, timeout=10)
+        r = safe_get(url, headers=headers, timeout=10)
         if r.status_code != 200:
             return info
 
@@ -398,6 +419,8 @@ def scrape_generic_url(url):
                 info["avatar"] = og_img.get("content")
         except Exception:
             pass
+    except UnsafeURLError as exc:
+        print(f"  Generic scrape blocked for {url[:60]}: {exc}")
     except Exception:
         pass
     return info

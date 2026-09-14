@@ -15,6 +15,18 @@ Five detectors (matching the plan specification):
 Each detector is a standalone function so individual detectors can be
 unit-tested in isolation.  :func:`run_all_detectors` calls them all and
 returns a sorted merged list.
+
+Change log
+----------
+- Detector failures are recorded via ``log_trace`` (durable, ends up in
+  the debug log) rather than only printing to stdout. A detector that
+  raises on 1 of 5000 entities no longer disappears into a console line
+  that scrolls away.
+- ``detect_username_variants`` gained a length-difference pre-filter.
+  Levenshtein is O(n·m); two strings that differ in length by more than
+  2 can never have edit distance ≤ 2, so we skip the call. This matters
+  for targets with hundreds of discovered usernames, where the O(n²)
+  detector loop dominated the whole correlation phase.
 """
 
 from __future__ import annotations
@@ -31,6 +43,7 @@ from .entities import (
     PlatformProfileEntity,
     UsernameEntity,
 )
+from ..utils import log_trace
 
 try:
     import networkx as nx
@@ -213,26 +226,48 @@ def detect_username_variants(
 
     Distance 1 → likely same person with minor variation (extra char, typo).
     Distance 2 → possible variant; lower confidence.
+
+    Performance note
+    ----------------
+    Levenshtein is O(n·m) per pair and the detector is O(k²) in the
+    number of usernames. Two strings whose lengths differ by more than
+    the edit-distance cap cannot possibly be within that cap, so we
+    reject on length before invoking the DP. This roughly halves the
+    work for uniformly distributed inputs and cuts it to near-zero for
+    the long-tail of very different usernames a discovery run produces.
     """
     correlations: list[Correlation] = []
     usernames = [e for e in entities if isinstance(e, UsernameEntity)]
 
     seen_pairs: set[tuple[str, str]] = set()
 
+    # The edit-distance cap is a hard 2. Any pair whose lengths differ
+    # by > 2 is rejected without a DP call.
+    MAX_DIST = 2
+
     for i, a in enumerate(usernames):
+        a_low = a.value.lower()
+        a_len = len(a_low)
+
         for b in usernames[i + 1:]:
-            # Skip identical values (same username on two platforms – handled
-            # by the graph co-occurrence rule, not this detector)
-            if a.value.lower() == b.value.lower():
+            b_low = b.value.lower()
+
+            # Skip identical values (same username on two platforms –
+            # handled by the graph co-occurrence rule, not this detector)
+            if a_low == b_low:
                 continue
 
-            pair_key = tuple(sorted([a.value.lower(), b.value.lower()]))
+            # Length pre-filter — cheap, avoids most DP calls.
+            if abs(a_len - len(b_low)) > MAX_DIST:
+                continue
+
+            pair_key = tuple(sorted([a_low, b_low]))
             if pair_key in seen_pairs:
                 continue
             seen_pairs.add(pair_key)
 
-            dist = _levenshtein(a.value.lower(), b.value.lower())
-            if 0 < dist <= 2:
+            dist = _levenshtein(a_low, b_low)
+            if 0 < dist <= MAX_DIST:
                 conf = 0.78 if dist == 1 else 0.55
                 plat_a = a.platform or "unknown"
                 plat_b = b.platform or "unknown"
@@ -392,8 +427,10 @@ def run_all_detectors(
     Run every detector and return a deduplicated list sorted by
     confidence (descending).
 
-    Detector failures are caught and printed so one broken detector
-    cannot abort the entire intelligence stage.
+    Detector failures are caught, printed, and recorded via ``log_trace``
+    so one broken detector cannot abort the entire intelligence stage
+    (and so the failure survives in the debug log rather than scrolling
+    off the console).
     """
     all_correlations: list[Correlation] = []
 
@@ -403,7 +440,10 @@ def run_all_detectors(
             all_correlations.extend(results)
         except Exception as exc:
             print(f"  [!] Correlation detector {detector.__name__!r} failed: {exc}")
+            log_trace(
+                f"correlations: detector {detector.__name__} raised "
+                f"{type(exc).__name__}: {exc}"
+            )
 
-    # Sort by confidence, highest first
     all_correlations.sort(key=lambda c: c.confidence, reverse=True)
     return all_correlations

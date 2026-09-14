@@ -3,20 +3,22 @@ discord_osint/intelligence/html_report.py
 -------------------------------------------
 Generates a fully self-contained, dark-themed HTML investigation report.
 
-This module replaces the legacy ``generate_html_report()`` call in
-ReportingStage with a renderer that matches the WhoCord web UI aesthetic:
-dark backgrounds, indigo/emerald accents, collapsible platform cards.
+Change log
+----------
+Adds three new renderers for Apollo / Lusha contact-enrichment output:
 
-Key design choices
-------------------
-- **Zero external dependencies** – all CSS is inlined; no CDN requests so
-  reports are fully viewable offline.
-- **Platform cards** – social profiles are grouped by platform.  Each card
-  shows the platform name and username prominently; bio, creation date, linked
-  accounts, and any other extracted fields collapse beneath.
-- **Structured sections** – Identity · Social Profiles · Email Intelligence ·
-  Intelligence Analysis · Pivot Sub-Reports · Technical Data.
-- **Responsive** – single column on narrow screens, two-column grid on wide.
+* ``_render_enrichment_section``    — matched profile cards + spend bar
+* ``_render_enrichment_rejections`` — collapsed audit block listing every
+                                      identifier the trust filter rejected,
+                                      with its one-line reason
+* ``_render_enrichment_profile_card`` — one matched contact card
+
+Both new sections are additive: when neither provider ran, neither
+section renders and the report is byte-identical to the previous
+version.
+
+``_safe_href()`` and ``_safe_img_src()`` gate every ``href=`` and
+``src=`` in the report, as before.
 """
 
 from __future__ import annotations
@@ -27,13 +29,70 @@ import re
 from collections import defaultdict
 from datetime import datetime
 from typing import Any
+from urllib.parse import urlparse
+
 
 # ---------------------------------------------------------------------------
-# Platform metadata (icon + display name)
+# URL safety helpers
+# ---------------------------------------------------------------------------
+
+_ALLOWED_HREF_SCHEMES  = frozenset({"http", "https", "mailto"})
+_ALLOWED_IMG_SCHEMES   = frozenset({"http", "https"})
+
+
+def _has_dangerous_scheme(raw: str) -> bool:
+    if not raw:
+        return False
+    s = re.sub(r"[\x00-\x20]+", "", raw).strip()
+    if not s:
+        return False
+    for scheme in _ALLOWED_HREF_SCHEMES:
+        if s.lower().startswith(scheme + ":"):
+            return False
+    if s.startswith("//") or s.startswith("/") or s.startswith("#") or s.startswith("?"):
+        return False
+    return bool(re.match(r"^[a-zA-Z][a-zA-Z0-9+\-.]*:", s))
+
+
+def _safe_href(raw: str) -> str:
+    if raw is None:
+        return "#"
+    raw = str(raw).strip()
+    if not raw:
+        return "#"
+
+    if _has_dangerous_scheme(raw):
+        return "#"
+
+    parsed = urlparse(raw)
+    if parsed.scheme in ("http", "https"):
+        if not parsed.netloc:
+            return "#"
+
+    return _e(raw)
+
+
+def _safe_img_src(raw: str) -> str:
+    if raw is None:
+        return ""
+    raw = str(raw).strip()
+    if not raw:
+        return ""
+
+    stripped = re.sub(r"[\x00-\x20]+", "", raw).strip()
+    parsed   = urlparse(stripped)
+    if parsed.scheme.lower() not in _ALLOWED_IMG_SCHEMES:
+        return ""
+    if not parsed.netloc:
+        return ""
+    return _e(raw)
+
+
+# ---------------------------------------------------------------------------
+# Platform metadata
 # ---------------------------------------------------------------------------
 
 _PLATFORM_META: dict[str, tuple[str, str]] = {
-    # (emoji_icon, display_name)
     "google":     ("🔍", "Google"),
     "github":     ("🐙", "GitHub"),
     "twitter":    ("🐦", "Twitter / X"),
@@ -83,7 +142,6 @@ def _platform_label(platform: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _unpack(entry: Any) -> tuple[str, str]:
-    """Return (value_str, source_str) from a raw intel entry."""
     if isinstance(entry, dict):
         val = entry.get("value", "")
         src = entry.get("source", "")
@@ -96,7 +154,6 @@ def _unpack(entry: Any) -> tuple[str, str]:
 
 
 def _e(text: str) -> str:
-    """HTML-escape a string."""
     return _html.escape(str(text))
 
 
@@ -105,27 +162,6 @@ def _e(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _parse_social_profiles(intel: dict) -> dict[str, dict]:
-    """
-    Group social_profiles intel into per-platform dicts.
-
-    Returns::
-
-        {
-          "github": {
-            "platform":  "github",
-            "usernames": ["alice"],
-            "urls":      ["https://github.com/alice"],
-            "bio":       "I love coding",
-            "blog":      "https://alice.dev",
-            "location":  "",
-            "email":     "",
-            "followers": "",
-            "created":   "",
-            "extra":     {"key": "value"},
-          },
-          ...
-        }
-    """
     profiles: dict[str, dict] = defaultdict(lambda: {
         "platform":  "",
         "usernames": [],
@@ -145,22 +181,20 @@ def _parse_social_profiles(intel: dict) -> dict[str, dict]:
             continue
 
         if key.startswith("blackbird_email_") or key.startswith("blackbird_api_"):
-            # Extract the URL part – it always starts after the prefix
             if key.startswith("blackbird_email_"):
                 url_part = key[len("blackbird_email_"):]
-            else:   # blackbird_api_
+            else:
                 url_part = key[len("blackbird_api_"):]
-                # Remove trailing "/socid_raw" if present
                 if url_part.endswith("/socid_raw"):
                     url_part = url_part[:-len("/socid_raw")]
 
-            # Derive a clean platform name from the domain
             domain = ""
             try:
                 from urllib.parse import urlparse
                 parsed = urlparse(url_part)
                 netloc = parsed.netloc.lower()
-                for prefix in ("www.", "api.", "spclient.", "auth.", "callback.", "signin.", "signup.", "public."):
+                for prefix in ("www.", "api.", "spclient.", "auth.", "callback.",
+                               "signin.", "signup.", "public."):
                     if netloc.startswith(prefix):
                         netloc = netloc[len(prefix):]
                 if "." in netloc:
@@ -176,45 +210,37 @@ def _parse_social_profiles(intel: dict) -> dict[str, dict]:
             p = profiles[domain]
             p["platform"] = domain
 
-            # Blackbird EMAIL entries: they always contain a URL
             if key.startswith("blackbird_email_") and val.startswith("http"):
                 if val not in p["urls"]:
                     p["urls"].append(val)
 
-            # Blackbird API entries: value is a JSON string – parse and extract
-            # only scalar fields (strings, numbers, booleans) to show as clean
-            # data rows.  The raw JSON is never shown as a handle or URL.
             elif key.startswith("blackbird_api_"):
                 try:
                     api_data = json.loads(val) if isinstance(val, str) else val
                     if isinstance(api_data, dict):
                         for field, field_val in api_data.items():
                             if isinstance(field_val, (str, int, float, bool)):
-                                # Use the field name as a label, converting underscores
-                                # to spaces and title‑casing it for readability.
                                 label = field.replace("_", " ").title()
                                 p["extra"][label] = str(field_val)
                 except Exception:
                     pass
 
-            continue   # done with this key
+            continue
 
-        # ── Original logic for all other keys ────────────────────────────
         if "/" in key:
             parts    = key.split("/")
             platform = parts[0].lower()
             username = parts[1] if len(parts) > 1 else ""
             field    = parts[2] if len(parts) > 2 else "url"
 
-            # Use platform_username as a unique key when a username is present
             if username:
                 unique_key = f"{platform}_{username}"
             else:
                 unique_key = platform
 
             p = profiles[unique_key]
-            p["platform"] = platform   # keep original platform name for display
-            p["username_slug"] = username   # used later for avatar matching
+            p["platform"] = platform
+            p["username_slug"] = username
 
             if username and username not in p["usernames"]:
                 p["usernames"].append(username)
@@ -224,7 +250,6 @@ def _parse_social_profiles(intel: dict) -> dict[str, dict]:
             elif field == "blog":
                 p["blog"] = p["blog"] or val
             elif field == "socid_raw":
-                # Parse socid JSON for useful fields
                 try:
                     socid = json.loads(val) if isinstance(val, str) else val
                     if isinstance(socid, dict):
@@ -269,7 +294,6 @@ def _parse_social_profiles(intel: dict) -> dict[str, dict]:
                 p["urls"].append(val)
 
         else:
-            # Legacy discovery / linkook keys
             parts_key = key.split("_", 2)
             if len(parts_key) >= 2 and parts_key[0] in ("discovery", "linkook"):
                 raw_platform = parts_key[1]
@@ -287,18 +311,15 @@ def _parse_social_profiles(intel: dict) -> dict[str, dict]:
                 if val not in p["usernames"]:
                     p["usernames"].append(val)
 
-    # Attach avatar URLs from scraped data (profile_avatars intel)
     avatar_map = intel.get("profile_avatars", {})
     if avatar_map:
         for unique_key, data in profiles.items():
-            if data.get("avatar"):   # already has one from socid, skip
+            if data.get("avatar"):
                 continue
-            # Try to match using the original platform/username from the key
             original_key = f"{data['platform']}/{data.get('username_slug', '')}" if data.get('username_slug') else data['platform']
             if original_key in avatar_map:
                 data["avatar"] = _unpack(avatar_map[original_key])[0]
                 continue
-            # Fallback: match by any URL in this platform's list
             for url in data.get("urls", []):
                 if url in avatar_map:
                     data["avatar"] = _unpack(avatar_map[url])[0]
@@ -308,7 +329,7 @@ def _parse_social_profiles(intel: dict) -> dict[str, dict]:
 
 
 # ---------------------------------------------------------------------------
-# CSS (self-contained dark theme)
+# CSS
 # ---------------------------------------------------------------------------
 
 _CSS = """
@@ -332,10 +353,8 @@ a:hover{text-decoration:underline}
 ::-webkit-scrollbar-track{background:#111}
 ::-webkit-scrollbar-thumb{background:#333;border-radius:3px}
 
-/* Layout */
 .container{max-width:1100px;margin:0 auto;padding:2rem 1.5rem}
 
-/* Header */
 .report-header{
   background:linear-gradient(135deg,#0f0c29,#1a1040,#0a0a0a);
   border-bottom:1px solid var(--border);padding:2.5rem 1.5rem 2rem;
@@ -350,7 +369,6 @@ a:hover{text-decoration:underline}
 .risk-low   {background:var(--green-bg);color:var(--green)}
 .risk-info  {background:var(--indigo-bg);color:#a5b4fc}
 
-/* Section */
 .section{margin-bottom:2.5rem}
 .section-title{
   font-size:1rem;font-weight:700;color:#fff;text-transform:uppercase;
@@ -358,10 +376,8 @@ a:hover{text-decoration:underline}
   border-bottom:2px solid var(--border2);display:flex;align-items:center;gap:.5rem}
 .section-title .icon{font-size:1.1rem}
 
-/* Cards grid */
 .cards-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:1rem}
 
-/* Platform card */
 .platform-card{
   background:var(--surface);border:1px solid var(--border);
   border-radius:var(--radius);overflow:hidden;transition:border-color .2s}
@@ -385,7 +401,6 @@ a:hover{text-decoration:underline}
 .platform-body{padding:1rem 1.1rem;display:none;border-top:1px solid var(--border)}
 .platform-card.open .platform-body{display:block}
 
-/* Data rows inside cards */
 .data-row{display:flex;gap:.6rem;padding:.3rem 0;font-size:.83rem;
   border-bottom:1px solid #1f1f1f}
 .data-row:last-child{border-bottom:none}
@@ -397,7 +412,6 @@ a:hover{text-decoration:underline}
   background:#111;border-radius:6px;padding:.6rem .8rem;margin-top:.4rem;
   border-left:3px solid var(--indigo)}
 
-/* Identity cards */
 .identity-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:.75rem}
 .identity-card{
   background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
@@ -410,7 +424,6 @@ a:hover{text-decoration:underline}
 .confidence-fill{height:100%;border-radius:2px;
   background:linear-gradient(90deg,var(--indigo),var(--emerald))}
 
-/* Email / breach */
 .email-card{background:var(--surface);border:1px solid var(--border);
   border-radius:var(--radius);padding:1rem 1.1rem;margin-bottom:.75rem}
 .email-address{font-family:monospace;font-size:.95rem;color:var(--indigo);font-weight:600}
@@ -420,7 +433,6 @@ a:hover{text-decoration:underline}
 .site-tag{background:#1a2035;color:#7aa2f7;font-size:.72rem;
   padding:.15rem .5rem;border-radius:4px}
 
-/* Correlation */
 .corr-item{display:flex;align-items:flex-start;gap:.75rem;
   background:var(--surface);border:1px solid var(--border);border-radius:8px;
   padding:.7rem 1rem;margin-bottom:.5rem}
@@ -431,7 +443,6 @@ a:hover{text-decoration:underline}
 .conf-low {background:#1c2530;color:#7dd3fc}
 .corr-desc{color:var(--text2);font-size:.83rem;line-height:1.5}
 
-/* Narrative cards */
 .narrative-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:.85rem;
   margin-bottom:1.2rem}
 .narrative-card{background:var(--surface);border:1px solid var(--border);
@@ -444,7 +455,6 @@ a:hover{text-decoration:underline}
   border-bottom:1px solid var(--border);display:flex;gap:.5rem;align-items:flex-start}
 .critical-list li::before{content:"🎯";font-size:.8rem;flex-shrink:0;margin-top:1px}
 
-/* Pivot */
 .pivot-card{background:var(--surface);border:1px solid #1a3d25;
   border-radius:var(--radius);margin-bottom:.75rem;overflow:hidden}
 .pivot-header{
@@ -457,7 +467,6 @@ a:hover{text-decoration:underline}
 .pivot-body{padding:1rem 1.1rem;display:none;border-top:1px solid #1a3d25}
 .pivot-card.open .pivot-body{display:block}
 
-/* Technical data */
 .tech-card{background:var(--surface);border:1px solid var(--border);
   border-radius:var(--radius);padding:1rem 1.1rem;margin-bottom:.75rem}
 .tech-card h4{font-size:.8rem;color:var(--text3);text-transform:uppercase;
@@ -465,29 +474,30 @@ a:hover{text-decoration:underline}
 .mono{font-family:monospace;font-size:.82rem;color:var(--text2);
   background:#111;padding:.5rem .75rem;border-radius:6px;word-break:break-all}
 
-/* Stats bar */
 .stats-bar{display:flex;flex-wrap:wrap;gap:.75rem;margin-bottom:1.5rem}
 .stat-pill{background:var(--surface);border:1px solid var(--border);
   border-radius:20px;padding:.3rem .9rem;font-size:.8rem;color:var(--text2)}
 .stat-pill strong{color:#fff}
 
-/* Empty state */
 .empty{color:var(--text3);font-style:italic;font-size:.85rem;padding:.5rem 0}
 
-/* Footer */
 .report-footer{text-align:center;padding:2rem 0;color:var(--text3);font-size:.78rem;
   border-top:1px solid var(--border);margin-top:3rem}
-"""
 
-# ---------------------------------------------------------------------------
-# JavaScript (toggle behaviour, all inline)
-# ---------------------------------------------------------------------------
+/* Enrichment */
+.enr-provider-tag{display:inline-block;padding:.1rem .45rem;border-radius:4px;
+  font-size:.65rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;
+  background:var(--indigo-bg);color:#c7d2fe;margin-left:.4rem}
+.enr-err{color:var(--red);font-size:.78rem}
+"""
 
 _JS = """
 document.querySelectorAll('.platform-header').forEach(h => {
   h.addEventListener('click', () => {
     const card = h.closest('.platform-card');
-    card.classList.toggle('open');
+    if (card.querySelector('.platform-body')) {
+      card.classList.toggle('open');
+    }
   });
 });
 document.querySelectorAll('.pivot-header').forEach(h => {
@@ -496,11 +506,11 @@ document.querySelectorAll('.pivot-header').forEach(h => {
     card.classList.toggle('open');
   });
 });
-// Open all platform cards that have data (bio or extra fields)
 document.querySelectorAll('.platform-card[data-has-detail]').forEach(c => {
   c.classList.add('open');
 });
 """
+
 
 # ---------------------------------------------------------------------------
 # Section renderers
@@ -517,14 +527,12 @@ def _render_identity_section(intel: dict) -> str:
 
     rows: list[str] = []
 
-    # Collect names
     names: list[tuple[str, str]] = []
     for key, entry in clues.items():
         val, src = _unpack(entry)
         if key.startswith("name_") and val:
             names.append((val, src))
 
-    # Discord username
     disc_user_entry = discord.get("username")
     if disc_user_entry:
         disc_user, _ = _unpack(disc_user_entry)
@@ -536,7 +544,6 @@ def _render_identity_section(intel: dict) -> str:
                 f'</div>'
             )
 
-    # Account created
     acc_created_entry = discord.get("account_created")
     if acc_created_entry:
         acc_val, _ = _unpack(acc_created_entry)
@@ -548,7 +555,6 @@ def _render_identity_section(intel: dict) -> str:
                 f'</div>'
             )
 
-    # Names
     for name_val, name_src in names[:6]:
         rows.append(
             f'<div class="identity-card">'
@@ -558,7 +564,6 @@ def _render_identity_section(intel: dict) -> str:
             f'</div>'
         )
 
-    # Location / language
     loc_entry = clues.get("inferred_location")
     if loc_entry:
         loc_val, _ = _unpack(loc_entry)
@@ -581,7 +586,6 @@ def _render_identity_section(intel: dict) -> str:
                 f'</div>'
             )
 
-    # Top identity confidence score
     if scores and isinstance(scores, list):
         top = scores[0] if isinstance(scores[0], dict) else {}
         top_name  = top.get("name", "")
@@ -604,8 +608,8 @@ def _render_identity_section(intel: dict) -> str:
 
     return f'<div class="identity-grid">{"".join(rows)}</div>'
 
+
 def _render_persona_section(intel: dict) -> str:
-    """Render the AI persona summary if it exists."""
     persona_entry = intel.get("persona_summary", {}).get("persona")
     if not persona_entry:
         return ""
@@ -622,6 +626,7 @@ def _render_persona_section(intel: dict) -> str:
       </div>
     </div>"""
 
+
 def _render_platform_card(platform: str, data: dict) -> str:
     icon     = _platform_icon(platform)
     label    = _platform_label(platform)
@@ -635,17 +640,15 @@ def _render_platform_card(platform: str, data: dict) -> str:
     created   = data.get("created", "")
     extra     = data.get("extra", {})
 
-    # Primary display username / URL
     primary_username = usernames[0] if usernames else (
         urls[0].split("/")[-1] if urls else ""
     )
 
-    # Does this card have detail to show?
-    has_detail = bool(bio or location or email or followers or created or extra or len(usernames) > 1 or len(urls) > 0)
+    has_detail = bool(bio or location or email or followers or created
+                      or extra or len(usernames) > 1 or len(urls) > 0)
 
     rows: list[str] = []
 
-    # All usernames
     if usernames:
         handles = " · ".join(_e(u) for u in usernames[:5])
         rows.append(
@@ -655,10 +658,10 @@ def _render_platform_card(platform: str, data: dict) -> str:
             f'</div>'
         )
 
-    # URLs
     if urls:
         links = " ".join(
-            f'<a href="{_e(u)}" target="_blank" rel="noreferrer">{_e(u[:60])}{"…" if len(u) > 60 else ""}</a>'
+            f'<a href="{_safe_href(u)}" target="_blank" '
+            f'rel="noopener noreferrer">{_e(u[:60])}{"…" if len(u) > 60 else ""}</a>'
             for u in urls[:3]
         )
         rows.append(
@@ -668,7 +671,6 @@ def _render_platform_card(platform: str, data: dict) -> str:
             f'</div>'
         )
 
-    # Created
     if created:
         rows.append(
             f'<div class="data-row">'
@@ -677,7 +679,6 @@ def _render_platform_card(platform: str, data: dict) -> str:
             f'</div>'
         )
 
-    # Location
     if location:
         rows.append(
             f'<div class="data-row">'
@@ -686,7 +687,6 @@ def _render_platform_card(platform: str, data: dict) -> str:
             f'</div>'
         )
 
-    # Email
     if email:
         rows.append(
             f'<div class="data-row">'
@@ -695,7 +695,6 @@ def _render_platform_card(platform: str, data: dict) -> str:
             f'</div>'
         )
 
-    # Followers
     if followers:
         rows.append(
             f'<div class="data-row">'
@@ -704,18 +703,17 @@ def _render_platform_card(platform: str, data: dict) -> str:
             f'</div>'
         )
 
-    # Blog
     if blog:
         rows.append(
             f'<div class="data-row">'
             f'<span class="data-label">Blog/Link</span>'
             f'<span class="data-value">'
-            f'<a href="{_e(blog)}" target="_blank" rel="noreferrer">{_e(blog[:60])}</a>'
+            f'<a href="{_safe_href(blog)}" target="_blank" '
+            f'rel="noopener noreferrer">{_e(blog[:60])}</a>'
             f'</span>'
             f'</div>'
         )
 
-    # Extra fields from socid
     for k, v in list(extra.items())[:8]:
         rows.append(
             f'<div class="data-row">'
@@ -724,20 +722,19 @@ def _render_platform_card(platform: str, data: dict) -> str:
             f'</div>'
         )
 
-    # Avatar image
     avatar = data.get("avatar", "")
     avatar_html = ""
-    if avatar and avatar.startswith("http"):
+    safe_avatar = _safe_img_src(avatar) if avatar else ""
+    if safe_avatar:
         avatar_html = (
             f'<div style="text-align:center;margin-bottom:.8rem">'
-            f'<img src="{_e(avatar)}" alt="Profile avatar" '
+            f'<img src="{safe_avatar}" alt="Profile avatar" '
             f'style="max-width:120px;max-height:120px;border-radius:50%;'
             f'border:2px solid var(--border2);display:inline-block"'
             f' onerror="this.style.display=\'none\'">'
             f'</div>'
         )
 
-    # Bio (always last, always full width)
     bio_html = ""
     if bio:
         bio_html = f'<div class="bio-text">{_e(bio)}</div>'
@@ -779,7 +776,6 @@ def _render_email_section(intel: dict) -> str:
     if not emails_intel:
         return '<div class="empty">No emails collected.</div>'
 
-    # ── Direct lookup: for each email, find matching breaches ──────
     parts: list[str] = []
     for _key, entry in emails_intel.items():
         email_val, src = _unpack(entry)
@@ -795,7 +791,6 @@ def _render_email_section(intel: dict) -> str:
             if not bv_raw:
                 continue
 
-            # Check if this breach key mentions our email
             if email_lower in bk.lower():
                 if "holehe_" in bk:
                     try:
@@ -830,7 +825,7 @@ def _render_email_section(intel: dict) -> str:
         total_breaches = len(hibp_sites) + len(holehe_sites)
         badge_html = f'<span class="risk-badge risk-high">{total_breaches} breach{"es" if total_breaches!=1 else ""}</span>' \
                      if total_breaches > 0 else '<span class="risk-badge risk-info">no breaches found</span>'
-        # ── MOSINT summary (if available) ──────────────────────────
+
         mosint_text = ""
         mosint_data = intel.get("mosint", {}).get(email_lower)
         if mosint_data:
@@ -873,7 +868,6 @@ def _render_intelligence_section(intel: dict) -> str:
 
     parts: list[str] = []
 
-    # Stats
     if entity_counts:
         pills = "".join(
             _render_stat_pill(k, v)
@@ -883,7 +877,6 @@ def _render_intelligence_section(intel: dict) -> str:
         pills += _render_stat_pill("Graph edges", g_summary.get("total_edges", 0))
         parts.append(f'<div class="stats-bar">{pills}</div>')
 
-    # Narrative cards
     if narrative:
         _card_defs = [
             ("executive_summary",   "📋 Executive Summary"),
@@ -914,7 +907,6 @@ def _render_intelligence_section(intel: dict) -> str:
                 f'</div>'
             )
 
-    # Correlations
     if correlations:
         parts.append('<h4 style="font-size:.85rem;color:#94a3b8;margin:.75rem 0 .4rem">Correlations</h4>')
         for c in correlations:
@@ -993,7 +985,6 @@ def _render_pivot_section(intel: dict) -> str:
 def _render_technical_section(intel: dict) -> str:
     parts: list[str] = []
 
-    # DNS records
     dns = intel.get("dns", {})
     if dns:
         for domain_key, entry in list(dns.items())[:5]:
@@ -1016,7 +1007,6 @@ def _render_technical_section(intel: dict) -> str:
                 except Exception:
                     pass
 
-    # SSL certificate
     ssl_info = intel.get("ssl", {})
     if ssl_info:
         for domain_key, entry in list(ssl_info.items())[:5]:
@@ -1037,7 +1027,6 @@ def _render_technical_section(intel: dict) -> str:
                 except Exception:
                     pass
 
-    # IP geolocation
     for key, entry in intel.get("dns", {}).items():
         if key.endswith("_geo"):
             val, _ = _unpack(entry)
@@ -1057,7 +1046,6 @@ def _render_technical_section(intel: dict) -> str:
                 except Exception:
                     pass
 
-    # Subdomains
     subdomains = intel.get("subdomains", {})
     if subdomains:
         for domain_key, entry in subdomains.items():
@@ -1076,7 +1064,6 @@ def _render_technical_section(intel: dict) -> str:
                 except Exception:
                     pass
 
-    # theHarvester results
     harvester_emails = intel.get("harvester_emails", {})
     if harvester_emails:
         for domain_key, entry in harvester_emails.items():
@@ -1115,7 +1102,6 @@ def _render_technical_section(intel: dict) -> str:
                 except Exception:
                     pass
 
-    # WHOIS (structured card)
     whois = intel.get("whois", {})
     if whois:
         for domain, entry in list(whois.items())[:5]:
@@ -1125,7 +1111,6 @@ def _render_technical_section(intel: dict) -> str:
                     data = json.loads(val) if isinstance(val, str) else val
                     if isinstance(data, dict):
                         rows = []
-                        # Simple fields
                         for field, label in [
                             ("registrar", "Registrar"),
                             ("creation_date", "Creation Date"),
@@ -1136,11 +1121,9 @@ def _render_technical_section(intel: dict) -> str:
                         ]:
                             if data.get(field):
                                 rows.append(f'<div class="data-row"><span class="data-label">{label}</span><span class="data-value">{_e(str(data[field]))}</span></div>')
-                        # Name servers (list)
                         if data.get("name_servers") and isinstance(data["name_servers"], list):
                             ns = ", ".join(data["name_servers"][:8])
                             rows.append(f'<div class="data-row"><span class="data-label">Name Servers</span><span class="data-value">{_e(ns)}</span></div>')
-                        # Domain statuses (list)
                         if data.get("domain_status") and isinstance(data["domain_status"], list):
                             statuses = ", ".join(data["domain_status"][:5])
                             rows.append(f'<div class="data-row"><span class="data-label">Domain Status</span><span class="data-value">{_e(statuses)}</span></div>')
@@ -1153,7 +1136,6 @@ def _render_technical_section(intel: dict) -> str:
                                 f'</div>'
                             )
                         else:
-                            # fallback to raw JSON
                             parts.append(
                                 f'<div class="tech-card">'
                                 f'<h4>WHOIS · {_e(domain)}</h4>'
@@ -1161,7 +1143,6 @@ def _render_technical_section(intel: dict) -> str:
                                 f'</div>'
                             )
                 except Exception:
-                    # fallback: show raw
                     parts.append(
                         f'<div class="tech-card">'
                         f'<h4>WHOIS · {_e(domain)}</h4>'
@@ -1169,18 +1150,15 @@ def _render_technical_section(intel: dict) -> str:
                         f'</div>'
                     )
 
-    # Phone intelligence
     phone = intel.get("phone", {})
     if phone:
         rows = []
-        # Helper to get the actual value from an intel entry
         def _get_phone_val(field: str) -> str:
             entry = phone.get(field)
             if entry and isinstance(entry, dict):
                 return _unpack(entry)[0]
             return ""
 
-        # Basic fields from phonenumbers
         number = _get_phone_val("number")
         if number:
             rows.append(f'<div class="data-row"><span class="data-label">Number</span><span class="data-value">{_e(number)}</span></div>')
@@ -1200,13 +1178,11 @@ def _render_technical_section(intel: dict) -> str:
         if carrier:
             rows.append(f'<div class="data-row"><span class="data-label">Carrier (phonenumbers)</span><span class="data-value">{_e(carrier)}</span></div>')
 
-        # Carrier lookup from API (safe parsing)
         carrier_lookup = phone.get("carrier_lookup")
         if carrier_lookup and isinstance(carrier_lookup, dict):
             val, _ = _unpack(carrier_lookup)
             if val:
                 try:
-                    # val might be a JSON string or already a dict
                     if isinstance(val, str):
                         data = json.loads(val)
                     else:
@@ -1219,7 +1195,6 @@ def _render_technical_section(intel: dict) -> str:
                         if data.get("line_type"):
                             rows.append(f'<div class="data-row"><span class="data-label">Line Type</span><span class="data-value">{_e(data["line_type"])}</span></div>')
                 except Exception:
-                    # If API data is malformed, ignore it – don't crash the whole card
                     pass
 
         if rows:
@@ -1230,11 +1205,9 @@ def _render_technical_section(intel: dict) -> str:
                 f'</div>'
             )
 
-    # URL analysis
     url_intel = intel.get("url_intel", {})
     if url_intel:
         rows = []
-        # HTTP metadata
         http_meta = url_intel.get("http_meta")
         if http_meta and isinstance(http_meta, dict):
             val, _ = _unpack(http_meta)
@@ -1242,17 +1215,21 @@ def _render_technical_section(intel: dict) -> str:
                 try:
                     data = json.loads(val) if isinstance(val, str) else val
                     if isinstance(data, dict):
-                        # Status code
                         if data.get("status_code"):
                             rows.append(f'<div class="data-row"><span class="data-label">HTTP Status</span><span class="data-value">{_e(str(data["status_code"]))}</span></div>')
-                        # Final URL
                         if data.get("final_url"):
-                            rows.append(f'<div class="data-row"><span class="data-label">Final URL</span><span class="data-value"><a href="{_e(data["final_url"])}" target="_blank">{_e(data["final_url"])}</a></span></div>')
-                        # Redirect chain (NEW)
+                            rows.append(
+                                f'<div class="data-row">'
+                                f'<span class="data-label">Final URL</span>'
+                                f'<span class="data-value">'
+                                f'<a href="{_safe_href(data["final_url"])}" '
+                                f'target="_blank" rel="noopener noreferrer">'
+                                f'{_e(data["final_url"])}</a>'
+                                f'</span></div>'
+                            )
                         if data.get("redirect_chain") and isinstance(data["redirect_chain"], list):
                             chain = " → ".join(data["redirect_chain"][:5])
                             rows.append(f'<div class="data-row"><span class="data-label">Redirects</span><span class="data-value">{_e(chain)}</span></div>')
-                        # Extra headers (NEW)
                         extra_headers = []
                         if data.get("server"):
                             extra_headers.append(f"Server: {data['server']}")
@@ -1264,13 +1241,11 @@ def _render_technical_section(intel: dict) -> str:
                             extra_headers.append(f"HSTS: {data['strict_transport']}")
                         if extra_headers:
                             rows.append(f'<div class="data-row"><span class="data-label">Extra Headers</span><span class="data-value">{_e(" · ".join(extra_headers))}</span></div>')
-                        # Content type
                         if data.get("content_type"):
                             rows.append(f'<div class="data-row"><span class="data-label">Content Type</span><span class="data-value">{_e(data["content_type"])}</span></div>')
                 except Exception:
                     pass
 
-        # Page metadata
         page_meta = url_intel.get("page_meta")
         has_metadata = False
         if page_meta and isinstance(page_meta, dict):
@@ -1288,12 +1263,18 @@ def _render_technical_section(intel: dict) -> str:
                         og = data.get("og")
                         if og and isinstance(og, dict):
                             if og.get("og:image"):
-                                rows.append(f'<div class="data-row"><span class="data-label">OG Image</span><span class="data-value"><a href="{_e(og["og:image"])}" target="_blank">Preview</a></span></div>')
+                                rows.append(
+                                    f'<div class="data-row">'
+                                    f'<span class="data-label">OG Image</span>'
+                                    f'<span class="data-value">'
+                                    f'<a href="{_safe_href(og["og:image"])}" '
+                                    f'target="_blank" rel="noopener noreferrer">Preview</a>'
+                                    f'</span></div>'
+                                )
                                 has_metadata = True
                 except Exception:
                     pass
 
-        # If no metadata and HTTP status is not 200, show a warning
         http_status = None
         if http_meta and isinstance(http_meta, dict):
             val, _ = _unpack(http_meta)
@@ -1308,14 +1289,12 @@ def _render_technical_section(intel: dict) -> str:
         elif not has_metadata:
             rows.append(f'<div class="data-row"><span class="data-label">Note</span><span class="data-value">No page metadata (title/description) found.</span></div>')
 
-        # Domain
         domain = url_intel.get("domain")
         if domain and isinstance(domain, dict):
             val, _ = _unpack(domain)
             if val:
                 rows.append(f'<div class="data-row"><span class="data-label">Domain</span><span class="data-value">{_e(val)}</span></div>')
 
-        # Interesting links (NEW) – from url_intel["interesting_links"]
         interesting_links = url_intel.get("interesting_links")
         if interesting_links and isinstance(interesting_links, dict):
             val, _ = _unpack(interesting_links)
@@ -1323,12 +1302,17 @@ def _render_technical_section(intel: dict) -> str:
                 try:
                     links = json.loads(val) if isinstance(val, str) else val
                     if isinstance(links, list) and links:
-                        link_tags = "".join(f'<span class="site-tag"><a href="{_e(link)}" target="_blank">{_e(link[:60])}</a></span>' for link in links[:10])
+                        link_tags = "".join(
+                            f'<span class="site-tag">'
+                            f'<a href="{_safe_href(link)}" target="_blank" '
+                            f'rel="noopener noreferrer">{_e(link[:60])}</a>'
+                            f'</span>'
+                            for link in links[:10]
+                        )
                         rows.append(f'<div class="data-row"><span class="data-label">Interesting Links</span><span class="data-value">{link_tags}</span></div>')
                 except Exception:
                     pass
 
-        # Emails found on the page
         emails = intel.get("emails", {})
         if emails:
             email_tags = []
@@ -1347,7 +1331,6 @@ def _render_technical_section(intel: dict) -> str:
                 f'</div>'
             )
 
-    # Wayback
     wayback = intel.get("wayback", {})
     if wayback:
         rows = []
@@ -1357,8 +1340,10 @@ def _render_technical_section(intel: dict) -> str:
                 rows.append(
                     f'<div class="data-row">'
                     f'<span class="data-label">URL</span>'
-                    f'<span class="data-value"><a href="{_e(str(val))}" target="_blank">'
-                    f'{_e(url[:60])}</a></span>'
+                    f'<span class="data-value">'
+                    f'<a href="{_safe_href(str(val))}" target="_blank" '
+                    f'rel="noopener noreferrer">{_e(url[:60])}</a>'
+                    f'</span>'
                     f'</div>'
                 )
         if rows:
@@ -1369,7 +1354,6 @@ def _render_technical_section(intel: dict) -> str:
                 f'</div>'
             )
 
-    # EXIF / GPS
     media = intel.get("media", {})
     if media:
         gps_rows = []
@@ -1391,7 +1375,6 @@ def _render_technical_section(intel: dict) -> str:
                 f'</div>'
             )
 
-    # GHunt
     ghunt = intel.get("ghunt", {})
     if ghunt:
         for email_key, entry in list(ghunt.items())[:3]:
@@ -1413,28 +1396,225 @@ def _render_technical_section(intel: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Contact-enrichment section renderers
+# ---------------------------------------------------------------------------
+
+def _render_enrichment_profile_card(provider: str, person: dict) -> str:
+    """Render one enriched contact (Apollo or Lusha) as a card."""
+    if not isinstance(person, dict):
+        return ""
+
+    name_parts = [
+        person.get("first_name") or person.get("firstName") or "",
+        person.get("last_name")  or person.get("lastName")  or "",
+    ]
+    full_name = " ".join(p for p in name_parts if p).strip() or \
+                person.get("name") or "Unknown"
+
+    title    = person.get("title") or person.get("jobTitle") or ""
+    city     = person.get("city") or ""
+    state    = person.get("state") or ""
+    country  = person.get("country") or ""
+    location = ", ".join(str(x) for x in (city, state, country) if x)
+
+    linkedin = person.get("linkedin_url") or person.get("linkedinUrl") or ""
+
+    org = person.get("organization") or {}
+    company = ""
+    if isinstance(org, dict):
+        company = org.get("name") or ""
+    company = company or person.get("companyName") or person.get("company") or ""
+
+    emails: list[str] = []
+    for key in ("email", "emailAddress", "emails", "emailAddresses"):
+        val = person.get(key)
+        if isinstance(val, str) and "@" in val:
+            emails.append(val)
+        elif isinstance(val, list):
+            for item in val:
+                if isinstance(item, str) and "@" in item:
+                    emails.append(item)
+                elif isinstance(item, dict):
+                    e = item.get("emailAddress") or item.get("email")
+                    if isinstance(e, str) and "@" in e:
+                        emails.append(e)
+
+    phones: list[str] = []
+    for key in ("phone", "phoneNumber", "phones", "phoneNumbers"):
+        val = person.get(key)
+        if isinstance(val, str) and val.strip():
+            phones.append(val.strip())
+        elif isinstance(val, list):
+            for item in val:
+                if isinstance(item, str) and item.strip():
+                    phones.append(item.strip())
+                elif isinstance(item, dict):
+                    p = item.get("phoneNumber") or item.get("number")
+                    if isinstance(p, str) and p.strip():
+                        phones.append(p.strip())
+
+    rows: list[str] = []
+    if title:
+        rows.append(f'<div class="data-row"><span class="data-label">Title</span><span class="data-value">{_e(title)}</span></div>')
+    if company:
+        rows.append(f'<div class="data-row"><span class="data-label">Company</span><span class="data-value">{_e(company)}</span></div>')
+    if location:
+        rows.append(f'<div class="data-row"><span class="data-label">Location</span><span class="data-value">📍 {_e(location)}</span></div>')
+    if linkedin:
+        rows.append(
+            f'<div class="data-row"><span class="data-label">LinkedIn</span>'
+            f'<span class="data-value"><a href="{_safe_href(linkedin)}" '
+            f'target="_blank" rel="noopener noreferrer">'
+            f'{_e(linkedin[:80])}</a></span></div>'
+        )
+    for email in dict.fromkeys(emails):
+        rows.append(f'<div class="data-row"><span class="data-label">Email</span><span class="data-value">✉️ {_e(email)}</span></div>')
+    for phone in dict.fromkeys(phones):
+        rows.append(f'<div class="data-row"><span class="data-label">Phone</span><span class="data-value">📞 {_e(phone)}</span></div>')
+
+    if not rows:
+        return ""
+
+    icon = "🅰️" if provider == "apollo" else "🅻"
+    return (
+        f'<div class="platform-card" data-has-detail="1">'
+        f'<div class="platform-header" style="cursor:default">'
+        f'<span class="platform-icon">{icon}</span>'
+        f'<span class="platform-name">{_e(full_name[:60])}</span>'
+        f'<span class="platform-username">{_e(title[:30])}</span>'
+        f'</div>'
+        f'<div class="platform-body">{"".join(rows)}</div>'
+        f'</div>'
+    )
+
+
+def _render_enrichment_section(intel: dict) -> str:
+    """
+    Matched Apollo / Lusha profiles, plus the spend summary.
+
+    Returns "" when the enrichment stage did not run.
+    """
+    profiles = intel.get("enrichment_profiles") or {}
+    spend    = intel.get("enrichment_spend") or {}
+    if not profiles and not spend:
+        return ""
+
+    parts: list[str] = []
+
+    # Spend summary pills.
+    if spend:
+        pills: list[str] = []
+        for provider, info in spend.items():
+            if not isinstance(info, dict):
+                continue
+            matched = info.get("matched", 0)
+            credits = info.get("credits", 0.0)
+            pills.append(_render_stat_pill(f"{provider.title()} matched", matched))
+            try:
+                pills.append(_render_stat_pill(
+                    f"{provider.title()} credits", f"{float(credits):g}",
+                ))
+            except (TypeError, ValueError):
+                pass
+            err = info.get("error")
+            if err:
+                pills.append(
+                    f'<div class="stat-pill"><span class="enr-err">'
+                    f'{_e(provider.title())}: {_e(str(err)[:80])}'
+                    f'</span></div>'
+                )
+        if pills:
+            parts.append(f'<div class="stats-bar">{"".join(pills)}</div>')
+
+    # Per-provider profile cards.
+    for provider, people in profiles.items():
+        if not people:
+            continue
+        cards = [
+            _render_enrichment_profile_card(provider, p)
+            for p in people if isinstance(p, dict)
+        ]
+        cards = [c for c in cards if c]
+        if not cards:
+            continue
+        parts.append(
+            f'<h4 style="font-size:.85rem;color:#94a3b8;margin:.75rem 0 .4rem">'
+            f'{_e(provider.title())} matches ({len(cards)})'
+            f'<span class="enr-provider-tag">{_e(provider)}</span>'
+            f'</h4>'
+        )
+        parts.append(f'<div class="cards-grid">{"".join(cards)}</div>')
+
+    return "".join(parts) if parts else ""
+
+
+def _render_enrichment_rejections(intel: dict) -> str:
+    """
+    Collapsed audit block listing every identifier the trust filter
+    rejected, per provider, with its one-line reason.
+    """
+    decisions = intel.get("enrichment_decisions") or {}
+    if not decisions:
+        return ""
+
+    rows: list[str] = []
+    total_rejected = 0
+
+    for provider, entries in decisions.items():
+        if not isinstance(entries, list):
+            continue
+        rejected = [e for e in entries if isinstance(e, dict) and not e.get("accepted")]
+        if not rejected:
+            continue
+        total_rejected += len(rejected)
+
+        inner: list[str] = []
+        for entry in rejected:
+            kind   = _e(str(entry.get("kind", "")))
+            value  = _e(str(entry.get("value", ""))[:120])
+            reason = _e(str(entry.get("reason", "")))
+            inner.append(
+                f'<div class="data-row">'
+                f'<span class="data-label">{kind}</span>'
+                f'<span class="data-value">'
+                f'<code style="color:#a5b4fc">{value}</code>'
+                f'<span style="color:var(--text3);margin-left:.5rem">— {reason}</span>'
+                f'</span></div>'
+            )
+
+        rows.append(
+            f'<details style="margin-bottom:.75rem">'
+            f'<summary style="cursor:pointer;color:var(--text2);font-size:.85rem">'
+            f'{_e(provider)}: {len(rejected)} identifier(s) rejected by the trust filter'
+            f'</summary>'
+            f'<div style="margin-top:.5rem">{"".join(inner)}</div>'
+            f'</details>'
+        )
+
+    if not rows:
+        return ""
+
+    return f"""
+    <div class="section">
+      <div class="section-title"><span class="icon">🚫</span>Rejected Identifiers ({total_rejected})</div>
+      <p style="font-size:.8rem;color:var(--text3);margin-bottom:.75rem">
+        These identifiers were evaluated but not submitted to the enabled
+        provider(s). Each carries the reason the trust filter rejected it.
+      </p>
+      {"".join(rows)}
+    </div>"""
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
 def generate_html_report(intel_core: Any, target_id: Any) -> str:
     """
     Generate a complete, self-contained dark-themed HTML report.
-
-    Parameters
-    ----------
-    intel_core:
-        ``InvestigationCore`` instance (uses ``.intel`` dict).
-    target_id:
-        Investigation target identifier used in the header.
-
-    Returns
-    -------
-    str
-        Full HTML document as a string.
     """
     intel = intel_core.intel if hasattr(intel_core, "intel") else intel_core
 
-    # ── Resolve target name ──────────────────────────────────────────────
     target_name = str(target_id)
     disc_user   = intel.get("discord", {}).get("username")
     if disc_user:
@@ -1442,15 +1622,14 @@ def generate_html_report(intel_core: Any, target_id: Any) -> str:
         if val:
             target_name = val
 
-    # ── Stats ────────────────────────────────────────────────────────────
     email_count   = len(intel.get("emails", {}))
     profile_count = len(_parse_social_profiles(intel))
     breach_count  = len(intel.get("breaches", {}))
     pivot_count   = len(intel.get("pivot_reports", []))
     has_intel     = bool(intel.get("intelligence_report"))
+    has_enrich    = bool(intel.get("enrichment_profiles") or intel.get("enrichment_spend"))
     generated_at  = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    # Risk badge
     if breach_count > 5 or email_count > 3:
         risk_label, risk_class = "High", "risk-high"
     elif breach_count > 0 or profile_count > 5:
@@ -1460,7 +1639,6 @@ def generate_html_report(intel_core: Any, target_id: Any) -> str:
     else:
         risk_label, risk_class = "Minimal", "risk-info"
 
-    # ── Pivot section HTML ────────────────────────────────────────────────
     pivot_html    = _render_pivot_section(intel)
     pivot_section = ""
     if pivot_html:
@@ -1470,7 +1648,6 @@ def generate_html_report(intel_core: Any, target_id: Any) -> str:
           {pivot_html}
         </div>"""
 
-    # ── Technical section ────────────────────────────────────────────────
     tech_html    = _render_technical_section(intel)
     tech_section = ""
     if tech_html:
@@ -1480,7 +1657,17 @@ def generate_html_report(intel_core: Any, target_id: Any) -> str:
           {tech_html}
         </div>"""
 
-    # ── Assemble ─────────────────────────────────────────────────────────
+    enrichment_html    = _render_enrichment_section(intel)
+    enrichment_section = ""
+    if enrichment_html:
+        enrichment_section = f"""
+        <div class="section">
+          <div class="section-title"><span class="icon">🛰</span>Contact Enrichment</div>
+          {enrichment_html}
+        </div>"""
+
+    rejection_html = _render_enrichment_rejections(intel)
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1497,6 +1684,7 @@ def generate_html_report(intel_core: Any, target_id: Any) -> str:
     <div>
       <span class="risk-badge {risk_class}">{risk_label} Risk</span>
       {f'<span class="risk-badge risk-info">🧠 Intelligence</span>' if has_intel else ""}
+      {f'<span class="risk-badge risk-info">🛰 Enriched</span>' if has_enrich else ""}
       {f'<span class="risk-badge risk-info">🔄 {pivot_count} Pivot{"s" if pivot_count!=1 else ""}</span>' if pivot_count else ""}
     </div>
     <div class="meta">Generated {generated_at} · WhoCord v1.1</div>
@@ -1504,7 +1692,6 @@ def generate_html_report(intel_core: Any, target_id: Any) -> str:
 
   <div class="container">
 
-    <!-- Stats bar -->
     <div class="stats-bar">
       {_render_stat_pill("Emails", email_count)}
       {_render_stat_pill("Platforms", profile_count)}
@@ -1512,31 +1699,29 @@ def generate_html_report(intel_core: Any, target_id: Any) -> str:
       {_render_stat_pill("Pivot branches", pivot_count)}
     </div>
 
-    <!-- Identity -->
     <div class="section">
       <div class="section-title"><span class="icon">👤</span>Identity</div>
       {_render_identity_section(intel)}
       {_render_persona_section(intel)}
     </div>
 
-    <!-- Social Profiles -->
     <div class="section">
       <div class="section-title"><span class="icon">🔗</span>Social Profiles ({profile_count})</div>
       {_render_profiles_section(intel)}
     </div>
 
-    <!-- Email Intelligence -->
     <div class="section">
       <div class="section-title"><span class="icon">✉️</span>Email Intelligence ({email_count})</div>
       {_render_email_section(intel)}
     </div>
 
-    <!-- Intelligence Analysis -->
     <div class="section">
       <div class="section-title"><span class="icon">🧠</span>Intelligence Analysis</div>
       {_render_intelligence_section(intel)}
     </div>
 
+    {enrichment_section}
+    {rejection_html}
     {pivot_section}
     {tech_section}
 

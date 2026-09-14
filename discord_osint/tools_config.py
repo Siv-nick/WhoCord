@@ -1,3 +1,17 @@
+"""
+discord_osint/tools_config.py
+-----------------------------
+The list of toggleable investigation tools that the CLI menu and the
+web UI both render.
+
+Change log
+----------
+- Added ``ENABLE_APOLLO`` and ``ENABLE_LUSHA``. Both default to off; the
+  descriptions make the paid-credit nature explicit so an analyst does
+  not enable them without understanding the cost.
+- HIBP description now states that a v3 API key is required.
+"""
+
 TOOLS_LIST = [
     ("ENABLE_USER_SCANNER", "User Scanner (username + email, 550+ sites)"),
     ("ENABLE_MAIGRET", "Maigret (broad username fallback, ~3000 sites)"),
@@ -8,7 +22,7 @@ TOOLS_LIST = [
     ("ENABLE_WMN", "WhatsMyName (bundled 600+ site API endpoint dataset)"),
     ("ENABLE_HOLEHE", "Holehe (email site registrations)"),
     ("ENABLE_H8MAIL", "h8mail (breach check)"),
-    ("ENABLE_HIBP", "HaveIBeenPwned (HIBP)"),
+    ("ENABLE_HIBP", "HaveIBeenPwned (HIBP v3 — requires HIBP_API_KEY)"),
     ("ENABLE_EMAILREP", "EmailRep.io"),
     ("ENABLE_SCYLLA", "Scylla (leak DB)"),
     ("ENABLE_GHUNT", "GHunt (Google account info)"),
@@ -31,6 +45,9 @@ TOOLS_LIST = [
     ("ENABLE_GOSEARCH", "Gosearch"),
     ("ENABLE_FACE_MATCH", "Face matching (disabled)"),
     ("ENABLE_TOUTATIS", "Toutatis (Instagram, needs session)"),
+    # ── Paid contact-enrichment providers (both default OFF) ──────────
+    ("ENABLE_APOLLO", "Apollo.io enrichment (PAID CREDITS — requires APOLLO_API_KEY)"),
+    ("ENABLE_LUSHA",  "Lusha enrichment (PAID CREDITS — requires LUSHA_API_KEY)"),
     ("ENABLE_SHERLOCK", "[deprecated] Sherlock — replaced by User Scanner"),
     ("ENABLE_NAMINTER", "[deprecated] Naminter — replaced by User Scanner"),
     ("ENABLE_SOCIAL_ANALYZER", "[deprecated] Social Analyzer — replaced by User Scanner"),

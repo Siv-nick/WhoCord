@@ -8,6 +8,7 @@ import ResultCard from "../components/ResultCard";
 import IntelCard from "../components/IntelCard";
 import PivotConfirmModal from "../components/PivotConfirmModal";
 import { Icon } from "../components/Icons";
+import { stopInvestigation } from "../utils/api";
 import type {
   Finding,
   FindingCategory,
@@ -33,6 +34,7 @@ const FINDING_CATEGORIES: Record<string, FindingCategory> = {
   connected_account:   "social",
   holehe:              "breach",
   hibp:                "breach",
+  hibp_skipped:        "breach",
   h8mail:              "breach",
   scylla:              "breach",
   gravatar:            "social",
@@ -47,6 +49,8 @@ const FINDING_CATEGORIES: Record<string, FindingCategory> = {
   whois:               "social",
   pivot_start:         "pivot",
   pivot_done:          "pivot",
+  pivot_error:         "pivot",
+  pivot_skipped:       "pivot",
 };
 
 function categorise(type: string): FindingCategory {
@@ -56,6 +60,8 @@ function categorise(type: string): FindingCategory {
 // ---------------------------------------------------------------------------
 // Reducer
 // ---------------------------------------------------------------------------
+
+type RunStatus = "idle" | "running" | "stopping" | "done" | "cancelled" | "error";
 
 type Action =
   | { type: "JOB_START";    jobId: string; target: string; mode: InvestigationState["mode"] }
@@ -69,10 +75,18 @@ type Action =
   | { type: "PIVOT_UPDATE"; seed: string; status: PivotInfo["status"] }
   | { type: "PIVOT_CONFIRM_REQUEST"; payload: PivotConfirmRequestPayload }
   | { type: "PIVOT_CONFIRM_RESOLVED" }
-  | { type: "STREAM_END";   reportUrl: string | null; status: "done" | "error" }
-  | { type: "SSE_ERROR" };
+  | { type: "STOPPING" }
+  | { type: "STOP_FAILED" }
+  | { type: "STREAM_END";   reportUrl: string | null; status: "done" | "cancelled" | "error" }
+  | { type: "SSE_INTERRUPTED" }
+  | { type: "SSE_RECONNECTED" }
+  | { type: "SSE_GIVE_UP" };
 
-const INITIAL: InvestigationState = {
+interface ExtendedState extends InvestigationState {
+  runStatus: RunStatus;
+}
+
+const INITIAL: ExtendedState = {
   jobId:               null,
   target:              "",
   mode:                "",
@@ -85,6 +99,7 @@ const INITIAL: InvestigationState = {
   pivotDepth:          0,
   pivots:              [],
   pivotConfirmPending: null,
+  runStatus:           "idle",
 };
 
 let _fid = 0;
@@ -112,15 +127,16 @@ function updatePivot(
   return pivots.map(p => (p.seed === seed ? { ...p, status } : p));
 }
 
-function reducer(state: InvestigationState, action: Action): InvestigationState {
+function reducer(state: ExtendedState, action: Action): ExtendedState {
   switch (action.type) {
     case "JOB_START":
       return {
         ...state,
-        jobId: action.jobId,
-        target: action.target,
-        mode: action.mode,
-        status: "running",
+        jobId:     action.jobId,
+        target:    action.target,
+        mode:      action.mode,
+        status:    "running",
+        runStatus: "running",
       };
 
     case "STAGE_START":
@@ -184,11 +200,46 @@ function reducer(state: InvestigationState, action: Action): InvestigationState 
     case "PIVOT_CONFIRM_RESOLVED":
       return { ...state, pivotConfirmPending: null };
 
-    case "STREAM_END":
-      return { ...state, status: action.status, reportUrl: action.reportUrl };
+    case "STOPPING":
+      return {
+        ...state,
+        runStatus: "stopping",
+        logs: [...state.logs, "[stop] stop signal sent — waiting for worker to exit…"].slice(-500),
+      };
 
-    case "SSE_ERROR":
-      return { ...state, status: "error" };
+    case "STOP_FAILED":
+      // Server refused; assume we're still running.
+      return {
+        ...state,
+        runStatus: "running",
+        logs: [...state.logs, "[stop] server could not honour stop request"].slice(-500),
+      };
+
+    case "STREAM_END":
+      return {
+        ...state,
+        runStatus: action.status,
+        reportUrl: action.reportUrl ?? state.reportUrl,
+      };
+
+    case "SSE_INTERRUPTED":
+      return {
+        ...state,
+        logs: [...state.logs, "[sse] connection interrupted — retrying…"].slice(-500),
+      };
+
+    case "SSE_RECONNECTED":
+      return {
+        ...state,
+        logs: [...state.logs, "[sse] reconnected"].slice(-500),
+      };
+
+    case "SSE_GIVE_UP":
+      return {
+        ...state,
+        runStatus: "error",
+        logs: [...state.logs, "[sse] connection permanently lost"].slice(-500),
+      };
 
     default:
       return state;
@@ -209,6 +260,7 @@ export default function InvestigationLive() {
   const [state, dispatch]       = useReducer(reducer, INITIAL);
   const [showLogs, setShowLogs] = useState(false);
   const [curMsg, setCurMsg]     = useState("");
+  const [stopBusy, setStopBusy] = useState(false);
   const logsEndRef              = useRef<HTMLDivElement>(null);
 
   if (!nav_state?.sseUrl) {
@@ -320,28 +372,104 @@ export default function InvestigationLive() {
 
       case "pivot_confirm_timeout":
         dispatch({ type: "PIVOT_CONFIRM_RESOLVED" });
+        dispatch({
+          type: "LOG",
+          line: `[pivot] confirmation window elapsed at depth ${p.depth ?? "?"} — running full seed set`,
+        });
         break;
 
-      case "stream_end":
+      case "abort":
+        dispatch({
+          type: "LOG",
+          line: `[abort] ${String(p.reason ?? "aborted")} at stage ${String(p.stage ?? "?")}`,
+        });
+        break;
+
+      case "stream_end": {
+        const raw = String(p.status ?? "done");
+        const terminal: "done" | "cancelled" | "error" =
+          raw === "cancelled" ? "cancelled" :
+          raw === "error"     ? "error"     :
+          "done";
         dispatch({
           type: "STREAM_END",
           reportUrl: p.report_url ? String(p.report_url) : null,
-          status:    p.status === "error" ? "error" : "done",
+          status: terminal,
         });
         break;
+      }
     }
   }, [state.currentStage, nav_state]);
 
   const { closeStream } = useSSE(sseUrl, {
-    onEvent:  handleEvent,
-    onError:  () => dispatch({ type: "SSE_ERROR" }),
+    onEvent: handleEvent,
+    onError:  () => dispatch({ type: "SSE_INTERRUPTED" }),
+    onReconnect: () => dispatch({ type: "SSE_RECONNECTED" }),
+    onGiveUp: () => dispatch({ type: "SSE_GIVE_UP" }),
     closeOn:  ["stream_end", "error"],
+    maxRetries: 10,
   });
+
+  /**
+   * Stop button handler. Sends the stop signal to the server (which
+   * cancels the pipeline), then waits for the stream to deliver
+   * `stream_end` with status="cancelled". We do NOT close the stream
+   * here — we need it open to receive the terminal event.
+   *
+   * If the server refuses (job already finished), we log it and let the
+   * stream settle naturally. If the stream never settles (network),
+   * the user can refresh.
+   */
+  const handleStop = useCallback(async () => {
+    if (stopBusy) return;
+    setStopBusy(true);
+    dispatch({ type: "STOPPING" });
+
+    const result = await stopInvestigation(state.jobId ?? undefined);
+    if (!result.success) {
+      dispatch({
+        type: "LOG",
+        line: `[stop] server refused: ${result.error ?? "unknown"}`,
+      });
+      // If the job is already finished the stream will close shortly;
+      // otherwise we revert to running.
+      if (result.error && !result.error.includes("not running")) {
+        dispatch({ type: "STOP_FAILED" });
+      }
+    }
+
+    // Safety: if the server never sends stream_end, give up after 20s
+    // and force the local UI back to a settled state.
+    setTimeout(() => {
+      setStopBusy(false);
+      if (state.runStatus === "stopping") {
+        closeStream();
+        dispatch({
+          type: "LOG",
+          line: "[stop] worker did not confirm exit within 20s — closing local stream",
+        });
+        dispatch({
+          type: "STREAM_END",
+          reportUrl: null,
+          status: "cancelled",
+        });
+      }
+    }, 20_000);
+  }, [stopBusy, state.jobId, state.runStatus, closeStream]);
 
   const intelFinding    = state.findings.find(f => f.type === "intelligence_report");
   const regularFindings = state.findings.filter(f => f.type !== "intelligence_report");
-  const isDone          = state.status === "done";
-  const isRunning       = state.status === "running";
+  const isDone          = state.runStatus === "done";
+  const isCancelled     = state.runStatus === "cancelled";
+  const isRunning       = state.runStatus === "running";
+  const isStopping      = state.runStatus === "stopping";
+
+  const statusLabel =
+    isRunning  ? "Running"     :
+    isStopping ? "Stopping…"   :
+    isDone     ? "Complete"    :
+    isCancelled? "Cancelled"   :
+    state.runStatus === "error" ? "Error" : "";
 
   return (
     <div className="p-6 max-w-5xl mx-auto">
@@ -369,17 +497,25 @@ export default function InvestigationLive() {
           </h1>
           {state.jobId && (
             <p className="text-[11px] text-zinc-600 font-mono">
-              job: {state.jobId.slice(0, 8)}…
+              job: {state.jobId.slice(0, 8)}…  ·  {statusLabel}
             </p>
           )}
         </div>
 
-        {isRunning && (
-          <button onClick={closeStream} className="btn btn-danger">
-            <Icon name="stop" size={12} /> Stop
+        {/* Stop — shown while running OR stopping (with a distinct label) */}
+        {(isRunning || isStopping) && (
+          <button
+            onClick={handleStop}
+            disabled={isStopping || stopBusy}
+            className="btn btn-danger"
+          >
+            <Icon name="stop" size={12} />
+            {isStopping ? "Stopping…" : "Stop"}
           </button>
         )}
-        {isDone && state.reportUrl && (
+
+        {/* Report link when finished */}
+        {(isDone || isCancelled) && state.reportUrl && (
           <a
             href={state.reportUrl}
             target="_blank"
@@ -391,11 +527,25 @@ export default function InvestigationLive() {
         )}
       </div>
 
+      {/* Cancelled banner */}
+      {isCancelled && (
+        <div className="mb-4 rounded-xl border border-amber-500/30 bg-amber-500/10
+                        px-4 py-3 text-amber-200 text-sm flex items-center gap-2">
+          <Icon name="alert" size={14} />
+          Investigation was cancelled. Partial results below.
+        </div>
+      )}
+
       {/* Progress */}
       <LiveProgress
         currentStage={state.currentStage}
         currentMessage={curMsg}
-        status={state.status === "idle" ? "idle" : state.status}
+        status={
+          state.runStatus === "idle" ? "idle" :
+          state.runStatus === "error" ? "error" :
+          state.runStatus === "done" || state.runStatus === "cancelled" ? "done" :
+          "running"
+        }
         findingCount={state.findings.length}
         pivotDepth={state.pivotDepth}
       />
@@ -408,7 +558,7 @@ export default function InvestigationLive() {
           {intelFinding && <IntelCard payload={intelFinding.payload} />}
           {regularFindings.length === 0 && !intelFinding && (
             <div className="text-center py-12 text-zinc-600 text-sm">
-              {isRunning ? "Waiting for findings…" : "No findings."}
+              {isRunning || isStopping ? "Waiting for findings…" : "No findings."}
             </div>
           )}
           {regularFindings.map(f => <ResultCard key={f.id} finding={f} />)}

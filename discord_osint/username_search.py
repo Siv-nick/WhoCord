@@ -12,8 +12,9 @@ import concurrent.futures
 import re
 from datetime import datetime
 from importlib import import_module
+
 from . import utils
-from .utils import resilient_task, tool_available, clean_username, CACHE_DIR, get_base_dir
+from .utils import resilient_task, tool_available, clean_username, CACHE_DIR, get_base_dir, log_trace
 
 from . import config as _config_module
 
@@ -30,15 +31,10 @@ from .scraping import is_likely_profile_url_v2
 # social_analyzer, and blackbird-username.
 #
 # Fixed: the tool frequently ignores `-o <file>` and prints JSON to stdout
-# instead. The previous implementation only read the output file and
-# silently returned [] whenever it was empty, discarding all results.
-# This version:
-#   1. Tries several flag conventions (some releases only accept --json etc.)
-#   2. Reads whichever channel (file OR stdout) actually contains data
-#   3. Normalises every plausible top-level JSON shape
-#   4. Only rejects entries that explicitly say "not found"
-#   5. Prints a diagnostic line instead of silently returning [] so the
-#      debug log shows what the tool actually emitted.
+# instead. This version reads whichever channel actually contains data,
+# normalises every plausible JSON shape, and — critically — records the
+# reason when nothing parseable came back, so the operator can tell the
+# difference between "site not found" and "tool crashed on startup".
 # ═══════════════════════════════════════════════════════════════════════════
 
 _USER_SCANNER_NAMES = ("user-scanner", "user_scanner", "userscanner", "UserScanner")
@@ -143,13 +139,6 @@ def _normalise_user_scanner(data) -> list[dict]:
     """
     Turn any plausible user-scanner output shape into the pipeline's
     expected list of ``{"site", "url", "category", "extra"}`` dicts.
-
-    Handles:
-      * top-level list of dicts
-      * {"results"|"data"|"findings"|"accounts"|"sites"|"profiles"|"matches": [...]}
-      * site-keyed dicts: {"github": {...}, "twitter": {...}}
-      * list of bare URL strings
-      * a single string containing one URL per line
     """
     raw_entries: list = []
 
@@ -163,7 +152,6 @@ def _normalise_user_scanner(data) -> list[dict]:
                 raw_entries = v
                 break
         if not raw_entries:
-            # Site-keyed dict fallback
             for site_name, entry in data.items():
                 if isinstance(entry, dict):
                     e = dict(entry)
@@ -183,7 +171,6 @@ def _normalise_user_scanner(data) -> list[dict]:
 
     results: list[dict] = []
     for entry in raw_entries:
-        # Bare URL string
         if isinstance(entry, str):
             if entry.startswith("http"):
                 results.append({
@@ -240,43 +227,41 @@ def run_user_scanner(target: str, mode: str = "username") -> list[dict]:
     """
     Run user-scanner against a username or email.
 
-    mode:
-        "username" → scans username platforms
-        "email"    → scans email-registration sites
-
     Returns a list of dicts:
         {"site": str, "url": str, "category": str, "extra": dict}
 
-    Prints a diagnostic line whenever nothing usable was parsed so the
-    cause is visible in the debug log instead of silently returning [].
+    Failure modes are recorded via ``log_trace`` so the debug log
+    distinguishes "no hits" from "tool crashed on startup" from "tool
+    produced output we could not parse."
     """
     binary = _user_scanner_binary()
     if not binary:
-        print(f"  user-scanner: executable not found (looked for "
-              f"{', '.join(_USER_SCANNER_NAMES)}). Skipping.")
+        msg = (f"user-scanner: executable not found (looked for "
+               f"{', '.join(_USER_SCANNER_NAMES)}). Skipping.")
+        print(f"  {msg}")
+        log_trace(msg)
         return []
 
     # Multiple flag conventions — different releases accept different
     # combinations. Stop at the first one that produces parsable output.
     flag = "-e" if mode == "email" else "-u"
     arg_variants = [
-        [flag, target, "-f", "json", "-o", None],   # placeholder for outfile
+        [flag, target, "-f", "json", "-o", None],
         [flag, target, "--format", "json", "--output", None],
         [flag, target, "--json", None],
         [flag, target, "-j", None],
-        [flag, target, "-f", "json"],               # stdout only
+        [flag, target, "-f", "json"],
         [flag, target, "--format", "json"],
-        [flag, target],                             # bare
+        [flag, target],
     ]
 
     parsed_data = None
     used_args   = None
     last_stdout = ""
     last_rc     = None
-    outfile     = None
+    last_err    = ""
 
     for arg_tpl in arg_variants:
-        # Fresh temp file for each attempt
         tmp = tempfile.NamedTemporaryFile(
             suffix=".json", delete=False, mode="w", encoding="utf-8",
         )
@@ -291,11 +276,15 @@ def run_user_scanner(target: str, mode: str = "username") -> list[dict]:
                 args.append(a)
 
         try:
-            result, stdout, _ = utils.run_external_tool(binary, *args, timeout=600)
+            result, stdout, stderr = utils.run_external_tool(
+                binary, *args, timeout=600,
+            )
             last_stdout = stdout or ""
             last_rc     = getattr(result, "returncode", None)
+            last_err    = stderr or ""
         except Exception as exc:
-            print(f"  user-scanner: attempt {args[:2]} raised {exc}")
+            log_trace(f"user-scanner: attempt {' '.join(args[:2])} raised "
+                      f"{type(exc).__name__}: {exc}")
             try:
                 os.unlink(outfile)
             except OSError:
@@ -309,9 +298,8 @@ def run_user_scanner(target: str, mode: str = "username") -> list[dict]:
                     parsed_data = json.load(f)
                 used_args = args
                 break
-            except json.JSONDecodeError:
-                # File written but malformed — fall through to stdout
-                pass
+            except json.JSONDecodeError as exc:
+                log_trace(f"user-scanner: output file not valid JSON: {exc}")
 
         # 2. Try JSON on stdout
         blob = _extract_json_blob(last_stdout)
@@ -335,14 +323,19 @@ def run_user_scanner(target: str, mode: str = "username") -> list[dict]:
     # ── Diagnostics ─────────────────────────────────────────────────────
     if parsed_data is None:
         snippet = (last_stdout or "").strip().replace("\n", " ⏎ ")[:300]
-        print(
-            "  user-scanner returned no parsable output.\n"
+        err_snippet = (last_err or "").strip().replace("\n", " ⏎ ")[:200]
+        detail = (
+            "user-scanner returned no parsable output.\n"
             f"    binary      : {binary}\n"
             f"    mode        : {mode}\n"
             f"    last rc     : {last_rc}\n"
             f"    stdout size : {len(last_stdout)} chars\n"
             f"    stdout head : {snippet or '(empty)'}"
         )
+        if err_snippet:
+            detail += f"\n    stderr head : {err_snippet}"
+        print(f"  {detail}")
+        log_trace(detail)
         return []
 
     results = _normalise_user_scanner(parsed_data)
@@ -352,11 +345,13 @@ def run_user_scanner(target: str, mode: str = "username") -> list[dict]:
             sample = json.dumps(parsed_data, ensure_ascii=False)[:300]
         except Exception:
             sample = repr(parsed_data)[:300]
-        print(
-            "  user-scanner: parsed JSON but found no HTTP URLs in it.\n"
+        detail = (
+            "user-scanner: parsed JSON but found no HTTP URLs in it.\n"
             f"    args used : {' '.join(str(a) for a in (used_args or []))}\n"
             f"    data head : {sample}"
         )
+        print(f"  {detail}")
+        log_trace(detail)
 
     return results
 
@@ -369,15 +364,23 @@ def run_user_scanner(target: str, mode: str = "username") -> list[dict]:
 def run_maigret(username):
     """Kept: broadest raw username coverage (~3000 sites)."""
     if not tool_available("maigret"):
+        log_trace("maigret: not on PATH — skipping.")
         return []
-    _, _, _ = utils.run_external_tool(
+
+    result, _stdout, stderr = utils.run_external_tool(
         "maigret", username,
         "--all-sites", "--json", "simple", "--timeout", "15",
         timeout=600,
     )
+    rc = getattr(result, "returncode", None)
+    if rc not in (0, None):
+        log_trace(f"maigret: exited rc={rc} — stderr: {(stderr or '')[:200]}")
+
     reports_dir = os.path.join(os.path.dirname(get_base_dir()), "reports")
     if not os.path.isdir(reports_dir):
+        log_trace(f"maigret: reports dir {reports_dir!r} missing — no output.")
         return []
+
     candidates = []
     for fn in os.listdir(reports_dir):
         if fn.startswith(f"report_{username}") and fn.endswith(".json"):
@@ -387,13 +390,16 @@ def run_maigret(username):
             if username in fn and "simple" in fn and fn.endswith(".json"):
                 candidates.append(os.path.join(reports_dir, fn))
     if not candidates:
+        log_trace(f"maigret: no matching report_*.json for {username!r}.")
         return []
+
     latest = max(candidates, key=os.path.getmtime)
     try:
         with open(latest, 'r', encoding='utf-8') as f:
             data = json.load(f)
     except Exception as e:
         print(f"  Maigret JSON read error: {e}")
+        log_trace(f"maigret: JSON read error on {latest}: {e}")
         return []
 
     results = []
@@ -424,20 +430,27 @@ def run_sociopath(seed_url, recursive=0):
     if not tool_available("sociopath"):
         if not utils.install_package("sociopath"):
             print("  [X] sociopath could not be installed automatically.")
+            log_trace("sociopath: not on PATH and pip install failed.")
             return []
         else:
             print("  sociopath installed successfully.")
 
     if not tool_available("sociopath"):
+        log_trace("sociopath: still not on PATH after install — skipping.")
         return []
 
     cmd = ["sociopath", seed_url, "--json", "-r", str(recursive)]
-    _, stdout, _ = utils.debug_subprocess(cmd, timeout=60)
-    if stdout is None:
+    result, stdout, stderr = utils.debug_subprocess(cmd, timeout=60)
+    rc = getattr(result, "returncode", None)
+    if rc not in (0, None):
+        log_trace(f"sociopath: rc={rc}, stderr={(stderr or '')[:200]}")
+    if not stdout:
+        log_trace(f"sociopath: empty stdout for {seed_url[:60]}")
         return []
 
     json_start = stdout.find('[')
     if json_start == -1:
+        log_trace(f"sociopath: no JSON array found in stdout ({len(stdout)} chars).")
         return []
     json_str = stdout[json_start:]
     bracket_count = 0
@@ -451,6 +464,7 @@ def run_sociopath(seed_url, recursive=0):
             json_end = i + 1
             break
     if json_end == -1:
+        log_trace("sociopath: JSON array never closed in stdout.")
         return []
     json_str = json_str[:json_end]
 
@@ -458,6 +472,7 @@ def run_sociopath(seed_url, recursive=0):
         data = json.loads(json_str)
     except json.JSONDecodeError as e:
         print(f"  sociopath JSON error: {e}")
+        log_trace(f"sociopath: JSON parse error: {e}")
         return []
 
     results = data if isinstance(data, list) else data.get("results", [])
@@ -481,9 +496,14 @@ def run_sociopath(seed_url, recursive=0):
 def run_linkook(username):
     """Kept: deep URL discovery, complementary to user-scanner."""
     if not tool_available("linkook"):
+        log_trace("linkook: not on PATH — skipping.")
         return []
-    _, stdout, _ = utils.run_external_tool("linkook", username, timeout=60)
+    result, stdout, stderr = utils.run_external_tool("linkook", username, timeout=60)
+    rc = getattr(result, "returncode", None)
+    if rc not in (0, None):
+        log_trace(f"linkook: rc={rc}, stderr={(stderr or '')[:200]}")
     if stdout is None:
+        log_trace("linkook: no stdout captured.")
         return []
     urls = []
     for line in stdout.splitlines():
@@ -525,12 +545,14 @@ def run_blackbird(target, mode="username"):
                 stdout=_clone_sp.DEVNULL, stderr=_clone_sp.DEVNULL,
             )
             print("  Blackbird cloned successfully.")
-        except Exception:
+        except Exception as exc:
             print(f"  [!] Failed to clone Blackbird. Please manually run:")
             print(f"      git clone https://github.com/p1ngul1n0/blackbird {BLACKBIRD_DIR}")
+            log_trace(f"blackbird: git clone failed: {exc}")
             return []
         if not os.path.isfile(blackbird_py):
             print(f"  [!] Cloned, but blackbird.py still not found at {blackbird_py}")
+            log_trace("blackbird: blackbird.py missing after clone.")
             return []
 
     try:
@@ -553,6 +575,7 @@ def run_blackbird(target, mode="username"):
             print("  Done – data file downloaded successfully.")
         except Exception as e:
             print(f"  Auto‑download failed: {e}")
+            log_trace(f"blackbird: wmn-data download failed: {e}")
             return []
 
     t0 = time.time()
@@ -578,7 +601,10 @@ def run_blackbird(target, mode="username"):
     else:
         env = None
 
-    _, stdout, _ = utils.debug_subprocess(cmd, timeout=600, cwd=BLACKBIRD_DIR, env=env)
+    result, stdout, stderr = utils.debug_subprocess(cmd, timeout=600, cwd=BLACKBIRD_DIR, env=env)
+    rc = getattr(result, "returncode", None)
+    if rc not in (0, None):
+        log_trace(f"blackbird: rc={rc}, stderr={(stderr or '')[:300]}")
     time.sleep(1)
 
     results_dir = os.path.join(BLACKBIRD_DIR, "results")
@@ -610,6 +636,7 @@ def run_blackbird(target, mode="username"):
                     continue
 
     if not best_path:
+        log_trace("blackbird: no fresh *_blackbird.json produced.")
         return []
 
     try:
@@ -617,6 +644,7 @@ def run_blackbird(target, mode="username"):
             data = json.load(f)
     except Exception as e:
         print(f"  Blackbird JSON read error: {e}")
+        log_trace(f"blackbird: JSON read error on {best_path}: {e}")
         return []
 
     results = []

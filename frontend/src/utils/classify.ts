@@ -2,6 +2,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Frontend mirror of the backend DataProbe classification logic, plus the
 // canonical entity → icon name mapping used by the whole UI.
+//
+// Change log
+// ----------
+// - `findingTypeToEntityType` map brought up to date with every finding
+//   type the backend emits. `hibp_skipped` and `intelligence_narrative`
+//   were previously falling through to "unknown", which made the
+//   "HIBP could not check" case visually indistinguishable from an
+//   unrecognised tool output.
+// - Added module-level documentation of which backend module emits each
+//   finding type so the map stays in sync when new stages are added.
 
 import type { IconName } from "../components/Icons";
 import type { NodeEntityType, NodeModule } from "../types/graph";
@@ -41,33 +51,105 @@ export function classifyInput(raw: string): ClassifyResult {
 }
 
 // ─── Finding type → entity type ──────────────────────────────────────
+//
+// Backend sources, kept as a comment so this table is easy to audit when
+// a stage gains a new finding type:
+//
+//   email_investigation.py / email_intel.py:
+//     email, holehe, h8mail, hibp, hibp_skipped, emailrep, ghunt,
+//     gravatar, scylla
+//   discord_mode.py:
+//     discord_handle, avatar_url, connected_account, name_clue
+//   scraping_stage.py / media.py:
+//     avatar_downloaded, exif_gps, exif_date, exif_camera,
+//     exif_metadata, reverse_image, perceptual_hash, image_info, ocr_text
+//   analysis.py / extras.py:
+//     whois, wayback, name_similarity, confidence_scores, location,
+//     language
+//   domain_investigation.py:
+//     dns, ip_address, ip_geolocation, ssl_certificate, subdomains,
+//     harvester_emails, harvester_hosts
+//   url_analysis.py:
+//     http_metadata, page_metadata, emails_on_page, interesting_links,
+//     url_domain, safe_browsing
+//   phone_investigation.py:
+//     phone_metadata, phone_carrier, phoneinfoga
+//   intelligence/engine.py:
+//     correlations, intelligence_report, intelligence_narrative,
+//     persona_summary
+//   username_search / mosint:
+//     mosint_profiles, social_profiles_found
+//   pivot.py (status — handled as separate events, not `finding`):
+//     pivot_start, pivot_done, pivot_error, pivot_skipped
+//
 const FINDING_TO_ENTITY: Record<string, NodeEntityType> = {
+  // ── Email ────────────────────────────────────────────────────────
   email:               "email",
+  emailrep:            "email",
+
+  // ── Breach ───────────────────────────────────────────────────────
   hibp:                "breach",
+  hibp_skipped:        "breach",
   holehe:              "breach",
   h8mail:              "breach",
   scylla:              "breach",
+
+  // ── Social / identity ────────────────────────────────────────────
   gravatar:            "social_profile",
   ghunt:               "social_profile",
-  emailrep:            "email",
   connected_account:   "social_profile",
-  name_clue:           "name",
+  social_profiles_found:"social_profile",
+  mosint_profiles:     "social_profile",
   discord_handle:      "username",
+  name_clue:           "name",
+  name_similarity:     "name",
+  confidence_scores:   "unknown",
+
+  // ── Media ────────────────────────────────────────────────────────
   avatar_url:          "image",
-  exif_gps:            "location",
+  avatar_downloaded:   "image",
   reverse_image:       "image",
-  whois:               "domain",
-  wayback:             "url",
-  ip_address:          "ip",
+  perceptual_hash:     "image",
+  image_info:          "image",
+  ocr_text:            "image",
+
+  // ── Location ─────────────────────────────────────────────────────
+  exif_gps:            "location",
   ip_geolocation:      "location",
+  location:            "location",
+
+  // ── Network / domain ─────────────────────────────────────────────
+  whois:               "domain",
+  dns:                 "domain",
   ssl_certificate:     "domain",
   subdomains:          "domain",
-  dns:                 "domain",
+  ip_address:          "ip",
+
+  // ── URL ──────────────────────────────────────────────────────────
+  wayback:             "url",
+  http_metadata:       "url",
+  page_metadata:       "url",
+  emails_on_page:      "url",
+  interesting_links:   "url",
+  url_domain:          "domain",
+  safe_browsing:       "url",
+
+  // ── Phone ────────────────────────────────────────────────────────
   phone_metadata:      "phone",
   phone_carrier:       "phone",
   phoneinfoga:         "phone",
-  http_metadata:       "url",
-  page_metadata:       "url",
+
+  // ── Email harvesting ─────────────────────────────────────────────
+  harvester_emails:    "email",
+  harvester_hosts:     "domain",
+
+  // ── Intelligence ─────────────────────────────────────────────────
+  correlations:        "unknown",
+  intelligence_report: "unknown",
+  intelligence_narrative: "unknown",
+  persona_summary:     "unknown",
+
+  // ── Probe ────────────────────────────────────────────────────────
   probe_classification:"unknown",
 };
 

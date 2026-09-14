@@ -8,16 +8,15 @@ Fix
 ``IntelligenceStage`` is now part of every pipeline, so the knowledge
 graph / correlation / AI narrative step actually runs.
 
-`ReportingStage` is intentionally **not** included here:
-  * it must run *after* adaptive pivoting finishes, so it can embed
-    pivot sub-reports in the final HTML, and
-  * pivot processing happens inside ``Pipeline.run()`` *after* the stage
-    loop, which means a stage list ending in ReportingStage would render
-    the report before pivots were merged.
+``EnrichmentStage`` is appended to every pipeline. It is a no-op unless
+the analyst has explicitly enabled Apollo and/or Lusha *and* stored a
+key for the enabled provider, so its presence does not change the
+behaviour of a default run.
 
-The root ``run_osint_pipeline()`` / ``run_module_pipeline()`` functions
-call ``ReportingStage().run(ctx, emit)`` explicitly once everything
-(including pivots) is complete.
+`ReportingStage` is intentionally **not** included here — it must run
+after adaptive pivoting finishes. The root ``run_osint_pipeline()`` /
+``run_module_pipeline()`` functions call ``ReportingStage().run(ctx,
+emit)`` explicitly once everything (including pivots) is complete.
 """
 
 from __future__ import annotations
@@ -33,6 +32,7 @@ from .stages import (
     IntelligenceStage,
     EmailIntelStage,
 )
+from ..enrichment.stage import EnrichmentStage
 
 
 def build_pipeline(ctx: InvestigationContext) -> Pipeline:
@@ -41,11 +41,11 @@ def build_pipeline(ctx: InvestigationContext) -> Pipeline:
 
     Discord mode:
         DiscordModeStage → Discovery → Scraping → Media
-        → Analysis → Intelligence → EmailIntel
+        → Analysis → Intelligence → EmailIntel → Enrichment
 
     Manual mode:
         Discovery → Scraping → Media
-        → Analysis → Intelligence → EmailIntel
+        → Analysis → Intelligence → EmailIntel → Enrichment
     """
     stages = []
 
@@ -59,6 +59,7 @@ def build_pipeline(ctx: InvestigationContext) -> Pipeline:
         AnalysisStage(),
         IntelligenceStage(),
         EmailIntelStage(),
+        EnrichmentStage(),
     ])
     return Pipeline(stages, ctx)
 
@@ -79,6 +80,7 @@ def build_sub_pipeline(ctx: InvestigationContext) -> Pipeline:
         AnalysisStage(),
         IntelligenceStage(),
         EmailIntelStage(),
+        EnrichmentStage(),
     ]
     return Pipeline(stages, ctx)
 
@@ -89,6 +91,7 @@ def build_email_pipeline(ctx: InvestigationContext) -> Pipeline:
         EmailInvestigationStage(),
         ScrapingStage(),
         IntelligenceStage(),
+        EnrichmentStage(),
     ]
     return Pipeline(stages, ctx)
 
@@ -98,6 +101,7 @@ def build_domain_pipeline(ctx: InvestigationContext) -> Pipeline:
     stages = [
         DomainInvestigationStage(),
         IntelligenceStage(),
+        EnrichmentStage(),
     ]
     return Pipeline(stages, ctx)
 
@@ -107,6 +111,7 @@ def build_phone_pipeline(ctx: InvestigationContext) -> Pipeline:
     stages = [
         PhoneInvestigationStage(),
         IntelligenceStage(),
+        EnrichmentStage(),
     ]
     return Pipeline(stages, ctx)
 
@@ -116,6 +121,7 @@ def build_image_pipeline(ctx: InvestigationContext) -> Pipeline:
     stages = [
         ImageAnalysisStage(),
         IntelligenceStage(),
+        EnrichmentStage(),
     ]
     return Pipeline(stages, ctx)
 
@@ -126,6 +132,7 @@ def build_url_pipeline(ctx: InvestigationContext) -> Pipeline:
         URLAnalysisStage(),
         ScrapingStage(),
         IntelligenceStage(),
+        EnrichmentStage(),
     ]
     return Pipeline(stages, ctx)
 
@@ -135,6 +142,7 @@ def build_probe_pipeline(ctx: InvestigationContext) -> Pipeline:
     stages = [
         DataProbeStage(),
         IntelligenceStage(),
+        EnrichmentStage(),
     ]
     return Pipeline(stages, ctx)
 

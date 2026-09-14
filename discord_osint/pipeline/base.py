@@ -3,11 +3,17 @@ discord_osint/pipeline/base.py
 -------------------------------
 Stage ABC and Pipeline runner.
 
-Phase 3 edit
+Cancellation
 ------------
-``Pipeline.run()`` gains an optional ``pivot_confirm_fn`` parameter that is
-threaded down to ``process_pending_seeds()``.  The confirm function is passed
-recursively into every sub-pipeline so deep pivots also pause for confirmation.
+``Pipeline.run()`` accepts an optional ``cancel_event`` (a
+``threading.Event``). When set, the pipeline stops at the next stage
+boundary and emits an ``abort`` event with ``reason="cancelled by user"``.
+The web layer's ``/stop`` handler sets the same event.
+
+Sub-pipelines launched by the pivot machinery inherit the cancel token
+automatically: if ``cancel_event`` isn't passed explicitly, the runner
+falls back to ``getattr(self.context.config, "_cancel_event", None)``,
+which ``web_app.py`` sets once per job.
 """
 
 from __future__ import annotations
@@ -54,6 +60,7 @@ class Pipeline:
         pivot_config: Optional["PivotConfig"] = None,
         seed_queue: Optional["SeedQueue"]     = None,
         pivot_confirm_fn: Optional["ConfirmFn"] = None,
+        cancel_event=None,
     ) -> None:
         """
         Run all stages sequentially.
@@ -70,18 +77,53 @@ class Pipeline:
             Optional callable; when supplied and ``pivot_config.require_confirm``
             is True, it is called before each pivot depth batch to let the user
             approve or filter the seeds.  Passed recursively to sub-pipelines.
+        cancel_event:
+            Optional ``threading.Event``. When set, the runner stops at
+            the next stage boundary and emits an ``abort`` event. If not
+            supplied, the runner reads ``config._cancel_event`` (set by
+            web_app.py's ``/run`` handler) so sub-pipelines inherit
+            cancellation without threading the token manually.
         """
+        # Resolve cancel token: explicit param wins, otherwise fall back
+        # to the one the web layer attached to the config object.
+        if cancel_event is None:
+            cancel_event = getattr(self.context.config, "_cancel_event", None)
+
         _pivot_active = (
             pivot_config is not None
             and seed_queue is not None
             and pivot_config.enabled
         )
 
+        depth_label = f" [d={self.context.depth}]" if self.context.depth else ""
+
         # ------------------------------------------------------------------ #
         # Stage loop                                                           #
         # ------------------------------------------------------------------ #
         aborted = False
+        last_stage_name = None
+
         for stage in self.stages:
+            last_stage_name = stage.name
+
+            # --- Cancellation check between stages ---
+            # The check is at the stage boundary rather than inside each
+            # stage, so a long-running stage can still overrun. That's a
+            # deliberate tradeoff: adding checks mid-stage means touching
+            # every stage implementation and every tool wrapper.
+            if cancel_event is not None and cancel_event.is_set():
+                print(
+                    f"\n[!] Cancellation requested before stage '{stage.name}'"
+                    f"{depth_label} — stopping."
+                )
+                emit("abort", {
+                    "stage":  stage.name,
+                    "depth":  self.context.depth,
+                    "reason": "cancelled by user",
+                })
+                aborted = True
+                break
+
             try:
                 emit("stage_start", {"stage": stage.name, "depth": self.context.depth})
                 stage.run(self.context, emit)
@@ -90,21 +132,29 @@ class Pipeline:
             except PipelineAbortError as exc:
                 print(
                     f"\n[!] Pipeline aborted at '{stage.name}'"
-                    + (f" [d={self.context.depth}]" if self.context.depth else "")
+                    + depth_label
                     + f": {exc.reason}"
                 )
-                emit("abort", {"stage": stage.name, "depth": self.context.depth, "reason": exc.reason})
+                emit("abort", {
+                    "stage":  stage.name,
+                    "depth":  self.context.depth,
+                    "reason": exc.reason,
+                })
                 aborted = True
                 break
 
             except Exception as exc:
                 print(
                     f"\n[!] Stage '{stage.name}'"
-                    + (f" [d={self.context.depth}]" if self.context.depth else "")
+                    + depth_label
                     + f" raised an unexpected error – continuing.\n    {exc}"
                 )
                 traceback.print_exc()
-                emit("stage_error", {"stage": stage.name, "depth": self.context.depth, "error": str(exc)})
+                emit("stage_error", {
+                    "stage": stage.name,
+                    "depth": self.context.depth,
+                    "error": str(exc),
+                })
                 if _pivot_active:
                     self._scan_seeds(pivot_config, seed_queue)
                 continue
@@ -118,15 +168,22 @@ class Pipeline:
                     )
 
         # ------------------------------------------------------------------ #
-        # Save                                                                 #
+        # Save (even on abort — partial state is still useful)               #
         # ------------------------------------------------------------------ #
-        saved       = self.context.intel_core.save_state()
-        depth_label = f" [d={self.context.depth}]" if self.context.depth else ""
-        print(f"\n== Pipeline{depth_label} complete – intel saved to {saved} ==")
+        saved = self.context.intel_core.save_state()
+
+        cancelled = (
+            aborted
+            and cancel_event is not None
+            and cancel_event.is_set()
+        )
+        status_word = "cancelled" if cancelled else ("aborted" if aborted else "complete")
+
+        print(f"\n== Pipeline{depth_label} {status_word} – intel saved to {saved} ==")
         emit("done", {"intel_path": saved, "depth": self.context.depth})
 
         # ------------------------------------------------------------------ #
-        # Pivot processing                                                     #
+        # Pivot processing (skipped on cancel/abort)                          #
         # ------------------------------------------------------------------ #
         if _pivot_active and not aborted:
             self._process_pivot_seeds(pivot_config, seed_queue, emit, pivot_confirm_fn)

@@ -5,26 +5,32 @@ Adaptive recursive pivoting – Phase 2 (updated for Phase 3 edits).
 
 New in this version
 -------------------
-``process_pending_seeds`` gains an optional ``confirm_fn`` parameter.
-When supplied, the function is called BEFORE any sub-pipeline is launched.
-It receives the full batch of ``(seed_value, seed_type)`` tuples and must
-return the approved subset.  The caller blocks until the user responds (or
-a timeout fires) so the SSE stream can pause and show a confirmation modal.
+``SeedQueue.pop_batch`` no longer discards seeds beyond the batch limit.
+The old implementation popped the entire depth bucket but only returned
+the first ``limit`` items — everything past that vanished silently. Any
+target with more than ``max_seeds_per_depth`` discovered emails/usernames
+would lose the excess with no log line and no chance to investigate them
+in a later pass.
 
-``confirm_fn`` signature::
+Fix summary
+-----------
+* ``SeedQueue.pop_batch``         — returns a batch and *keeps* the
+                                    remainder in the pending bucket.
+* ``SeedQueue.drain_depth``       — new helper that atomically removes
+                                    and returns ALL pending seeds at a
+                                    depth (used when we want to plan
+                                    the whole depth before launching).
+* ``process_pending_seeds``       — now drains the full depth, confirms
+                                    once over the whole set (if
+                                    confirmation is enabled), then
+                                    launches sub-investigations in
+                                    batches of ``max_seeds_per_depth``.
+                                    Nothing is dropped.
 
-    confirm_fn(
-        seeds: list[tuple[str, str]],
-        depth: int,
-        emit: EmitFn,
-    ) -> list[tuple[str, str]]
-
-Returning an empty list causes the entire pivot depth to be skipped.
-Returning the original list (default when confirm_fn is None) runs everything.
-
-The emit callback is passed so confirm_fn can fire a ``pivot_confirm_request``
-event before it blocks on a threading.Event, which is the approach used by
-web_app.py's closure.
+Sub-pipelines now also run :class:`EnrichmentStage` so a pivot off a
+discovered email can also benefit from Apollo / Lusha when those
+providers are enabled. The stage is a no-op when neither provider is
+enabled, so this is purely additive.
 """
 
 from __future__ import annotations
@@ -62,10 +68,11 @@ class PivotConfig:
     pivot_email:          Follow newly discovered email addresses.
     pivot_username:       Follow newly discovered plain usernames.
     max_depth:            Maximum recursion depth (root = 0).
-    max_seeds_per_depth:  At most this many sub-investigations per depth.
+    max_seeds_per_depth:  Batch size per launch wave. The full depth set
+                          is now processed across multiple waves rather
+                          than truncated to this number.
     require_confirm:      When True, pause before each depth and wait for
-                          user approval via confirm_fn.  Defaults to False
-                          so existing behaviour is unchanged.
+                          user approval via confirm_fn.
     """
 
     enabled:             bool = False
@@ -77,7 +84,6 @@ class PivotConfig:
 
     @classmethod
     def from_config(cls, config: Any) -> "PivotConfig":
-        """Construct from a Config / ConfigService object, falling back gracefully."""
         return cls(
             enabled=             bool(getattr(config, "ENABLE_PIVOTING",         False)),
             pivot_email=         bool(getattr(config, "PIVOT_EMAIL",             True)),
@@ -95,9 +101,6 @@ class PivotConfig:
 class SeedQueue:
     """
     Shared deduplication registry for the entire investigation tree.
-
-    One instance per root-level investigation; passed by reference to all
-    sub-pipelines so a seed is never investigated twice.
     """
 
     def __init__(self) -> None:
@@ -125,11 +128,37 @@ class SeedQueue:
         return True
 
     def pop_batch(self, depth: int, limit: int) -> list[tuple[str, str]]:
-        all_at_depth = self._pending.pop(depth, [])
-        batch = all_at_depth[:limit]
+        """
+        Return up to *limit* seeds from *depth*.
+
+        Anything beyond *limit* stays in the pending bucket for a later
+        call — it is NOT discarded. Seeds in the returned batch are
+        marked as processed.
+        """
+        all_at_depth = self._pending.get(depth, [])
+        if not all_at_depth:
+            return []
+
+        batch    = all_at_depth[:limit]
+        leftover = all_at_depth[limit:]
+
+        if leftover:
+            self._pending[depth] = leftover
+        else:
+            self._pending.pop(depth, None)
+
         for seed, _ in batch:
             self.mark_processed(seed)
         return batch
+
+    def drain_depth(self, depth: int) -> list[tuple[str, str]]:
+        """
+        Remove and return ALL pending seeds at *depth*.
+
+        Returned seeds are NOT marked as processed — the caller is
+        expected to mark them (or gate them through confirmation first).
+        """
+        return self._pending.pop(depth, [])
 
     def pending_count(self, depth: int) -> int:
         return len(self._pending.get(depth, []))
@@ -227,6 +256,7 @@ def build_sub_pipeline(
         DiscoveryStage, ScrapingStage, MediaStage,
         AnalysisStage, IntelligenceStage, EmailIntelStage,
     )
+    from ..enrichment.stage import EnrichmentStage
 
     cfg          = parent_ctx.config
     username     = seed_value.split("@")[0] if seed_type == "email" else seed_value
@@ -246,8 +276,11 @@ def build_sub_pipeline(
         seed_value=seed_value,
     )
 
-    stages   = [DiscoveryStage(), ScrapingStage(), MediaStage(),
-                AnalysisStage(), IntelligenceStage(), EmailIntelStage()]
+    stages = [
+        DiscoveryStage(), ScrapingStage(), MediaStage(),
+        AnalysisStage(), IntelligenceStage(), EmailIntelStage(),
+        EnrichmentStage(),
+    ]
     pipeline = Pipeline(stages, sub_ctx)
     return sub_ctx, pipeline
 
@@ -260,6 +293,8 @@ _MERGE_CATEGORIES = (
     "emails", "social_profiles", "identity_clues", "breaches",
     "whois", "wayback", "media", "ghunt", "emailrep",
     "email_verification", "name_analysis",
+    "phone", "enrichment_profiles", "enrichment_decisions",
+    "enrichment_spend", "enrichment_balance",
 )
 
 
@@ -315,22 +350,6 @@ def process_pending_seeds(
 ) -> int:
     """
     Run sub-pipelines for all seeds pending at ``ctx.depth + 1``.
-
-    Parameters
-    ----------
-    ctx:
-        Current (parent) investigation context.
-    seed_queue:
-        Shared deduplication queue.
-    pivot_config:
-        Pivot settings.
-    emit:
-        Pipeline event callback.
-    confirm_fn:
-        Optional callable that receives the proposed batch and returns the
-        approved subset.  When ``pivot_config.require_confirm`` is True and
-        no confirm_fn is supplied, the full batch runs without confirmation.
-        Signature: ``confirm_fn(seeds, depth, emit) -> seeds``
     """
     if not pivot_config.enabled:
         return 0
@@ -339,82 +358,94 @@ def process_pending_seeds(
     if next_depth > pivot_config.max_depth:
         return 0
 
-    batch = seed_queue.pop_batch(next_depth, pivot_config.max_seeds_per_depth)
-    if not batch:
-        return 0
-
-    # ------------------------------------------------------------------ #
-    # Confirmation gate                                                    #
-    # ------------------------------------------------------------------ #
-    if confirm_fn is not None:
-        try:
-            approved = confirm_fn(batch, next_depth, emit)
-        except Exception as exc:
-            print(f"  [PIVOT] confirm_fn raised {exc} – proceeding with full batch")
-            approved = batch
-
-        # Re-mark seeds that were rejected as processed so they are never
-        # queued again even if they appear in future stages.
-        approved_set = {s for s, _ in approved}
-        for seed, stype in batch:
-            if seed not in approved_set:
-                seed_queue.mark_processed(seed)
-                emit("pivot_skipped", {"seed": seed, "seed_type": stype, "depth": next_depth})
-                print(f"  [PIVOT d={next_depth}] skipped by user: {stype}={seed!r}")
-
-        batch = approved
-
-    if not batch:
-        print(f"\n  [PIVOT d={next_depth}] all seeds skipped.")
+    all_seeds = seed_queue.drain_depth(next_depth)
+    if not all_seeds:
         return 0
 
     print(
         f"\n{'=' * 60}\n"
-        f"[PIVOT] Depth {next_depth}: investigating "
-        f"{len(batch)} seed(s)\n"
+        f"[PIVOT] Depth {next_depth}: {len(all_seeds)} seed(s) queued\n"
         f"{'=' * 60}"
     )
 
-    launched = 0
-    for seed_value, seed_type in batch:
-        print(f"\n  [PIVOT d={next_depth}] {seed_type}={seed_value!r}")
-        emit("pivot_start", {
-            "seed":      seed_value,
-            "seed_type": seed_type,
-            "depth":     next_depth,
-        })
-
+    # ------------------------------------------------------------------ #
+    # Confirmation gate (once per depth, over the whole seed set)         #
+    # ------------------------------------------------------------------ #
+    if confirm_fn is not None:
         try:
-            sub_ctx, sub_pipeline = build_sub_pipeline(
-                seed_value, seed_type, ctx, next_depth
-            )
-            sub_pipeline.run(
-                emit=emit,
-                pivot_config=pivot_config,
-                seed_queue=seed_queue,
-                pivot_confirm_fn=confirm_fn,
-            )
-            merge_results(ctx, sub_ctx)
-            launched += 1
+            approved = confirm_fn(all_seeds, next_depth, emit)
+        except Exception as exc:
+            print(f"  [PIVOT] confirm_fn raised {exc} – proceeding with full set")
+            approved = all_seeds
 
-            emit("pivot_done", {
+        approved_set = {s for s, _ in approved}
+        for seed, stype in all_seeds:
+            if seed not in approved_set:
+                seed_queue.mark_processed(seed)
+                emit("pivot_skipped", {
+                    "seed": seed, "seed_type": stype, "depth": next_depth,
+                })
+                print(f"  [PIVOT d={next_depth}] skipped by user: {stype}={seed!r}")
+
+        all_seeds = [s for s in all_seeds if s[0] in approved_set]
+
+    if not all_seeds:
+        print(f"\n  [PIVOT d={next_depth}] all seeds skipped.")
+        return 0
+
+    batch_size = max(1, pivot_config.max_seeds_per_depth)
+    launched   = 0
+
+    for batch_start in range(0, len(all_seeds), batch_size):
+        batch = all_seeds[batch_start : batch_start + batch_size]
+
+        print(
+            f"\n  [PIVOT d={next_depth}] launching batch "
+            f"{batch_start // batch_size + 1} "
+            f"({len(batch)} seed(s))"
+        )
+
+        for seed_value, seed_type in batch:
+            seed_queue.mark_processed(seed_value)
+
+            print(f"\n  [PIVOT d={next_depth}] {seed_type}={seed_value!r}")
+            emit("pivot_start", {
                 "seed":      seed_value,
                 "seed_type": seed_type,
                 "depth":     next_depth,
-                "merged":    True,
             })
-            print(f"  [PIVOT d={next_depth}] ✓ merged: {seed_value!r}")
 
-        except Exception as exc:
-            print(
-                f"  [PIVOT d={next_depth}] ✗ failed for "
-                f"{seed_type}={seed_value!r}: {exc}"
-            )
-            traceback.print_exc()
-            emit("pivot_error", {
-                "seed":    seed_value,
-                "error":   str(exc),
-                "depth":   next_depth,
-            })
+            try:
+                sub_ctx, sub_pipeline = build_sub_pipeline(
+                    seed_value, seed_type, ctx, next_depth
+                )
+                sub_pipeline.run(
+                    emit=emit,
+                    pivot_config=pivot_config,
+                    seed_queue=seed_queue,
+                    pivot_confirm_fn=confirm_fn,
+                )
+                merge_results(ctx, sub_ctx)
+                launched += 1
+
+                emit("pivot_done", {
+                    "seed":      seed_value,
+                    "seed_type": seed_type,
+                    "depth":     next_depth,
+                    "merged":    True,
+                })
+                print(f"  [PIVOT d={next_depth}] ✓ merged: {seed_value!r}")
+
+            except Exception as exc:
+                print(
+                    f"  [PIVOT d={next_depth}] ✗ failed for "
+                    f"{seed_type}={seed_value!r}: {exc}"
+                )
+                traceback.print_exc()
+                emit("pivot_error", {
+                    "seed":    seed_value,
+                    "error":   str(exc),
+                    "depth":   next_depth,
+                })
 
     return launched

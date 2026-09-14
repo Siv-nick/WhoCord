@@ -1,6 +1,9 @@
 import json
 import os
+import sys
+
 import keyring
+
 from .utils import get_base_dir, get_data_dir
 
 CONFIG_FILE = os.path.join(get_base_dir(), "config.json")
@@ -9,7 +12,16 @@ DEFAULT_CONFIG = {
     "DISCORD_TOKEN":          "",
     "GITHUB_TOKEN":           "",
     "GROQ_API_KEY":           "",
+    "OPENROUTER_API_KEY":     "",
     "INSTAGRAM_SESSION":      "",
+    "HIBP_API_KEY":           "",
+    # ── Contact-enrichment providers (opt-in) ─────────────────────────
+    "APOLLO_API_KEY":         "",
+    "LUSHA_API_KEY":          "",
+    "ENABLE_APOLLO":          False,
+    "ENABLE_LUSHA":           False,
+    "ENRICHMENT_MAX_IDENTIFIERS": 25,
+    "ENABLE_ENRICHMENT_PHONE_REVEAL": False,
     "MULTI_GUILD_SEARCH":     False,
     "SKIP_GITHUB":            False,
     "ENABLE_USER_SCANNER":    True,
@@ -65,6 +77,19 @@ DEFAULT_CONFIG = {
     "MANUAL_URL":             "",
     "PROBE_STRING":           "",
     "DEBUG":                  False,
+
+    # ── LLM configuration ────────────────────────────────────────────────
+    "LLM_PROVIDER":           "groq",
+    "LLM_MODEL":              "llama3-8b-8192",
+    "LLM_TEMPERATURE":        0.25,
+    "LLM_MAX_TOKENS":         4096,
+    "LLM_SYSTEM_PROMPT":      "",
+
+    # ── Intel dump controls ─────────────────────────────────────────────
+    "LLM_INTEL_BUDGET":       60000,
+    "LLM_INTEL_INCLUDE_RAW":  True,
+    "LLM_INTEL_EXCLUDE_META": True,
+
     # Deprecated — kept so old config.json files don't crash
     "ENABLE_SHERLOCK":        False,
     "ENABLE_NAMINTER":        False,
@@ -72,17 +97,29 @@ DEFAULT_CONFIG = {
 }
 
 SENSITIVE_KEYS = {
-    "DISCORD_TOKEN":       "discord-osint/discord",
-    "GITHUB_TOKEN":        "discord-osint/github",
-    "GROQ_API_KEY":        "discord-osint/groq",
-    "INSTAGRAM_SESSION":   "discord-osint/instagram",
+    "DISCORD_TOKEN":      "discord-osint/discord",
+    "GITHUB_TOKEN":       "discord-osint/github",
+    "GROQ_API_KEY":       "discord-osint/groq",
+    "OPENROUTER_API_KEY": "discord-osint/openrouter",
+    "INSTAGRAM_SESSION":  "discord-osint/instagram",
+    "HIBP_API_KEY":       "discord-osint/hibp",
+    "APOLLO_API_KEY":     "discord-osint/apollo",
+    "LUSHA_API_KEY":      "discord-osint/lusha",
 }
 
 # Module‑level globals (kept in sync by Config class)
 USER_TOKEN          = ""
 GITHUB_TOKEN        = ""
 GROQ_API_KEY        = ""
+OPENROUTER_API_KEY  = ""
 INSTAGRAM_SESSION   = ""
+HIBP_API_KEY        = ""
+APOLLO_API_KEY      = ""
+LUSHA_API_KEY       = ""
+ENABLE_APOLLO       = False
+ENABLE_LUSHA        = False
+ENRICHMENT_MAX_IDENTIFIERS = 25
+ENABLE_ENRICHMENT_PHONE_REVEAL = False
 MULTI_GUILD_SEARCH  = False
 SKIP_GITHUB         = False
 ENABLE_USER_SCANNER = True
@@ -138,6 +175,17 @@ MANUAL_URL          = ""
 PROBE_STRING        = ""
 OUTPUT_FORMAT       = "html"
 DEBUG               = False
+
+# LLM globals
+LLM_PROVIDER          = "groq"
+LLM_MODEL             = "llama3-8b-8192"
+LLM_TEMPERATURE       = 0.25
+LLM_MAX_TOKENS        = 4096
+LLM_SYSTEM_PROMPT     = ""
+LLM_INTEL_BUDGET      = 60000
+LLM_INTEL_INCLUDE_RAW = True
+LLM_INTEL_EXCLUDE_META = True
+
 # Deprecated
 ENABLE_SHERLOCK     = False
 ENABLE_NAMINTER     = False
@@ -162,32 +210,57 @@ class Config:
         self._load()
 
     def _load(self):
+        # 1. Environment variables first.
         for key in DEFAULT_CONFIG:
             env_val = os.environ.get(key)
             if env_val is not None:
                 self._data[key] = env_val
+
+        # 2. File overrides (non-sensitive keys only).
         if os.path.exists(self._config_file):
             try:
-                with open(self._config_file, 'r') as f:
+                with open(self._config_file, 'r', encoding='utf-8') as f:
                     file_data = json.load(f)
+                if not isinstance(file_data, dict):
+                    raise ValueError(
+                        f"config root must be an object, got {type(file_data).__name__}"
+                    )
                 for k, v in file_data.items():
                     if k not in SENSITIVE_KEYS and k in DEFAULT_CONFIG:
                         self._data[k] = v
-            except Exception:
-                pass
+            except Exception as exc:
+                print(
+                    f"[config] WARNING: could not read {self._config_file!r}: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+                print(
+                    "[config]          falling back to defaults for unreadable keys",
+                    file=sys.stderr,
+                )
+
+        # 3. Sensitive keys: env var wins, else keyring.
         for key, service in SENSITIVE_KEYS.items():
             env_val = os.environ.get(key)
             if env_val:
                 self._data[key] = env_val
             else:
-                stored = keyring.get_password(service, key)
+                try:
+                    stored = keyring.get_password(service, key)
+                except Exception as exc:
+                    print(
+                        f"[config] WARNING: keyring read failed for {key}: {exc}",
+                        file=sys.stderr,
+                    )
+                    stored = None
                 if stored:
                     self._data[key] = stored
+
         _sync_globals_from_dict(self._data)
 
     def save(self):
         clean = {k: v for k, v in self._data.items() if k not in SENSITIVE_KEYS}
-        with open(self._config_file, 'w') as f:
+        with open(self._config_file, 'w', encoding='utf-8') as f:
             json.dump(clean, f, indent=2)
         for key, service in SENSITIVE_KEYS.items():
             value = self._data[key]

@@ -1,24 +1,56 @@
 // src/hooks/useChat.ts
-// ─────────────────────────────────────────────────────────────────────────────
-// Manages the AI Chat panel: sends map state + user question to
-// POST /api/ai/chat and streams the Groq response back token by token.
-
 import { useCallback, useRef, useState } from "react";
-import type { ChatMessage } from "../types/graph";
-import type { GraphEdge, GraphNode } from "../types/graph";
+import type { ChatMessage, GraphEdge, GraphNode } from "../types/graph";
+import type {
+  Finding,
+  InvestigationStatus,
+  PivotInfo,
+} from "../types/investigation";
 
 let _msgSeq = 0;
 const newMsgId = () => `msg_${++_msgSeq}_${Date.now()}`;
+
+const MAX_NODES     = 400;
+const MAX_EDGES     = 800;
+const MAX_LOGS      = 150;
+const MAX_FINDINGS  = 60;
+
+export interface ChatExtraContext {
+  status?:       InvestigationStatus;
+  currentStage?: string | null;
+  target?:       string;
+  mode?:         string;
+  jobId?:        string | null;
+  pivotDepth?:   number;
+  pivots?:       PivotInfo[];
+  logs?:         string[];
+  findings?:     Finding[];
+}
 
 interface UseChatResult {
   messages:  ChatMessage[];
   streaming: boolean;
   sendMessage: (
-    text: string,
+    text:  string,
     nodes: GraphNode[],
     edges: GraphEdge[],
+    ctx?:  ChatExtraContext,
   ) => Promise<void>;
   clearChat: () => void;
+}
+
+function trimRawData(raw: unknown, maxKeys = 12, maxChars = 120): Record<string, unknown> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: Record<string, unknown> = {};
+  let count = 0;
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (count >= maxKeys) break;
+    if (v === null || v === undefined) continue;
+    if (typeof v === "object") continue;
+    out[k] = typeof v === "string" ? v.slice(0, maxChars) : v;
+    count += 1;
+  }
+  return out;
 }
 
 export function useChat(): UseChatResult {
@@ -32,10 +64,10 @@ export function useChat(): UseChatResult {
     text: string,
     nodes: GraphNode[],
     edges: GraphEdge[],
+    ctx: ChatExtraContext = {},
   ) => {
     if (!text.trim() || streaming) return;
 
-    // Append user message
     const userMsg: ChatMessage = {
       id:      newMsgId(),
       role:    "user",
@@ -45,7 +77,6 @@ export function useChat(): UseChatResult {
     setMessages(prev => [...prev, userMsg]);
     setStreaming(true);
 
-    // Placeholder for the assistant reply (streamed in)
     const assistantId = newMsgId();
     const assistantMsg: ChatMessage = {
       id:      assistantId,
@@ -57,23 +88,59 @@ export function useChat(): UseChatResult {
 
     abortRef.current = new AbortController();
 
+    const trimmedNodes = nodes.slice(0, MAX_NODES).map(n => ({
+      id:         n.id,
+      label:      n.label,
+      entityType: n.entityType,
+      module:     n.module,
+      infoFields: n.infoFields.map(f => ({
+        label: f.label,
+        value: f.value.slice(0, 500),
+      })),
+      rawData:    trimRawData(n.rawData),
+    }));
+
+    const trimmedEdges = edges.slice(0, MAX_EDGES).map(e => ({
+      sourceId: e.sourceId,
+      targetId: e.targetId,
+    }));
+
+    const trimmedLogs = (ctx.logs ?? []).slice(-MAX_LOGS);
+
+    const trimmedFindings = (ctx.findings ?? []).slice(0, MAX_FINDINGS).map(f => {
+      const p = f.payload as Record<string, unknown>;
+      const summary = String(
+        p.value ?? p.url ?? p.email ?? p.domain ?? f.label
+      ).slice(0, 120);
+      return { type: f.type, stage: f.stage, summary };
+    });
+
+    const body = {
+      message: text.trim(),
+      job_id:  ctx.jobId ?? undefined,
+      map: {
+        node_count:   nodes.length,
+        edge_count:   edges.length,
+        nodes:        trimmedNodes,
+        edges:        trimmedEdges,
+        status:       ctx.status      ?? "idle",
+        currentStage: ctx.currentStage ?? null,
+        target:       ctx.target      ?? "",
+        mode:         ctx.mode        ?? "",
+        jobId:        ctx.jobId       ?? null,
+        pivotDepth:   ctx.pivotDepth  ?? 0,
+        pivots:       ctx.pivots      ?? [],
+        logs:         trimmedLogs,
+        findings:     trimmedFindings,
+      },
+    };
+
     try {
       const res = await fetch("/api/ai/chat", {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: text.trim(),
-          map: {
-            node_count:  nodes.length,
-            edge_count:  edges.length,
-            nodes: nodes.map(n => ({
-              label:      n.label,
-              entityType: n.entityType,
-              infoFields: n.infoFields.map(f => ({ label: f.label, value: f.value })),
-            })),
-          },
-        }),
-        signal: abortRef.current.signal,
+        body:    JSON.stringify(body),
+        signal:  abortRef.current.signal,
       });
 
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -88,8 +155,6 @@ export function useChat(): UseChatResult {
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
-
-        // Parse SSE lines
         const lines = buffer.split("\n");
         buffer = lines.pop() ?? "";
 
@@ -111,7 +176,6 @@ export function useChat(): UseChatResult {
               );
             }
           } catch {
-            // Raw text fallback
             if (raw) {
               setMessages(prev =>
                 prev.map(m =>

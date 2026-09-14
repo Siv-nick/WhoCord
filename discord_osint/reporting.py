@@ -4,9 +4,12 @@ discord_osint/reporting.py
 Report helpers: identity confidence scoring, name analysis, AI persona
 summaries, AI structured reports, and markdown formatting.
 
-Note: the HTML report generator lives in
-``discord_osint/intelligence/html_report.py``.  This file only holds the
-non-HTML reporting utilities that the pipeline stages still call directly.
+LLM provider resolution
+-----------------------
+Every LLM call routes through ``config_service.get_llm_endpoint()``,
+which returns the base URL, API key, and extra headers for whichever
+provider (``LLM_PROVIDER``) is active. Switching from Groq to
+OpenRouter is a single config-key change with no code edits required.
 """
 
 import json
@@ -16,6 +19,60 @@ import datetime
 
 from .scraping import looks_like_real_name_v2, is_valid_email
 from .utils import CACHE_DIR
+from .config_service import get_llm_endpoint
+
+
+# ---------------------------------------------------------------------------
+# LLM settings helper
+# ---------------------------------------------------------------------------
+
+def _llm_settings() -> tuple[str, float, int, str, int, bool, bool]:
+    try:
+        from .config import config as _cfg
+    except Exception:
+        return ("llama3-8b-8192", 0.25, 4096, "", 60000, True, True)
+
+    def _f(v, d):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return d
+
+    def _i(v, d):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return d
+
+    def _b(v, d):
+        if v is None:
+            return d
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "yes", "on")
+        return bool(v)
+
+    model  = getattr(_cfg, "LLM_MODEL", "llama3-8b-8192") or "llama3-8b-8192"
+    temp   = _f(getattr(_cfg, "LLM_TEMPERATURE", 0.25), 0.25)
+    tokens = _i(getattr(_cfg, "LLM_MAX_TOKENS", 4096), 4096)
+    prompt = getattr(_cfg, "LLM_SYSTEM_PROMPT", "") or ""
+    budget = _i(getattr(_cfg, "LLM_INTEL_BUDGET", 60000), 60000)
+    raw    = _b(getattr(_cfg, "LLM_INTEL_INCLUDE_RAW", True), True)
+    meta   = _b(getattr(_cfg, "LLM_INTEL_EXCLUDE_META", True), True)
+    return model, temp, tokens, prompt, budget, raw, meta
+
+
+def _build_system_prompt(base_prompt: str) -> str:
+    """
+    Combine a caller-supplied (or default) base prompt with the
+    untrusted-data contract. The contract is always appended, so a
+    custom prompt cannot reopen the injection surface.
+    """
+    from .intelligence.intel_dump import UNTRUSTED_DATA_RULES
+
+    base = (base_prompt or "").strip()
+    if base:
+        return base + "\n\n" + UNTRUSTED_DATA_RULES
+    return UNTRUSTED_DATA_RULES
 
 
 # -------------------------------------------------------------------
@@ -133,161 +190,67 @@ def run_name_analysis(name_list):
 
 
 # -------------------------------------------------------------------
-#  AI Persona Summary — gathers intel from every available source
+#  AI Persona Summary
 # -------------------------------------------------------------------
-def generate_persona_summary(intel, groq_api_key):
+def generate_persona_summary(intel, groq_api_key=None):
     """
-    Ask the LLM to summarise the subject's persona based on every piece
-    of intel we've collected (emails, breaches, bios, names, location,
-    phone, WHOIS, URL metadata, GHunt, pivots).
+    Ask the LLM to summarise the subject's persona using the FULL intel
+    dump rather than just bios and emails.
+
+    The *groq_api_key* argument is accepted for backwards compatibility
+    but ignored — the active provider and its key are read from the
+    config via ``get_llm_endpoint()``.
     """
-    if not groq_api_key:
+    base_url, api_key, extra_headers = get_llm_endpoint()
+    if not api_key:
         return None
 
     try:
         from openai import OpenAI
-        client = OpenAI(base_url="https://api.groq.com/openai/v1",
-                        api_key=groq_api_key)
+        from .intelligence.intel_dump import build_intel_dump
 
-        # ── 1. Emails + breach context ──────────────────────────────────
-        emails   = intel.get("emails", {})
-        breaches = intel.get("breaches", {})
-        email_lines = []
-        for key, entry in emails.items():
-            email_val = entry.get("value", "") if isinstance(entry, dict) else ""
-            if not email_val or "@" not in email_val:
-                continue
-            sites = []
-            for bk, bv in breaches.items():
-                if email_val in bk:
-                    bval = bv.get("value", {}) if isinstance(bv, dict) else bv
-                    if isinstance(bval, dict) and bval.get("used_on"):
-                        sites.extend(bval["used_on"])
-            if sites:
-                email_lines.append(
-                    f"Email {email_val} registered on: {', '.join(set(sites[:5]))}"
-                )
-            else:
-                email_lines.append(f"Email {email_val} (no registrations found)")
+        client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            default_headers=extra_headers or None,
+        )
 
-        # ── 2. Bios ─────────────────────────────────────────────────────
-        bios = []
-        for k, v in intel.get("social_profiles", {}).items():
-            if "bio" in k.lower() or "desc" in k.lower():
-                val = v.get("value", "") if isinstance(v, dict) else ""
-                if val:
-                    bios.append(val[:500])
-        for k, v in intel.get("social_profiles", {}).items():
-            if "socid_raw" in k:
-                try:
-                    socid_data = json.loads(v.get("value", "{}"))
-                    if isinstance(socid_data, dict) and socid_data.get("bio"):
-                        bios.append(socid_data["bio"][:500])
-                except Exception:
-                    pass
+        model, temp, tokens, custom_prompt, budget, include_raw, exclude_meta = \
+            _llm_settings()
 
-        # ── 3. Identity clues ───────────────────────────────────────────
-        identity = intel.get("identity_clues", {})
-        names    = [v.get("value", "") for k, v in identity.items()
-                    if k.startswith("name_") and v.get("value")]
-        location = ""
-        lang     = ""
-        for k, v in identity.items():
-            if k == "inferred_location":
-                location = v.get("value", "")
-            if k == "language":
-                lang = v.get("value", "")
-
-        # ── 4. Phone ────────────────────────────────────────────────────
-        phone = intel.get("phone", {})
-        phone_str = ""
-        if phone:
-            num     = phone.get("number", {})
-            num_val = num.get("value", "") if isinstance(num, dict) else ""
-            carr    = phone.get("carrier", {})
-            carr_val = carr.get("value", "") if isinstance(carr, dict) else ""
-            if num_val:
-                phone_str = f"Phone number: {num_val} (carrier: {carr_val})"
-
-        # ── 5. Domain WHOIS ─────────────────────────────────────────────
-        whois = intel.get("whois", {})
-        whois_str = ""
-        for domain, data in whois.items():
-            if isinstance(data, dict):
-                reg = data.get("registrant_org", "") or data.get("registrant_name", "")
-                whois_str = (
-                    f"Domain {domain} registered to {reg}"
-                    if reg else f"Domain {domain} (no public registrant)"
-                )
-
-        # ── 6. URL page metadata ────────────────────────────────────────
-        url_intel = intel.get("url_intel", {})
-        url_title = ""
-        url_desc  = ""
-        if url_intel:
-            page_meta = url_intel.get("page_meta", {})
-            if isinstance(page_meta, dict):
-                val = page_meta.get("value", {}) if "value" in page_meta else page_meta
-                if isinstance(val, dict):
-                    url_title = val.get("title", "")
-                    url_desc  = val.get("description", "")
-
-        # ── 7. GHunt ────────────────────────────────────────────────────
-        ghunt      = intel.get("ghunt", {})
-        ghunt_str  = ""
-        for email, data in ghunt.items():
-            if isinstance(data, dict):
-                services = data.get("activated_services", [])
-                if services:
-                    ghunt_str = f"Google account with services: {', '.join(services)}"
-                break
-
-        # ── 8. Pivot sub-reports ────────────────────────────────────────
-        pivot_count = len(intel.get("pivot_reports", []))
-
-        # ── Build prompt ────────────────────────────────────────────────
-        prompt_parts = [
-            "You are an experienced OSINT investigator. Based on the following "
-            "collected data, write a single concise paragraph describing the "
-            "person's online persona, interests, profession, and any notable "
-            "characteristics. Use clear, factual language.",
-            "",
-            "=== DATA ===",
-        ]
-        if email_lines:
-            prompt_parts.append("Emails and registrations:\n" + "\n".join(email_lines))
-        if bios:
-            prompt_parts.append("Profile biographies:\n" + "\n---\n".join(bios[:15]))
-        if names:
-            prompt_parts.append(f"Possible names: {', '.join(names[:5])}")
-        if location:
-            prompt_parts.append(f"Inferred location: {location}")
-        if lang:
-            prompt_parts.append(f"Language: {lang}")
-        if phone_str:
-            prompt_parts.append(phone_str)
-        if whois_str:
-            prompt_parts.append(whois_str)
-        if url_title or url_desc:
-            prompt_parts.append(
-                f"Page title: {url_title[:200]}\nPage description: {url_desc[:300]}"
-            )
-        if ghunt_str:
-            prompt_parts.append(ghunt_str)
-        if pivot_count:
-            prompt_parts.append(f"Number of pivot sub-investigations: {pivot_count}")
-
-        if not any([email_lines, bios, names, location, lang,
-                    phone_str, whois_str, url_title, ghunt_str]):
+        dump = build_intel_dump(
+            intel,
+            budget=budget,
+            include_raw=include_raw,
+            exclude_meta=exclude_meta,
+        )
+        if not dump.strip():
             return "Insufficient data to form a persona."
 
-        prompt = "\n".join(prompt_parts)
+        user_prompt = (
+            "You are an experienced OSINT investigator.  Using the "
+            "complete investigation dump below, write a single concise "
+            "paragraph (4-6 sentences) describing the subject's online "
+            "persona, interests, profession, and any notable "
+            "characteristics.  Use clear, factual language.  Cite the "
+            "section name when a finding is important.\n\n"
+            + dump
+        )
+
+        system_prompt = _build_system_prompt(
+            custom_prompt
+            or "You are an experienced OSINT investigator. "
+               "Respond with plain prose, no markdown fences."
+        )
 
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=4000,
-            temperature=0.3,
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+            max_tokens=min(tokens, 4000),
+            temperature=temp,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -296,12 +259,19 @@ def generate_persona_summary(intel, groq_api_key):
 
 
 # -------------------------------------------------------------------
-#  AI structured report (JSON) — unchanged
+#  AI structured report (JSON)
 # -------------------------------------------------------------------
-def generate_ai_report(core, groq_api_key):
-    """Generate an AI summary using Groq's Llama 3.3 model."""
-    if not groq_api_key:
-        print("  AI report skipped – no Groq API key set.")
+def generate_ai_report(core, groq_api_key=None):
+    """
+    Generate a structured JSON report using the FULL intel dump.
+
+    The *groq_api_key* argument is accepted for backwards compatibility
+    but ignored — the active provider and its key are read from the
+    config via ``get_llm_endpoint()``.
+    """
+    base_url, api_key, extra_headers = get_llm_endpoint()
+    if not api_key:
+        print("  AI report skipped – no API key set for the active provider.")
         return None
 
     if hasattr(core, "intel"):
@@ -314,68 +284,76 @@ def generate_ai_report(core, groq_api_key):
 
     try:
         from openai import OpenAI
-        client = OpenAI(base_url="https://api.groq.com/openai/v1",
-                        api_key=groq_api_key)
+        from .intelligence.intel_dump import build_intel_dump
 
-        top_list = intel.get("confidence_scores", [])
-        if isinstance(top_list, dict):
-            top_list = [v for v in top_list.values() if isinstance(v, dict)]
-        top_candidates = top_list[:3] if isinstance(top_list, list) else []
+        client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            default_headers=extra_headers or None,
+        )
 
-        email_list = []
-        for key, entry in intel.get("emails", {}).items():
-            if entry.get("source") != "email_guesser":
-                email_list.append({"email": entry["value"], "source": entry["source"]})
+        model, temp, tokens, custom_prompt, budget, include_raw, exclude_meta = \
+            _llm_settings()
 
-        breach_status = {}
-        for key, entry in intel.get("breaches", {}).items():
-            breach_status[key] = (
-                "compromised"
-                if "Not Compromised" not in str(entry["value"])
-                else "clean"
-            )
+        dump = build_intel_dump(
+            intel,
+            budget=budget,
+            include_raw=include_raw,
+            exclude_meta=exclude_meta,
+        )
 
-        profiles = [
-            v["value"] for k, v in intel.get("social_profiles", {}).items()
-            if v.get("value", "").startswith("http")
-        ][:15]
+        user_prompt = (
+            "You are an OSINT analyst.  Using the complete investigation "
+            "dump below, produce a concise JSON report with exactly these "
+            "keys:\n\n"
+            "- executive_summary: a brief overview of the investigation\n"
+            "- identity_assessment: evaluation of the subject's identity "
+            "(pseudonymity, possible real name)\n"
+            "- digital_footprint: summary of platforms, categories, and "
+            "online presence\n"
+            "- risk_indicators: identified risks (breaches, exposed info, "
+            "password reuse, etc.)\n"
+            "- relationship_analysis: connections between data points\n"
+            "- critical_points: a list of the most important findings "
+            "(array of strings)\n\n"
+            + dump
+        )
 
-        summary = {
-            "discord_username": intel.get("discord", {}).get("username", {}).get("value", "?"),
-            "top_identities":   [{"name": c["name"], "score": c["score"]} for c in top_candidates],
-            "emails":           email_list[:10],
-            "breach_status":    breach_status,
-            "profile_urls":     profiles,
-        }
-
-        prompt = f"""You are an OSINT analyst. Based on the following data, produce a concise JSON report with exactly these keys:
-
-- executive_summary: a brief overview of the investigation
-- identity_assessment: evaluation of the subject's identity (pseudonymity, possible real name)
-- digital_footprint: summary of platforms, categories, and online presence
-- risk_indicators: identified risks (breaches, exposed info, password reuse, etc.)
-- relationship_analysis: connections between data points
-- critical_points: a list of the most important findings (array of strings)
-
-Data: {json.dumps(summary, indent=2)}"""
+        system_prompt = _build_system_prompt(
+            custom_prompt
+            or "You are an OSINT analyst. Respond ONLY with valid JSON, "
+               "no markdown fences, no preamble."
+        )
 
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=5500,
-            temperature=0.25,
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+            max_tokens=min(tokens, 5500),
+            temperature=temp,
         )
         raw = response.choices[0].message.content.strip()
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE)
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE)
+
         try:
-            return json.loads(raw)
-        except Exception:
+            parsed = json.loads(cleaned)
+            if not isinstance(parsed, dict):
+                raise ValueError("expected a JSON object at the top level")
+            return parsed
+        except Exception as parse_exc:
+            print(f"  AI report parse error: {parse_exc}")
             return {
-                "executive_summary":  raw,
+                "executive_summary":  (
+                    "[AI report could not be parsed as JSON. "
+                    "See debug logs for the raw response.]"
+                ),
                 "identity_assessment": "",
                 "digital_footprint":  "",
                 "risk_indicators":    "",
-                "next_steps":         "",
+                "critical_points":    [],
+                "_parse_error":       str(parse_exc),
             }
     except Exception as e:
         import traceback

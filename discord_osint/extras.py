@@ -1,3 +1,21 @@
+"""
+discord_osint/extras.py
+-----------------------
+Supplementary OSINT helpers: avatar download, reverse image search,
+EXIF extraction, WHOIS, Wayback availability, location/language inference,
+and socialscan URL filtering.
+
+Change log
+----------
+- Silent `except Exception: pass` branches in `download_avatar`,
+  `reverse_image_search`, `whois_domain`, and `wayback_available` now
+  record the failure reason via `log_trace` so a debug-log run
+  distinguishes "no result" from "tool crashed".
+- `socialscan_filter` now distinguishes "not installed", "crashed on
+  launch", "produced malformed JSON", and "nothing available" — each of
+  which previously collapsed into "keep all URLs and print one line".
+"""
+
 import os
 import re
 import subprocess as _sp
@@ -6,7 +24,8 @@ import time
 import sys
 from urllib.parse import urlparse
 from collections import Counter
-from .utils import http_session, tool_available, REQUEST_DELAY, CACHE_DIR
+
+from .utils import http_session, tool_available, REQUEST_DELAY, CACHE_DIR, log_trace
 from . import utils
 
 # ── Bug 3 fix: never bind tool flags at import time. ──────────────────
@@ -32,13 +51,16 @@ def download_avatar(url, save_dir):
             with open(fname, 'wb') as f:
                 f.write(r.content)
             return fname
-    except Exception:
-        pass
+        log_trace(f"download_avatar: HTTP {r.status_code} or body too small "
+                  f"({len(r.content)} bytes) for {url[:80]}")
+    except Exception as exc:
+        log_trace(f"download_avatar: EXCEPTION {type(exc).__name__}: {exc} "
+                  f"for {url[:80]}")
     return None
 
 
 def reverse_image_search(image_url):
-    if not _flag("ENABLE_REVERSE_IMG"):   # Bug 3
+    if not _flag("ENABLE_REVERSE_IMG"):
         return []
     if any(x in image_url.lower() for x in ["default", "logo", "placeholder",
                                             "gravatar.com/avatar/00000000000000000000000000000000"]):
@@ -58,8 +80,10 @@ def reverse_image_search(image_url):
                     except Exception:
                         pass
             return [d for d, _ in Counter(domains).most_common(10)]
+        log_trace(f"reverse_image_search: HTTP {r.status_code} for {image_url[:80]}")
     except Exception as e:
         print(f"  Reverse image search error: {e}")
+        log_trace(f"reverse_image_search: EXCEPTION {type(e).__name__}: {e}")
     return []
 
 
@@ -67,6 +91,7 @@ def extract_metadata(filepath):
     try:
         import exifread
     except ImportError:
+        log_trace("extract_metadata: exifread not installed.")
         return {}
     try:
         with open(filepath, 'rb') as f:
@@ -82,14 +107,15 @@ def extract_metadata(filepath):
                       float(tags["GPS GPSLongitude"].values[2]) / 3600
                 gps["latitude"] = lat
                 gps["longitude"] = lon
-            except Exception:
-                pass
+            except Exception as exc:
+                log_trace(f"extract_metadata: GPS parse error: {exc}")
         return {
             "gps": gps,
             "camera": str(tags.get("Image Model", "")),
             "date_taken": str(tags.get("EXIF DateTimeOriginal", "")),
         }
-    except Exception:
+    except Exception as exc:
+        log_trace(f"extract_metadata: EXCEPTION {type(exc).__name__}: {exc}")
         return {}
 
 
@@ -97,6 +123,8 @@ def whois_domain(domain):
     try:
         res = _sp.run(["whois", domain], capture_output=True, text=True, timeout=20)
         if res.returncode != 0 or not res.stdout.strip():
+            log_trace(f"whois_domain: rc={res.returncode} or empty stdout for "
+                      f"{domain} — stderr={(res.stderr or '')[:200]}")
             return {}
 
         lines = res.stdout.splitlines()
@@ -147,7 +175,9 @@ def whois_domain(domain):
 
         return data
 
-    except Exception:
+    except Exception as exc:
+        log_trace(f"whois_domain: EXCEPTION {type(exc).__name__}: {exc} "
+                  f"for {domain}")
         return {}
 
 
@@ -159,8 +189,11 @@ def wayback_available(url):
             snapshots = data.get("archived_snapshots", {})
             if snapshots and "closest" in snapshots:
                 return snapshots["closest"].get("url")
-    except Exception:
-        pass
+        else:
+            log_trace(f"wayback_available: HTTP {r.status_code} for {url[:80]}")
+    except Exception as exc:
+        log_trace(f"wayback_available: EXCEPTION {type(exc).__name__}: {exc} "
+                  f"for {url[:80]}")
     return None
 
 
@@ -179,13 +212,14 @@ def detect_language(text):
     try:
         from langdetect import detect_langs
     except ImportError:
+        log_trace("detect_language: langdetect not installed.")
         return None
     try:
         langs = detect_langs(text)
         if langs:
             return langs[0].lang, langs[0].prob
-    except Exception:
-        pass
+    except Exception as exc:
+        log_trace(f"detect_language: EXCEPTION {type(exc).__name__}: {exc}")
     return None
 
 
@@ -205,12 +239,12 @@ def _is_plausible_username(segment: str) -> bool:
         return False
     if segment.lower() in _NON_USERNAME_SEGMENTS:
         return False
-    # Usernames are alnum + . _ - only; no query chars, no path slashes
     return bool(re.fullmatch(r'[a-zA-Z0-9._\-]+', segment))
 
 
 def socialscan_filter(urls):
     if not tool_available("socialscan"):
+        log_trace("socialscan_filter: socialscan not on PATH — keeping all URLs.")
         return urls
 
     # ── Prefer classify_url() — it knows the actual platform slug. ──────
@@ -226,7 +260,6 @@ def socialscan_filter(urls):
         for url in urls:
             try:
                 parsed = urlparse(url)
-                # Skip anything that looks like an API endpoint
                 if "/api/" in parsed.path.lower():
                     continue
                 if parsed.netloc.lower().startswith(("api.", "public-api.")):
@@ -242,8 +275,9 @@ def socialscan_filter(urls):
             except Exception:
                 pass
 
-    # ── If we still couldn't find a real username, skip the filter. ─────
     if not username:
+        log_trace("socialscan_filter: no plausible username extracted — "
+                  "keeping all URLs.")
         return urls
 
     temp_dir = os.path.join(CACHE_DIR, "socialscan_tmp")
@@ -259,64 +293,80 @@ def socialscan_filter(urls):
     if utils.DEBUG_MODE:
         utils.debug_subprocess(cmd, timeout=60)
         return urls
-    else:
-        res = _sp.run(cmd, capture_output=True, text=True, timeout=60)
-        if res.returncode != 0 or not os.path.exists(outfile):
-            print("  socialscan failed, keeping all URLs")
-            return urls
+
+    res = _sp.run(cmd, capture_output=True, text=True, timeout=60)
+    if res.returncode != 0:
+        print(f"  socialscan exited rc={res.returncode} — keeping all URLs")
+        log_trace(f"socialscan_filter: rc={res.returncode}, "
+                  f"stderr={(res.stderr or '')[:200]}")
+        return urls
+    if not os.path.exists(outfile):
+        print("  socialscan produced no output file — keeping all URLs")
+        log_trace("socialscan_filter: no output file produced.")
+        return urls
+
+    try:
         with open(outfile, 'r') as f:
             data = json.load(f)
-        os.unlink(outfile)
+    except json.JSONDecodeError as exc:
+        print("  socialscan produced malformed JSON — keeping all URLs")
+        log_trace(f"socialscan_filter: JSON parse error: {exc}")
+        try:
+            os.unlink(outfile)
+        except OSError:
+            pass
+        return urls
+    os.unlink(outfile)
 
-        available_platforms = set()
-        unavailable_platforms = set()
-        for query, results in data.items():
-            if not isinstance(results, list):
+    available_platforms = set()
+    unavailable_platforms = set()
+    for query, results in data.items():
+        if not isinstance(results, list):
+            continue
+        for entry in results:
+            if not isinstance(entry, dict):
                 continue
-            for entry in results:
-                if not isinstance(entry, dict):
-                    continue
-                platform = entry.get("platform", "").lower()
-                success = entry.get("success", "False")
-                available = entry.get("available", "False")
-                if success == "True":
-                    if available == "True":
-                        available_platforms.add(platform)
-                    else:
-                        unavailable_platforms.add(platform)
+            platform = entry.get("platform", "").lower()
+            success = entry.get("success", "False")
+            available = entry.get("available", "False")
+            if success == "True":
+                if available == "True":
+                    available_platforms.add(platform)
+                else:
+                    unavailable_platforms.add(platform)
 
-        platform_to_domain = {
-            "twitter": "twitter.com",
-            "x": "x.com",
-            "instagram": "instagram.com",
-            "github": "github.com",
-            "gitlab": "gitlab.com",
-            "reddit": "reddit.com",
-            "tumblr": "tumblr.com",
-            "youtube": "youtube.com",
-            "twitch": "twitch.tv",
-            "tiktok": "tiktok.com",
-            "facebook": "facebook.com",
-            "pinterest": "pinterest.com",
-        }
+    platform_to_domain = {
+        "twitter": "twitter.com",
+        "x": "x.com",
+        "instagram": "instagram.com",
+        "github": "github.com",
+        "gitlab": "gitlab.com",
+        "reddit": "reddit.com",
+        "tumblr": "tumblr.com",
+        "youtube": "youtube.com",
+        "twitch": "twitch.tv",
+        "tiktok": "tiktok.com",
+        "facebook": "facebook.com",
+        "pinterest": "pinterest.com",
+    }
 
-        filtered = []
-        for url in urls:
-            if not is_likely_profile_url_v2(url):
-                filtered.append(url)
-                continue
-            domain = urlparse(url).netloc.lower().replace("www.", "")
-            matching_platform = None
-            for plat, plat_domain in platform_to_domain.items():
-                if domain.endswith(plat_domain):
-                    matching_platform = plat
-                    break
-            if matching_platform is None:
-                filtered.append(url)
-            elif matching_platform in available_platforms:
-                filtered.append(url)
-            elif matching_platform in unavailable_platforms:
-                print(f"    Skipping {url} (socialscan says not available)")
-            else:
-                filtered.append(url)
-        return filtered if filtered else urls
+    filtered = []
+    for url in urls:
+        if not is_likely_profile_url_v2(url):
+            filtered.append(url)
+            continue
+        domain = urlparse(url).netloc.lower().replace("www.", "")
+        matching_platform = None
+        for plat, plat_domain in platform_to_domain.items():
+            if domain.endswith(plat_domain):
+                matching_platform = plat
+                break
+        if matching_platform is None:
+            filtered.append(url)
+        elif matching_platform in available_platforms:
+            filtered.append(url)
+        elif matching_platform in unavailable_platforms:
+            print(f"    Skipping {url} (socialscan says not available)")
+        else:
+            filtered.append(url)
+    return filtered if filtered else urls

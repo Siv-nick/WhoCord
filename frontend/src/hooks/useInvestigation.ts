@@ -1,23 +1,34 @@
 // src/hooks/useInvestigation.ts
-// ─────────────────────────────────────────────────────────────────────
-// Connects an SSE stream (/run) to the canvas graph state.
+// Connects an SSE stream (/run) to the canvas graph state and exposes
+// status / findings / pivots so the AI chat can include them.
 //
-// Deduplication:
-//   - `urlToNodeId`     – global map (URL → node id)
-//   - `parentNodeKeys`  – per-parent set of node keys (parentId → Set<key>)
-//
-//   A node is added only if its key has NOT already been seen under the
-//   SAME parent. The same key under a DIFFERENT parent is allowed and
-//   creates a separate node.
-// ─────────────────────────────────────────────────────────────────────
+// Stop plumbing
+// -------------
+// `stop()` calls the /stop endpoint with the current job id, tracks a
+// `stopping` state while the server acknowledges, and lets the pipeline
+// tear down cleanly at the next stage boundary. The old `stop()`
+// implementation was purely client-side — it closed the EventSource
+// while the server kept running the investigation.
 
 import { useCallback, useRef, useState } from "react";
-import { buildRunUrl } from "../utils/api";
+import { buildRunUrl, stopInvestigation } from "../utils/api";
 import { classifyInput, findingTypeToEntityType } from "../utils/classify";
 import { childPosition } from "../utils/graphLayout";
 import { newEdgeId, newNodeId, useGraphState } from "./useGraphState";
-import type { GraphEdge, GraphNode, InfoField, NodeEntityType } from "../types/graph";
-import type { FindingPayload, RunParams } from "../types/investigation";
+import type {
+  GraphEdge,
+  GraphNode,
+  InfoField,
+  NodeEntityType,
+} from "../types/graph";
+import type {
+  Finding,
+  FindingCategory,
+  FindingPayload,
+  PivotInfo,
+  PivotStatus,
+  RunParams,
+} from "../types/investigation";
 
 const STAGE_ORDER = [
   "discord_mode", "discovery", "scraping", "media",
@@ -31,29 +42,12 @@ function stageProgress(name: string, done: boolean): number {
   return done ? Math.round(((idx + 1) / STAGE_ORDER.length) * 95) : base;
 }
 
-// ── Noise filter for profile URLs (unchanged) ────────────────────────
 const NOISY_URL_FRAGMENTS = [
-  "/api/",
-  "/oembed",
-  "?validate=",
-  "/signup/",
-  "checkusername",
-  "email_available",
-  "/wayback/available",
-  "/graphql/",
-  "username_available",
-  "showAuthorExists",
-  "/rest/u/",
-  "/public/users",
-  "/public/v1/",
-  "/v1.1/sites/",
-  "/v2/orgs/",
-  "/v2/users/",
-  "/v1/users/",
-  "/v1.3/users/",
-  "/v3/users/",
-  "/v4/users",
-  "/v6/user/",
+  "/api/", "/oembed", "?validate=", "/signup/", "checkusername",
+  "email_available", "/wayback/available", "/graphql/", "username_available",
+  "showAuthorExists", "/rest/u/", "/public/users", "/public/v1/",
+  "/v1.1/sites/", "/v2/orgs/", "/v2/users/", "/v1/users/",
+  "/v1.3/users/", "/v3/users/", "/v4/users", "/v6/user/",
   "/account/v1/accounts/",
 ];
 
@@ -84,51 +78,38 @@ function isAvatarUrl(url: string): boolean {
   return AVATAR_CDN_PATTERNS.some(re => re.test(url));
 }
 
-// ── Node key computation ────────────────────────────────────────────
-// Returns a stable string that uniquely identifies a finding *within a
-// given parent*. Two findings with the same key are treated as the same
-// node and only one is rendered per parent.
 function nodeKey(ftype: string, p: Record<string, unknown>): string {
   switch (ftype) {
     case "api_response":
     case "profile_url":
     case "avatar_url":
       return `url:${String(p.url ?? p.value ?? "").toLowerCase()}`;
-
     case "email":
     case "holehe":
     case "hibp":
+    case "hibp_skipped":
     case "h8mail":
     case "gravatar":
     case "ghunt":
     case "emailrep":
     case "scylla":
       return `email:${String(p.email ?? p.value ?? "").toLowerCase()}`;
-
     case "name_clue":
       return `name:${String(p.value ?? "").toLowerCase()}`;
-
     case "connected_account":
       return `acct:${String(p.platform ?? "").toLowerCase()}:${String(p.value ?? "").toLowerCase()}`;
-
     case "exif_gps":
       return `gps:${String(p.file ?? "")}`;
-
     case "reverse_image":
       return `rimg:${String(p.file ?? "")}`;
-
     case "whois":
       return `whois:${String(p.domain ?? "").toLowerCase()}`;
-
     case "wayback":
       return `wb:${String(p.url ?? "").toLowerCase()}`;
-
     case "language":
       return `lang:${String(p.value ?? "").toLowerCase()}`;
-
     case "location":
       return `loc:${String(p.value ?? "").toLowerCase()}`;
-
     default:
       return `${ftype}:${String(
         p.value ?? p.url ?? p.email ?? p.domain ?? p.file ?? "",
@@ -148,6 +129,8 @@ function extractLabel(ftype: string, p: Record<string, unknown>): string {
       return `Holehe: ${String(p.email ?? "")}`.slice(0, 60);
     case "hibp":
       return `HIBP: ${String(p.email ?? "")}`.slice(0, 60);
+    case "hibp_skipped":
+      return `HIBP skipped: ${String(p.email ?? "")}`.slice(0, 60);
     case "h8mail":
       return `h8mail: ${String(p.email ?? "")}`.slice(0, 60);
     case "gravatar":
@@ -183,7 +166,6 @@ function buildInfoFields(ftype: string, p: Record<string, unknown>): InfoField[]
       break;
     }
     case "api_response": {
-      // Prefer backend-supplied key_fields; fall back to legacy dump.
       const url = String(p.url ?? "");
       const kf  = p.key_fields;
 
@@ -208,7 +190,6 @@ function buildInfoFields(ftype: string, p: Record<string, unknown>): InfoField[]
         return fields;
       }
 
-      // Fallback (only if backend didn't send key_fields)
       const data = p.data as Record<string, unknown> | unknown[] | undefined;
       push("api_url", "API URL", url, { isLink: true });
 
@@ -260,6 +241,11 @@ function buildInfoFields(ftype: string, p: Record<string, unknown>): InfoField[]
       if (Array.isArray(p.breach_names)) {
         push("breach_names", "Breach Names", (p.breach_names as string[]).join(", "));
       }
+      break;
+    }
+    case "hibp_skipped": {
+      push("email", "Email", String(p.email ?? ""));
+      push("reason", "Reason", String(p.reason ?? "check could not be performed"));
       break;
     }
     case "h8mail": {
@@ -334,15 +320,55 @@ const SKIP_TYPES = new Set([
   "persona_summary", "social_profiles_found", "stage_start", "stage_done",
 ]);
 
+const FINDING_CATEGORIES: Record<string, FindingCategory> = {
+  email:               "email",
+  name_clue:           "identity",
+  discord_handle:      "identity",
+  avatar_url:          "media",
+  avatar_downloaded:   "media",
+  connected_account:   "social",
+  holehe:              "breach",
+  hibp:                "breach",
+  hibp_skipped:        "breach",
+  h8mail:              "breach",
+  scylla:              "breach",
+  gravatar:            "social",
+  ghunt:               "identity",
+  emailrep:            "email",
+  exif_gps:            "media",
+  reverse_image:       "media",
+  correlations:        "intelligence",
+  intelligence_report: "intelligence",
+  persona_summary:     "intelligence",
+  wayback:             "social",
+  whois:               "social",
+  pivot_start:         "pivot",
+  pivot_done:          "pivot",
+  pivot_error:         "pivot",
+  pivot_skipped:       "pivot",
+};
+
+let _fid = 0;
+const nextFindingId = () => `f_${++_fid}_${Date.now()}`;
+
+export type InvestigationStatus = "idle" | "running" | "stopping" | "done" | "cancelled" | "error";
+
 export interface UseInvestigationResult {
   progress:     number;
   running:      boolean;
+  stopping:     boolean;
   jobId:        string | null;
   reportUrl:    string | null;
   logs:         string[];
   currentStage: string | null;
+  status:       InvestigationStatus;
+  target:       string;
+  mode:         string;
+  pivotDepth:   number;
+  pivots:       PivotInfo[];
+  findings:     Finding[];
   start:        (parentNodeId: string, params: RunParams) => void;
-  stop:         () => void;
+  stop:         () => Promise<void>;
   resetParentCounter: (parentNodeId: string) => void;
 }
 
@@ -352,32 +378,65 @@ export function useInvestigation(): UseInvestigationResult {
   const esRef        = useRef<EventSource | null>(null);
   const urlToNodeId  = useRef<Map<string, string>>(new Map());
   const parentNextIndex = useRef<Map<string, number>>(new Map());
-
-  // ── Per-parent dedup registry ─────────────────────────────────────
-  // parentId → Set of node keys already added under that parent
-  const parentNodeKeys = useRef<Map<string, Set<string>>>(new Map());
+  const parentNodeKeys  = useRef<Map<string, Set<string>>>(new Map());
+  const jobIdRef        = useRef<string | null>(null);
+  const parentRef       = useRef<string | null>(null);
 
   const [progress,     setProgress]     = useState(0);
   const [running,      setRunning]      = useState(false);
+  const [stopping,     setStopping]     = useState(false);
   const [jobId,        setJobId]        = useState<string | null>(null);
   const [reportUrl,    setReportUrl]    = useState<string | null>(null);
   const [logs,         setLogs]         = useState<string[]>([]);
   const [currentStage, setCurrentStage] = useState<string | null>(null);
 
-  const stop = useCallback(() => {
+  const [status,     setStatus]     = useState<InvestigationStatus>("idle");
+  const [target,     setTarget]     = useState<string>("");
+  const [mode,       setMode]       = useState<string>("");
+  const [pivotDepth, setPivotDepth] = useState<number>(0);
+  const [pivots,     setPivots]     = useState<PivotInfo[]>([]);
+  const [findings,   setFindings]   = useState<Finding[]>([]);
+
+  const closeStream = useCallback(() => {
     esRef.current?.close();
     esRef.current = null;
-    setRunning(false);
-    setCurrentStage(null);
   }, []);
+
+  /**
+   * Signal the running investigation to abort. The server sets a
+   * cancellation token which the pipeline checks at the next stage
+   * boundary; the stream then delivers an `abort` event and finally
+   * `stream_end` with status="cancelled".
+   *
+   * We do NOT close the EventSource here — the stream needs to stay
+   * open long enough to deliver the terminal event.
+   */
+  const stop = useCallback(async () => {
+    if (!running && status !== "running") return;
+    setStopping(true);
+    setStatus("stopping");
+
+    const result = await stopInvestigation(jobIdRef.current ?? undefined);
+    if (!result.success) {
+      // The server refused — job may have already finished. Surface it
+      // but leave the stream alone in case it's mid-teardown.
+      console.warn("stopInvestigation failed:", result.error);
+      setStopping(false);
+      // If the server says "job is not running", the stream will
+      // deliver stream_end shortly. If it says something else, we
+      // fall back to running state.
+      if (result.error && !result.error.includes("not running")) {
+        setStatus("running");
+      }
+    }
+    // On success we stay in "stopping" until `stream_end` arrives.
+  }, [running, status]);
 
   const resetParentCounter = useCallback((parentNodeId: string) => {
     parentNextIndex.current.set(parentNodeId, 0);
-    // Also clear the per-parent dedup registry when the counter is reset
     parentNodeKeys.current.delete(parentNodeId);
   }, []);
 
-  // ── Helper: returns true if we should skip this finding ───────────
   const shouldSkipAsDuplicate = useCallback(
     (parentNodeId: string, ftype: string, p: Record<string, unknown>): boolean => {
       const key = nodeKey(ftype, p);
@@ -386,9 +445,7 @@ export function useInvestigation(): UseInvestigationResult {
         keys = new Set<string>();
         parentNodeKeys.current.set(parentNodeId, keys);
       }
-      if (keys.has(key)) {
-        return true;
-      }
+      if (keys.has(key)) return true;
       keys.add(key);
       return false;
     },
@@ -398,8 +455,8 @@ export function useInvestigation(): UseInvestigationResult {
   const start = useCallback((parentNodeId: string, params: RunParams) => {
     if (esRef.current) esRef.current.close();
     urlToNodeId.current = new Map();
-    // Fresh per-parent key registry for this run
     parentNodeKeys.current.set(parentNodeId, new Set<string>());
+    parentRef.current = parentNodeId;
 
     const liveState = useGraphState.getState();
     const liveNodes = liveState.nodes;
@@ -407,20 +464,29 @@ export function useInvestigation(): UseInvestigationResult {
 
     const existingChildCount = liveEdges.filter(e => e.sourceId === parentNodeId).length;
     const trackedIndex = parentNextIndex.current.get(parentNodeId) ?? 0;
-    let startIndex = Math.max(trackedIndex, existingChildCount);
+    const startIndex = Math.max(trackedIndex, existingChildCount);
+
+    jobIdRef.current = null;
 
     setProgress(0);
     setRunning(true);
+    setStopping(false);
     setJobId(null);
     setReportUrl(null);
     setLogs([]);
     setCurrentStage(null);
+    setStatus("running");
+    setTarget(params.username || params.email || params.user_id || params.target || "");
+    setMode(params.mode);
+    setPivotDepth(0);
+    setPivots([]);
+    setFindings([]);
 
     updateNode(parentNodeId, { investigating: true, progress: 0 });
 
-    const sseUrl    = buildRunUrl(params);
-    const es        = new EventSource(sseUrl);
-    esRef.current   = es;
+    const sseUrl  = buildRunUrl(params);
+    const es      = new EventSource(sseUrl);
+    esRef.current = es;
 
     const parentNode = liveNodes.find(n => n.id === parentNodeId);
     const parentPos  = parentNode?.position ?? { x: 0, y: 0 };
@@ -436,7 +502,10 @@ export function useInvestigation(): UseInvestigationResult {
 
       switch (evtType) {
         case "job_start":
-          setJobId(String(p.job_id ?? ""));
+          jobIdRef.current = String(p.job_id ?? "") || null;
+          setJobId(jobIdRef.current);
+          if (p.target) setTarget(String(p.target));
+          if (p.mode)   setMode(String(p.mode));
           break;
 
         case "stage_start": {
@@ -517,18 +586,27 @@ export function useInvestigation(): UseInvestigationResult {
           const ftype = String(p.type ?? "");
           if (SKIP_TYPES.has(ftype)) break;
 
-          // Skip profile_url nodes whose URL is clearly an API / utility endpoint
           if (ftype === "profile_url") {
             const url = String(p.url ?? "");
             if (isNoisyUrl(url)) break;
           }
 
-          // ── Per-parent dedup gate (applies to every finding type) ──
-          if (shouldSkipAsDuplicate(parentNodeId, ftype, p)) {
-            break;
-          }
+          if (shouldSkipAsDuplicate(parentNodeId, ftype, p)) break;
 
-          // ── api_response: always create a new node ───────────────
+          const category = FINDING_CATEGORIES[ftype] ?? "other";
+          setFindings(prev => {
+            const entry: Finding = {
+              id:        nextFindingId(),
+              stage:     String(currentStage ?? ""),
+              type:      ftype,
+              category,
+              label:     extractLabel(ftype, p),
+              timestamp: Date.now(),
+              payload:   p as FindingPayload,
+            };
+            return [entry, ...prev].slice(0, 200);
+          });
+
           if (ftype === "api_response") {
             const url    = String(p.url ?? "");
             const label  = String(p.label ?? "");
@@ -601,36 +679,110 @@ export function useInvestigation(): UseInvestigationResult {
           break;
         }
 
+        case "pivot_start": {
+          const seed     = String(p.seed ?? "");
+          const seedType = String(p.seed_type ?? "username") as "email" | "username";
+          const depth    = Number(p.depth ?? 1);
+          setPivotDepth(prev => Math.max(prev, depth));
+          setPivots(prev => {
+            if (prev.some(x => x.seed === seed)) return prev;
+            return [...prev, { seed, seedType, depth, status: "running" }];
+          });
+          break;
+        }
+
+        case "pivot_done": {
+          const seed = String(p.seed ?? "");
+          setPivots(prev => prev.map(x =>
+            x.seed === seed ? { ...x, status: "done" as PivotStatus } : x
+          ));
+          break;
+        }
+
+        case "pivot_error": {
+          const seed = String(p.seed ?? "");
+          setPivots(prev => prev.map(x =>
+            x.seed === seed ? { ...x, status: "error" as PivotStatus } : x
+          ));
+          break;
+        }
+
+        case "pivot_skipped": {
+          const seed = String(p.seed ?? "");
+          setPivots(prev => prev.map(x =>
+            x.seed === seed ? { ...x, status: "skipped" as PivotStatus } : x
+          ));
+          break;
+        }
+
+        case "pivot_confirm_timeout": {
+          // Emitted when the confirmation window elapses without a
+          // response. We surface it in the logs so the analyst knows
+          // the pivot ran with the full seed set (server default).
+          setLogs(prev => [
+            ...prev,
+            `[pivot] confirmation window elapsed at depth ${p.depth ?? "?"} — running full seed set`,
+          ].slice(-600));
+          break;
+        }
+
         case "report_ready":
           if (p.format === "html") setReportUrl(String(p.path ?? ""));
           break;
 
-        case "stream_end":
+        case "abort": {
+          // The pipeline stopped early (user cancel or a stage aborted).
+          const reason = String(p.reason ?? "aborted");
+          setLogs(prev => [...prev, `[abort] ${reason}`].slice(-600));
+          break;
+        }
+
+        case "stream_end": {
           setProgress(100);
           setCurrentStage(null);
-          updateNode(parentNodeId, { investigating: false, progress: 100 });
+
+          const serverStatus = String(p.status ?? "done");
+          let finalStatus: InvestigationStatus;
+          if (serverStatus === "cancelled")   finalStatus = "cancelled";
+          else if (serverStatus === "error")  finalStatus = "error";
+          else                                finalStatus = "done";
+          setStatus(finalStatus);
+
+          updateNode(parentNodeId, {
+            investigating: false,
+            progress: finalStatus === "error" ? 0 : 100,
+          });
           if (p.report_url) setReportUrl(String(p.report_url));
           parentNextIndex.current.set(parentNodeId, currentIndex);
-          stop();
+
+          setRunning(false);
+          setStopping(false);
+          closeStream();
           break;
+        }
 
         case "error":
+          setStatus("error");
           updateNode(parentNodeId, { investigating: false, progress: 0 });
           setCurrentStage(null);
-          stop();
+          setRunning(false);
+          setStopping(false);
+          closeStream();
           break;
       }
     };
 
+    // Native EventSource will retry automatically. Only treat the
+    // connection as failed if it can't be re-established — the hook
+    // (not this one) tracks retry count. Here we just log.
     es.onerror = () => {
-      updateNode(parentNodeId, { investigating: false, progress: 0 });
-      setCurrentStage(null);
-      stop();
+      setLogs(prev => [...prev, "[sse] connection interrupted — retrying…"].slice(-600));
     };
-  }, [addNode, addEdge, updateNode, stop, shouldSkipAsDuplicate]);
+  }, [addNode, addEdge, updateNode, closeStream, shouldSkipAsDuplicate, currentStage]);
 
   return {
-    progress, running, jobId, reportUrl, logs, currentStage,
+    progress, running, stopping, jobId, reportUrl, logs, currentStage,
+    status, target, mode, pivotDepth, pivots, findings,
     start, stop, resetParentCounter,
   };
 }

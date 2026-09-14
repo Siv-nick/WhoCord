@@ -1,5 +1,15 @@
 // src/utils/api.ts
-import type { AppConfig, Job, PivotConfig, PivotSeed, RunParams } from "../types/investigation";
+import type {
+  AppConfig,
+  EnrichmentTestResult,
+  Job,
+  LLMConfig,
+  PivotConfig,
+  PivotSeed,
+  RunParams,
+} from "../types/investigation";
+
+export type { LLMConfig } from "../types/investigation";
 
 const BASE = "";
 
@@ -59,15 +69,85 @@ export async function savePivotConfig(pivot: PivotConfig): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Enrichment config
+// ---------------------------------------------------------------------------
+
+export interface EnrichmentPatch {
+  max_identifiers?: number;
+  phone_reveal?:    boolean;
+}
+
+export async function saveEnrichmentConfig(
+  patch: EnrichmentPatch,
+): Promise<void> {
+  const res = await fetch(`${BASE}/config`, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({ action: "set_enrichment", enrichment: patch }),
+  });
+  if (!res.ok) throw new Error(`set_enrichment ${res.status}`);
+}
+
+/**
+ * Test a stored API key against the provider's account endpoint.
+ * This never spends a credit — both providers expose a 0-cost
+ * profile/usage endpoint.
+ */
+export async function testEnrichmentProvider(
+  provider: "apollo" | "lusha",
+): Promise<EnrichmentTestResult> {
+  try {
+    const res = await fetch(`${BASE}/api/enrichment/test/${provider}`, {
+      method: "POST",
+    });
+    const body = await res.json().catch(() => ({}));
+    return body as EnrichmentTestResult;
+  } catch (err) {
+    return { ok: false, balance: null, error: String(err) };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// LLM models
+// ---------------------------------------------------------------------------
+
+export interface LLMModel {
+  id:        string;
+  owned_by:  string;
+  free?:     boolean;
+  created?:  number;
+}
+
+export interface LLMModelList {
+  models:  LLMModel[];
+  source:  "live" | "fallback";
+  reason?: string;
+}
+
+export async function fetchLLMModels(): Promise<LLMModelList> {
+  const res = await fetch(`${BASE}/api/llm/models`);
+  if (!res.ok) throw new Error(`/api/llm/models ${res.status}`);
+  return res.json();
+}
+
+/** @deprecated Use fetchLLMModels — the endpoint was renamed. */
+export async function fetchGroqModels(): Promise<LLMModelList> {
+  return fetchLLMModels();
+}
+
+export async function saveLLMConfig(llm: Partial<LLMConfig>): Promise<void> {
+  const res = await fetch(`${BASE}/config`, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({ action: "set_llm", llm }),
+  });
+  if (!res.ok) throw new Error(`set_llm ${res.status}`);
+}
+
+// ---------------------------------------------------------------------------
 // Pivot confirmation
 // ---------------------------------------------------------------------------
 
-/**
- * Send the user's approved seed list back to the waiting pipeline thread.
- *
- * @param jobId        Active job UUID
- * @param approvedSeeds  Seeds the user approved (subset of what was proposed)
- */
 export async function confirmPivot(
   jobId: string,
   approvedSeeds: PivotSeed[],
@@ -80,7 +160,31 @@ export async function confirmPivot(
 }
 
 // ---------------------------------------------------------------------------
-// Investigations – history
+// Stop investigation
+// ---------------------------------------------------------------------------
+
+export interface StopResult {
+  success: boolean;
+  job_id?: string;
+  error?:  string;
+}
+
+export async function stopInvestigation(jobId?: string): Promise<StopResult> {
+  try {
+    const res = await fetch(`${BASE}/stop`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify(jobId ? { job_id: jobId } : {}),
+    });
+    const body = await res.json().catch(() => ({} as StopResult));
+    return body as StopResult;
+  } catch (err) {
+    return { success: false, error: String(err) };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Investigations
 // ---------------------------------------------------------------------------
 
 export async function fetchInvestigations(): Promise<Job[]> {
@@ -106,12 +210,12 @@ export function investigationReportUrl(id: string): string {
 export function buildRunUrl(params: RunParams): string {
   const qs = new URLSearchParams();
   qs.set("mode", params.mode);
-  if (params.username)   qs.set("username",    params.username);
-  if (params.email)      qs.set("email",        params.email);
-  if (params.user_id)    qs.set("user_id",      params.user_id);
-  if (params.guild_id)   qs.set("guild_id",     params.guild_id);
+  if (params.username)    qs.set("username",    params.username);
+  if (params.email)       qs.set("email",        params.email);
+  if (params.user_id)     qs.set("user_id",      params.user_id);
+  if (params.guild_id)    qs.set("guild_id",     params.guild_id);
   if (params.multi_guild) qs.set("multi_guild", "1");
-  if (params.target) qs.set("target", params.target);
+  if (params.target)      qs.set("target",       params.target);
   return `${BASE}/run?${qs.toString()}`;
 }
 

@@ -17,11 +17,17 @@ Usage
         intel=ctx.intel_core.intel,
         avatar_urls=ctx.avatar_urls,
         emit=emit,
+        cancel_event=getattr(cfg, "_cancel_event", None),
     )
     # report is a plain dict – safe to store in intel_core
 
-The engine is intentionally thin: it delegates real work to the four
-sub-modules and packages results into a serialisable dict.
+Cancellation
+------------
+The engine checks ``cancel_event`` before each of the four steps. The
+most useful check is the one before step 4 — if the user hit Stop while
+the graph was being built, we skip the ~45 s Groq narrative roundtrip
+rather than burning the call. The returned report is a partial dict with
+whatever steps completed.
 """
 
 from __future__ import annotations
@@ -32,6 +38,7 @@ from .entities import BaseEntity
 from .extractor import extract_entities
 from .graph import build_graph, graph_summary
 from .correlations import run_all_detectors, Correlation
+from ..utils import log_trace
 
 # Type alias matching the pipeline emit signature
 EmitFn = Callable[[str, dict], None]
@@ -62,6 +69,7 @@ class IntelligenceEngine:
         intel: dict[str, Any],
         avatar_urls: Optional[Set[str]] = None,
         emit: EmitFn = _NOOP,
+        cancel_event: Any = None,
     ) -> dict[str, Any]:
         """
         Execute the full intelligence pipeline.
@@ -74,6 +82,13 @@ class IntelligenceEngine:
             ``InvestigationContext.avatar_urls`` – image URLs.
         emit:
             Pipeline event callback; called with structured progress events.
+        cancel_event:
+            Optional ``threading.Event``. When set, remaining steps are
+            skipped and the partial report is returned. If not supplied,
+            the engine falls back to
+            ``getattr(ctx.config, "_cancel_event", None)`` via the caller
+            (the stage already does this) — passing it explicitly here is
+            the recommended path.
 
         Returns
         -------
@@ -85,8 +100,13 @@ class IntelligenceEngine:
             - ``"graph_summary"``  – networkx graph statistics
             - ``"correlations"``   – list of correlation dicts
             - ``"narrative"``      – AI narrative dict (may be ``{}``)
+            - ``"cancelled"``      – True if the pipeline stopped early
         """
         avatar_urls = avatar_urls or set()
+        cancelled = False
+
+        def _is_cancelled() -> bool:
+            return cancel_event is not None and cancel_event.is_set()
 
         # ---------------------------------------------------------------- #
         # Step 1 – Entity extraction                                         #
@@ -112,46 +132,65 @@ class IntelligenceEngine:
         G = None
         g_summary: dict = {}
 
-        emit("progress", {"message": "Intelligence: building knowledge graph"})
-        try:
-            G = build_graph(entities)
-            g_summary = graph_summary(G)
-            print(
-                f"  Intelligence – graph: "
-                f"{g_summary.get('total_nodes', 0)} nodes, "
-                f"{g_summary.get('total_edges', 0)} edges, "
-                f"density={g_summary.get('density', 0.0):.4f}"
-            )
-        except ImportError:
-            print("  Intelligence – networkx not installed; graph step skipped.")
-        except Exception as exc:
-            print(f"  Intelligence – graph error (continuing): {exc}")
+        if _is_cancelled():
+            cancelled = True
+            print("  Intelligence – cancelled after extraction.")
+        else:
+            emit("progress", {"message": "Intelligence: building knowledge graph"})
+            try:
+                G = build_graph(entities)
+                g_summary = graph_summary(G)
+                print(
+                    f"  Intelligence – graph: "
+                    f"{g_summary.get('total_nodes', 0)} nodes, "
+                    f"{g_summary.get('total_edges', 0)} edges, "
+                    f"density={g_summary.get('density', 0.0):.4f}"
+                )
+            except ImportError:
+                print("  Intelligence – networkx not installed; graph step skipped.")
+            except Exception as exc:
+                print(f"  Intelligence – graph error (continuing): {exc}")
+                log_trace(f"IntelligenceEngine graph step failed: "
+                          f"{type(exc).__name__}: {exc}")
 
         # ---------------------------------------------------------------- #
         # Step 3 – Correlation detection                                     #
         # ---------------------------------------------------------------- #
-        emit("progress", {"message": "Intelligence: running correlation detectors"})
-        correlations: list[Correlation] = run_all_detectors(entities, G)
+        correlations: list[Correlation] = []
 
-        print(f"  Intelligence – correlations found: {len(correlations)}")
-        for c in correlations[:5]:
-            print(f"    [{c.correlation_type}] conf={c.confidence:.2f}  "
-                  f"{c.description[:80]}{'…' if len(c.description) > 80 else ''}")
+        if cancelled or _is_cancelled():
+            cancelled = True
+            print("  Intelligence – cancelled before correlation step.")
+        else:
+            emit("progress", {"message": "Intelligence: running correlation detectors"})
+            correlations = run_all_detectors(entities, G)
 
-        if correlations:
-            emit("finding", {
-                "type":         "correlations",
-                "count":        len(correlations),
-                "top_type":     correlations[0].correlation_type,
-                "top_conf":     correlations[0].confidence,
-            })
+            print(f"  Intelligence – correlations found: {len(correlations)}")
+            for c in correlations[:5]:
+                print(f"    [{c.correlation_type}] conf={c.confidence:.2f}  "
+                      f"{c.description[:80]}{'…' if len(c.description) > 80 else ''}")
+
+            if correlations:
+                emit("finding", {
+                    "type":         "correlations",
+                    "count":        len(correlations),
+                    "top_type":     correlations[0].correlation_type,
+                    "top_conf":     correlations[0].confidence,
+                })
 
         # ---------------------------------------------------------------- #
         # Step 4 – AI narrative                                             #
         # ---------------------------------------------------------------- #
         narrative: dict = {}
 
-        if self.groq_api_key:
+        if cancelled or _is_cancelled():
+            cancelled = True
+            # Skipping the narrative is the whole point of the check
+            # here — the Groq call takes up to 45 seconds and cannot be
+            # interrupted once in flight.
+            print("  Intelligence – cancelled; skipping AI narrative step.")
+            emit("progress", {"message": "Intelligence: narrative skipped (cancelled)"})
+        elif self.groq_api_key:
             emit("progress", {"message": "Intelligence: generating AI narrative"})
             try:
                 from .narrative import generate_narrative
@@ -169,6 +208,8 @@ class IntelligenceEngine:
                     print("  Intelligence – narrative returned empty (LLM parse issue).")
             except Exception as exc:
                 print(f"  Intelligence – narrative generation failed: {exc}")
+                log_trace(f"IntelligenceEngine narrative step failed: "
+                          f"{type(exc).__name__}: {exc}")
         else:
             print("  Intelligence – no Groq API key; narrative step skipped.")
 
@@ -181,6 +222,7 @@ class IntelligenceEngine:
             "graph_summary": g_summary,
             "correlations":  [c.to_dict() for c in correlations],
             "narrative":     narrative,
+            "cancelled":     cancelled,
         }
 
     # ------------------------------------------------------------------ #

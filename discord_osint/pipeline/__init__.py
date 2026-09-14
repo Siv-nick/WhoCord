@@ -7,6 +7,12 @@ Bug 12 fix: when manual mode has only an email, the mode switch is
             handled by web_app.py before dispatch. This function no
             longer silently reroutes; if it is invoked directly with
             only an email, it reports and delegates.
+
+Cancellation
+------------
+``_common_setup()`` reads ``config._cancel_event`` (set by the web layer
+for each job) and threads it into ``pipeline.run(..., cancel_event=...)``
+so a ``/stop`` POST aborts at the next stage boundary.
 """
 
 from __future__ import annotations
@@ -30,8 +36,9 @@ def _common_setup(config) -> tuple:
     pivot_config = PivotConfig.from_config(config)
     seed_queue   = SeedQueue()
 
-    emitter = getattr(config, "_phase3_emit", None)
-    return pivot_config, seed_queue, emitter
+    emitter      = getattr(config, "_phase3_emit", None)
+    cancel_event = getattr(config, "_cancel_event", None)
+    return pivot_config, seed_queue, emitter, cancel_event
 
 
 def run_osint_pipeline(config=None) -> None:
@@ -42,7 +49,7 @@ def run_osint_pipeline(config=None) -> None:
         from ..config import config as default_config
         config = default_config
 
-    pivot_config, seed_queue, emitter = _common_setup(config)
+    pivot_config, seed_queue, emitter, cancel_event = _common_setup(config)
 
     mode         = config.MODE
     manual_email = getattr(config, "MANUAL_EMAIL", "").strip() or \
@@ -124,6 +131,7 @@ def run_osint_pipeline(config=None) -> None:
         pivot_config=pivot_config,
         seed_queue=seed_queue,
         pivot_confirm_fn=confirm_fn,
+        cancel_event=cancel_event,
     )
 
     if pivot_config.enabled:
@@ -147,7 +155,7 @@ def run_module_pipeline(mode: str, config=None) -> None:
         run_osint_pipeline(config)
         return
 
-    pivot_config, seed_queue, emitter = _common_setup(config)
+    pivot_config, seed_queue, emitter, cancel_event = _common_setup(config)
 
     target_value = _resolve_target(mode, config)
     target_id    = hash(target_value) & 0x7FFFFFFF
@@ -189,6 +197,7 @@ def run_module_pipeline(mode: str, config=None) -> None:
         pivot_config=pivot_config,
         seed_queue=seed_queue,
         pivot_confirm_fn=confirm_fn,
+        cancel_event=cancel_event,
     )
 
     from .stages.reporting_stage import ReportingStage

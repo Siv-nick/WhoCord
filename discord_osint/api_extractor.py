@@ -3,6 +3,15 @@ discord_osint/api_extractor.py
 -------------------------------
 Helper for fetching, labelling, normalising, and *deriving* JSON API
 responses discovered during an investigation.
+
+Change log
+----------
+``fetch_api()`` now routes every request through
+``utils.url_safety.safe_get``, which validates the target host (and
+every redirect hop) against private / loopback / link-local / metadata
+ranges. Previously a scraped profile could point the fetcher at
+``127.0.0.1`` or ``169.254.169.254`` and the response would be folded
+into the report.
 """
 
 from __future__ import annotations
@@ -10,6 +19,8 @@ from __future__ import annotations
 import re
 from typing import Any
 from urllib.parse import urlparse
+
+from .utils.url_safety import safe_get, UnsafeURLError
 
 # ── Trace into the active debug log (safe no-op if none is set up) ──
 try:
@@ -383,6 +394,14 @@ def fetch_api(url: str, timeout: int = 6) -> dict | list | None:
 
     Every decision point is logged via ``log_trace()`` so a run with
     DEBUG on leaves an auditable trail in ``investigation_cache/debug_logs/``.
+
+    SSRF guard
+    ----------
+    Requests go through ``utils.url_safety.safe_get``, which rejects
+    private / loopback / link-local / metadata targets on the initial
+    URL and on every redirect hop. A scraped profile linking to
+    ``http://169.254.169.254/…`` or ``http://127.0.0.1:8080/admin`` is
+    dropped with a debug-log line rather than fetched.
     """
     log_trace(f"fetch_api: --> GET {url}")
 
@@ -398,8 +417,10 @@ def fetch_api(url: str, timeout: int = 6) -> dict | list | None:
     }
 
     try:
-        r = requests.get(url, headers=headers, timeout=timeout,
-                         allow_redirects=True)
+        r = safe_get(url, headers=headers, timeout=timeout)
+    except UnsafeURLError as exc:
+        log_trace(f"fetch_api: SSRF BLOCKED {url} — {exc}")
+        return None
     except Exception as exc:
         log_trace(f"fetch_api: EXCEPTION {type(exc).__name__}: {exc}")
         return None

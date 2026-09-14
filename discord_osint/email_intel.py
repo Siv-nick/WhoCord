@@ -9,6 +9,7 @@ import socket
 import hashlib
 import sys
 import shutil
+
 from . import utils
 from .utils import resilient_task, tool_available, http_session
 from .scraping import is_valid_email, is_valid_personal_email
@@ -245,18 +246,91 @@ def run_ghunt(gmail):
     return data
 
 
+# ──────────────────────────────────────────────────────────────────────
+# HaveIBeenPwned (v3 API)
+# ──────────────────────────────────────────────────────────────────────
+#
+# Change log
+# ----------
+# The old implementation called the retired v2 API and never sent the
+# authentication header that v3 requires — so it 404'd or 401'd and the
+# function always returned ``[]``. From the UI, "HIBP ran and found no
+# breaches" was indistinguishable from "HIBP was never actually usable."
+#
+# This version:
+#   • uses the v3 endpoint
+#   • sends ``hibp-api-key`` and the User-Agent HIBP requires
+#   • distinguishes "no breaches" (200 with empty body / 404) from
+#     "check could not be performed" (missing key, auth error, network)
+#   • returns ``None`` on failure so callers can log it honestly
+#
+# Return contract
+# ---------------
+#   list[dict]  – breaches found (may be empty = "no breaches")
+#   None        – the check could not be performed
+#
+_HIBP_API_URL = "https://haveibeenpwned.com/api/v3/breachedaccount/{email}"
+
+
 def check_hibp(email):
-    headers = {"User-Agent": "Mozilla/5.0"}
+    """
+    Query HaveIBeenPwned v3 for breaches affecting *email*.
+
+    Returns a list of breach dicts (possibly empty) on success, or
+    ``None`` when the check could not be performed — no API key, invalid
+    key, rate-limited, or network failure.
+    """
+    api_key = getattr(_config_module, "HIBP_API_KEY", "") or ""
+    if not api_key:
+        print("  HIBP: no API key configured (set HIBP_API_KEY) – skipping.")
+        return None
+
+    headers = {
+        # HIBP requires a descriptive User-Agent; a bare "Mozilla/5.0" is
+        # accepted but they prefer a tool identifier.
+        "User-Agent":   "WhoCord-OSINT/1.1",
+        "hibp-api-key": api_key,
+        "Accept":       "application/json",
+    }
+    params = {"truncateResponse": "false"}
+
     try:
         r = http_session.get(
-            f"https://haveibeenpwned.com/api/v2/breachedaccount/{email}",
-            headers=headers, timeout=10,
+            _HIBP_API_URL.format(email=email),
+            headers=headers, params=params, timeout=15,
         )
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
-    return []
+    except Exception as exc:
+        print(f"  HIBP: network error ({type(exc).__name__}: {exc})")
+        return None
+
+    # 200 → breaches found (JSON list)
+    if r.status_code == 200:
+        try:
+            data = r.json()
+            return data if isinstance(data, list) else []
+        except Exception:
+            print("  HIBP: 200 OK but response was not valid JSON.")
+            return None
+
+    # 404 → the account is not in any breach (valid "no breaches" result)
+    if r.status_code == 404:
+        return []
+
+    # 401 / 403 → key is missing, invalid, or lacks the required scope
+    if r.status_code in (401, 403):
+        print(f"  HIBP: authentication failed (HTTP {r.status_code}) — "
+              f"check HIBP_API_KEY.")
+        return None
+
+    # 429 → rate limited; caller can retry later
+    if r.status_code == 429:
+        retry_after = r.headers.get("Retry-After", "?")
+        print(f"  HIBP: rate limited (HTTP 429, Retry-After={retry_after}).")
+        return None
+
+    # Anything else
+    print(f"  HIBP: unexpected HTTP {r.status_code} — {r.text[:120]!r}")
+    return None
 
 
 def check_emailrep(email):
@@ -395,7 +469,8 @@ def enrich_email(
                 "breaches", f"holehe_{email}",
                 {"used_on": sites}, source="holehe",
             )
-            emit("finding", {"type": "holehe", "email": email, "sites": sites, "count": len(sites)})
+            emit("finding", {"type": "holehe", "email": email,
+                             "sites": sites, "count": len(sites)})
 
     # --- h8mail ---
     if cfg.ENABLE_H8MAIL:
@@ -405,11 +480,19 @@ def enrich_email(
             emit("finding", {"type": "h8mail", "email": email, "result": h8})
 
     # --- HIBP ---
+    # check_hibp returns None when the check could not be performed
+    # (no key, invalid key, network, rate limit). Distinguishing that
+    # from an empty list means the UI and the report can say "not
+    # checked" rather than the misleading "no breaches found".
     if cfg.ENABLE_HIBP:
-        hibp = check_hibp(email) or []
-        if hibp:
+        hibp = check_hibp(email)
+        if hibp is None:
+            print(f"  HIBP: no result for {email} — check skipped or failed.")
+        elif hibp:
             ctx.intel_core.add_intel("breaches", f"hibp_{email}", hibp, source="hibp")
             emit("finding", {"type": "hibp", "email": email, "breaches": len(hibp)})
+        else:
+            print(f"  HIBP: {email} not found in any breach.")
 
     # --- EmailRep ---
     if cfg.ENABLE_EMAILREP:
@@ -431,14 +514,19 @@ def enrich_email(
                 if avatar:
                     socid["image"] = avatar
                 socid["name"] = gh.get("name") or email
-                for field, label in [("gaia_id", "Gaia ID"), ("last_profile_edit", "Last Profile Edit")]:
+                for field, label in [("gaia_id", "Gaia ID"),
+                                     ("last_profile_edit", "Last Profile Edit")]:
                     if gh.get(field):
                         socid[field] = str(gh[field])
                 if gh.get("user_types") and isinstance(gh["user_types"], list):
                     socid["user_types"] = ", ".join(gh["user_types"])
                 if gh.get("activated_services") and isinstance(gh["activated_services"], list):
                     socid["services"] = ", ".join(gh["activated_services"])
-                for flat_key, display in [("maps_reviews", "reviews"), ("maps_answers", "answers"), ("maps_profile", "maps_profile")]:
+                for flat_key, display in [
+                    ("maps_reviews", "reviews"),
+                    ("maps_answers", "answers"),
+                    ("maps_profile", "maps_profile"),
+                ]:
                     if gh.get(flat_key):
                         socid[display] = str(gh[flat_key])
                 ctx.intel_core.add_intel(
@@ -452,12 +540,14 @@ def enrich_email(
     if getattr(cfg, "ENABLE_EMAIL_VERIFY", False):
         vrf = verify_email_smtp_advanced(email)
         if vrf:
-            ctx.intel_core.add_intel("email_verification", f"verify_{email}", vrf, source="smtp_verify")
+            ctx.intel_core.add_intel("email_verification", f"verify_{email}",
+                                     vrf, source="smtp_verify")
 
     # --- Gravatar ---
     grav_url = gravatar_lookup(email)
     if grav_url:
-        ctx.intel_core.add_intel("social_profiles", f"gravatar_{email}", grav_url, source="gravatar")
+        ctx.intel_core.add_intel("social_profiles", f"gravatar_{email}",
+                                 grav_url, source="gravatar")
         ctx.add_avatar(grav_url)
         emit("finding", {"type": "gravatar", "email": email, "url": grav_url})
 
@@ -465,7 +555,8 @@ def enrich_email(
     if cfg.ENABLE_SCYLLA:
         scylla_data = run_scylla(email)
         if scylla_data:
-            ctx.intel_core.add_intel("breaches", f"scylla_{email}", scylla_data, source="scylla")
+            ctx.intel_core.add_intel("breaches", f"scylla_{email}",
+                                     scylla_data, source="scylla")
             emit("finding", {"type": "scylla", "email": email})
 
     # --- Blackbird email search + API fetch ---
@@ -484,11 +575,18 @@ def enrich_email(
                     )
                     try:
                         import requests
-                        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-                        if resp.status_code == 200 and "application/json" in resp.headers.get("Content-Type", ""):
+                        resp = requests.get(
+                            url,
+                            headers={"User-Agent": "Mozilla/5.0"},
+                            timeout=10,
+                        )
+                        if (resp.status_code == 200
+                                and "application/json" in resp.headers.get("Content-Type", "")):
                             data = resp.json()
                             key = f"blackbird_api_{url[:60]}/socid_raw"
-                            ctx.intel_core.add_intel("social_profiles", key, json.dumps(data), source="blackbird_api")
+                            ctx.intel_core.add_intel("social_profiles", key,
+                                                     json.dumps(data),
+                                                     source="blackbird_api")
                     except Exception:
                         pass
         except Exception:
@@ -502,7 +600,9 @@ def enrich_email(
             for acc in mosint_data.get("data", []):
                 url = acc.get("url") or acc.get("profile_url")
                 if url and url.startswith("http"):
-                    ctx.intel_core.add_intel("social_profiles", f"mosint_{url[:60]}", url, source="mosint")
+                    ctx.intel_core.add_intel("social_profiles",
+                                             f"mosint_{url[:60]}", url,
+                                             source="mosint")
 
     # --- Feed any discovered URLs into all_urls for scraping ---
     discovered_urls = [e["url"] for e in ctx.discovery if e.get("url")]

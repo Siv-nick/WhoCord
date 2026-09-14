@@ -3,13 +3,25 @@ discord_osint/pipeline/stages/email_investigation.py
 ------------------------------------------------------
 EmailInvestigationStage – Phase 4 standalone email investigation module.
 
-Bug 1 fix:  _fetch_and_store_api_data now takes `emit` and correctly
-            forwards the API response as an `api_response` finding.
+Changes in this revision
+------------------------
+- HIBP: ``check_hibp()`` now returns ``None`` when the check could not
+  be performed (no key, auth failure, rate limit, network error) versus
+  ``[]`` for a genuine "not found in any breach." This stage distinguishes
+  the two in both stdout and the emitted findings, so an analyst isn't
+  misled into thinking a target has no breach exposure when the check
+  simply never ran.
+- Blackbird API fetch routed through ``utils.url_safety.safe_get`` so a
+  scraped profile URL can't SSRF the runner into a metadata service.
+- Bug 1 fix (retained): ``_fetch_and_store_api_data`` takes ``emit`` and
+  forwards ``api_response`` findings to the frontend.
 """
 
 from __future__ import annotations
 import json
+
 from ...utils.mosint_wrapper import run_mosint
+from ...utils.url_safety import safe_get, UnsafeURLError
 from ..base import Stage, EmitFn
 from ..context import InvestigationContext
 from ...scraping import is_valid_email
@@ -61,8 +73,10 @@ class EmailInvestigationStage(Stage):
                         "breaches", f"holehe_{email}",
                         {"used_on": sites}, source="holehe",
                     )
-                    emit("finding", {"type": "holehe", "email": email, "sites": sites, "count": len(sites)})
-                    print(f"  Holehe: {email} registered on {len(sites)} site(s): {', '.join(sites[:5])}")
+                    emit("finding", {"type": "holehe", "email": email,
+                                     "sites": sites, "count": len(sites)})
+                    print(f"  Holehe: {email} registered on {len(sites)} site(s): "
+                          f"{', '.join(sites[:5])}")
                 else:
                     print("  Holehe: no registrations found.")
             except Exception as exc:
@@ -75,9 +89,10 @@ class EmailInvestigationStage(Stage):
             try:
                 h8 = run_h8mail(email)
                 if h8:
-                    ctx.intel_core.add_intel("breaches", f"h8mail_{email}", h8, source="h8mail")
+                    ctx.intel_core.add_intel("breaches", f"h8mail_{email}",
+                                             h8, source="h8mail")
                     emit("finding", {"type": "h8mail", "email": email, "result": h8})
-                    print(f"  h8mail: breach data found.")
+                    print("  h8mail: breach data found.")
                 else:
                     print("  h8mail: no breach data.")
             except Exception as exc:
@@ -88,13 +103,32 @@ class EmailInvestigationStage(Stage):
             print("\n-- HIBP (HaveIBeenPwned) --")
             emit("progress", {"message": "Checking HaveIBeenPwned", "tool": "hibp"})
             try:
-                hibp = check_hibp(email) or []
-                if hibp:
-                    ctx.intel_core.add_intel("breaches", f"hibp_{email}", hibp, source="hibp")
-                    emit("finding", {"type": "hibp", "email": email, "breaches": len(hibp)})
+                hibp = check_hibp(email)
+
+                if hibp is None:
+                    # The check could not be performed — missing key,
+                    # auth failure, rate limit, or network. Distinct from
+                    # "not found in any breach".
+                    print("  HIBP: check could not be completed "
+                          "(see log line above for the reason).")
+                    emit("finding", {
+                        "type":   "hibp_skipped",
+                        "email":  email,
+                        "reason": "check could not be performed",
+                    })
+
+                elif hibp:
+                    ctx.intel_core.add_intel("breaches", f"hibp_{email}",
+                                             hibp, source="hibp")
+                    emit("finding", {"type": "hibp", "email": email,
+                                     "breaches": len(hibp)})
                     print(f"  HIBP: {len(hibp)} breach(es) found.")
+
                 else:
+                    # Confirmed: the address is not in any known breach.
                     print("  HIBP: no breaches.")
+                    emit("finding", {"type": "hibp", "email": email, "breaches": 0})
+
             except Exception as exc:
                 print(f"  HIBP error: {exc}")
 
@@ -107,7 +141,7 @@ class EmailInvestigationStage(Stage):
                 if rep:
                     ctx.intel_core.add_intel("emailrep", email, rep, source="emailrep")
                     emit("finding", {"type": "emailrep", "email": email, "data": rep})
-                    print(f"  EmailRep: data retrieved.")
+                    print("  EmailRep: data retrieved.")
             except Exception as exc:
                 print(f"  EmailRep error: {exc}")
 
@@ -120,7 +154,7 @@ class EmailInvestigationStage(Stage):
                 if gh:
                     ctx.intel_core.add_intel("ghunt", email, gh, source="ghunt")
                     emit("finding", {"type": "ghunt", "email": email, **gh})
-                    print(f"  GHunt: data retrieved.")
+                    print("  GHunt: data retrieved.")
 
                     socid = {}
                     if isinstance(gh, dict):
@@ -200,7 +234,7 @@ class EmailInvestigationStage(Stage):
                         "breaches", f"scylla_{email}", scylla_data, source="scylla"
                     )
                     emit("finding", {"type": "scylla", "email": email})
-                    print(f"  Scylla: data found.")
+                    print("  Scylla: data found.")
             except Exception as exc:
                 print(f"  Scylla error: {exc}")
 
@@ -313,15 +347,18 @@ class EmailInvestigationStage(Stage):
         emit: EmitFn,
     ) -> None:
         """
-        Bug 1 fix: `emit` is now a real parameter, so the api_response
-        finding actually reaches the frontend instead of raising NameError.
+        Fetch JSON from *url* and store it. Guarded by the SSRF check in
+        ``url_safety.safe_get`` so a scraped profile URL cannot point at
+        an internal address.
+
+        Bug 1 fix (retained): ``emit`` is a real parameter, so the
+        ``api_response`` finding actually reaches the frontend.
         """
-        import requests
         headers = {"User-Agent": "Mozilla/5.0"}
         try:
-            r = requests.get(url, headers=headers, timeout=10)
-            if (r.status_code == 200 and
-                    "application/json" in r.headers.get("Content-Type", "").lower()):
+            r = safe_get(url, timeout=10, headers=headers)
+            if (r.status_code == 200
+                    and "application/json" in r.headers.get("Content-Type", "").lower()):
                 data = r.json()
                 key = f"blackbird_api_{url[:60]}/socid_raw"
                 ctx.intel_core.add_intel(
@@ -340,5 +377,7 @@ class EmailInvestigationStage(Stage):
                     f"    API fetch failed for {url[:60]}: "
                     f"status {r.status_code}, content-type {r.headers.get('Content-Type')}"
                 )
+        except UnsafeURLError as exc:
+            print(f"    API fetch blocked for {url[:60]}: {exc}")
         except Exception as e:
             print(f"    API fetch error for {url[:60]}: {e}")

@@ -1,14 +1,18 @@
 """
-Flask web application – WhoCord Canvas update.
+Flask web application – WhoCord Canvas.
 
-Fixes applied
--------------
-- Bug 4:  MANUAL_* / MODE / TARGET_* fields now persist via ConfigService.
-- Bug 6:  Stdout capture is thread-safe via a per-thread _StdoutRouter.
-- Bug 7:  Job scanning parses report filenames with a regex so targets
-          containing underscores are handled correctly.
-- Bug 12: Manual mode with only an email is re-classified as "email" mode
-          before dispatch, so the job label and pipeline match.
+Changes in this revision
+------------------------
+- LLM provider is now selectable: ``LLM_PROVIDER`` config key accepts
+  ``"groq"`` (default) or ``"openrouter"``.
+- ``/api/llm/models`` replaces ``/api/groq/models``.
+- ``_build_chat_context()`` splits the intel budget between canvas and
+  intel dumps.
+- Contact-enrichment: two new token keys (APOLLO_API_KEY, LUSHA_API_KEY)
+  flow through the existing ``set_token`` action; ``set_enrichment``
+  persists the enrichment cap and phone-reveal toggle; the new
+  ``/api/enrichment/test/<provider>`` endpoint validates a stored key
+  without spending a credit.
 """
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ from flask import (
     request, send_from_directory, stream_with_context,
 )
 
-from discord_osint.config_service import ConfigService
+from discord_osint.config_service import ConfigService, get_llm_endpoint
 from discord_osint.pipeline.events import EventEmitter, to_sse_line
 from discord_osint.utils import CACHE_DIR, upgrade_tools
 from discord_osint.utils.sanitizers import (
@@ -44,14 +48,14 @@ config_service = ConfigService()
 _MODULE_MODES = frozenset({"email", "domain", "phone", "image", "url", "probe"})
 _ALL_MODES    = frozenset({"manual", "discord"}) | _MODULE_MODES
 
+_ENRICHMENT_TOKEN_KEYS = ("APOLLO_API_KEY", "LUSHA_API_KEY")
+
 
 # ---------------------------------------------------------------------------
-# Bug 6: thread-safe stdout capture
+# Thread-safe stdout capture
 # ---------------------------------------------------------------------------
 
 class _StdoutCapture:
-    """Per-request line-buffered writer that pushes events into a queue."""
-
     def __init__(self, event_queue: queue.Queue) -> None:
         self._q   = event_queue
         self._buf = ""
@@ -75,12 +79,6 @@ class _StdoutCapture:
 
 
 class _StdoutRouter:
-    """
-    A single global proxy for sys.stdout that dispatches to a
-    per-thread capture stream when one is installed, falling back to
-    the original stdout otherwise.
-    """
-
     def __init__(self) -> None:
         self._local    = threading.local()
         self._original = sys.stdout
@@ -113,22 +111,25 @@ class _StdoutRouter:
 
 
 _STDOUT_ROUTER = _StdoutRouter()
-sys.stdout = _STDOUT_ROUTER   # install once, globally
+sys.stdout = _STDOUT_ROUTER
 
 
 # ---------------------------------------------------------------------------
-# Job registry + pivot confirmation slots
+# Job registry
 # ---------------------------------------------------------------------------
 
 _JOBS: dict[str, dict] = {}
 _JOBS_LOCK = threading.Lock()
+
+_CANCEL_EVENTS: dict[str, threading.Event] = {}
+_WORKER_THREADS: dict[str, threading.Thread] = {}
+
 REPORT_HTML: str | None = None
 
 _PIVOT_RESPONSES: dict[str, dict] = {}
 _PIVOT_LOCK            = threading.Lock()
 _PIVOT_CONFIRM_TIMEOUT = 45
 
-# Bug 7: robust filename parsing
 _REPORT_FILE_RE = re.compile(r"^report_(.+)_(\d{8}_\d{6})\.html$")
 
 
@@ -164,8 +165,9 @@ def _scan_existing_jobs() -> None:
 
 _scan_existing_jobs()
 
+
 # ---------------------------------------------------------------------------
-# React SPA serving
+# SPA serving
 # ---------------------------------------------------------------------------
 
 _FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "frontend", "dist")
@@ -191,7 +193,8 @@ def react_assets(filename):
 
 @app.route("/<path:path>")
 def serve_react(path):
-    skip = ("api/", "run", "config", "get_config", "stop", "report", "upgrade", "shutdown")
+    skip = ("api/", "run", "config", "get_config", "stop", "report",
+            "upgrade", "shutdown")
     if any(path.startswith(p) for p in skip):
         return jsonify({"error": "not found"}), 404
     candidate = os.path.join(_FRONTEND_DIST, path)
@@ -203,7 +206,7 @@ def serve_react(path):
 
 
 # ---------------------------------------------------------------------------
-# Mode validation
+# Mode validation + per-module sanitisers
 # ---------------------------------------------------------------------------
 
 def validate_mode_extended(raw: str) -> str:
@@ -212,10 +215,6 @@ def validate_mode_extended(raw: str) -> str:
         return mode
     raise ValueError(f"Invalid mode {raw!r}. Valid: {sorted(_ALL_MODES)}")
 
-
-# ---------------------------------------------------------------------------
-# Per-module input sanitisers
-# ---------------------------------------------------------------------------
 
 def _sanitize_phone(raw: str) -> str:
     return re.sub(r"[^\d\+\-\s\(\)]", "", raw.strip())[:20]
@@ -242,12 +241,7 @@ def _sanitize_probe(raw: str) -> str:
 
 @app.route("/get_config")
 def get_config():
-    tokens = {
-        "DISCORD_TOKEN":     bool(config_service.discord_token),
-        "GITHUB_TOKEN":      bool(config_service.github_token),
-        "GROQ_API_KEY":      bool(config_service.groq_api_key),
-        "INSTAGRAM_SESSION": bool(config_service.instagram_session),
-    }
+    tokens = config_service.token_status()
     pivot_cfg = {
         "enabled":         bool(getattr(config_service, "ENABLE_PIVOTING",       False)),
         "pivot_email":     bool(getattr(config_service, "PIVOT_EMAIL",           True)),
@@ -256,56 +250,361 @@ def get_config():
         "max_seeds":       int( getattr(config_service, "PIVOT_MAX_SEEDS",       5)),
         "require_confirm": bool(getattr(config_service, "PIVOT_REQUIRE_CONFIRM", False)),
     }
+    llm_cfg = {
+        "provider":           config_service.llm_provider,
+        "model":              config_service.llm_model,
+        "temperature":        config_service.llm_temperature,
+        "max_tokens":         config_service.llm_max_tokens,
+        "system_prompt":      config_service.llm_system_prompt,
+        "intel_budget":       config_service.llm_intel_budget,
+        "intel_include_raw":  config_service.llm_intel_include_raw,
+        "intel_exclude_meta": config_service.llm_intel_exclude_meta,
+    }
+    enrichment_cfg = {
+        "max_identifiers": config_service.enrichment_max_identifiers,
+        "phone_reveal":    config_service.enrichment_phone_reveal,
+        "enabled": {
+            "apollo": config_service.enable_apollo,
+            "lusha":  config_service.enable_lusha,
+        },
+        "keys_stored": {
+            "apollo": bool(config_service.apollo_api_key),
+            "lusha":  bool(config_service.lusha_api_key),
+        },
+    }
     return jsonify({
-        "tokens": tokens, "tools": config_service.tools_list(),
-        "mode": config_service.mode,
+        "tokens": tokens,
+        "tools":  config_service.tools_list(),
+        "mode":   config_service.mode,
         "multi_guild_search": config_service.multi_guild_search,
-        "debug": config_service.debug, "pivot": pivot_cfg,
+        "debug":  config_service.debug,
+        "pivot":  pivot_cfg,
+        "llm":    llm_cfg,
+        "enrichment": enrichment_cfg,
     })
+
+
+def _apply_pivot_nested(pivot: dict) -> None:
+    setattr(config_service, "ENABLE_PIVOTING",
+            bool(pivot.get("enabled",        False)))
+    setattr(config_service, "PIVOT_EMAIL",
+            bool(pivot.get("pivot_email",     True)))
+    setattr(config_service, "PIVOT_USERNAME",
+            bool(pivot.get("pivot_username",  True)))
+    setattr(config_service, "PIVOT_MAX_DEPTH",
+            int( pivot.get("max_depth",       3)))
+    setattr(config_service, "PIVOT_MAX_SEEDS",
+            int( pivot.get("max_seeds",       5)))
+    setattr(config_service, "PIVOT_REQUIRE_CONFIRM",
+            bool(pivot.get("require_confirm", False)))
+
+
+def _apply_pivot_flat(data: dict) -> None:
+    nested = {
+        "enabled":         data.get("ENABLE_PIVOTING",       False),
+        "pivot_email":     data.get("PIVOT_EMAIL",           True),
+        "pivot_username":  data.get("PIVOT_USERNAME",        True),
+        "max_depth":       data.get("PIVOT_MAX_DEPTH",       3),
+        "max_seeds":       data.get("PIVOT_MAX_SEEDS",       5),
+        "require_confirm": data.get("PIVOT_REQUIRE_CONFIRM", False),
+    }
+    _apply_pivot_nested(nested)
 
 
 @app.route("/config", methods=["POST"])
 def config_endpoint():
-    data = request.get_json()
+    data = request.get_json(silent=True)
     if not data:
         return jsonify({"success": False, "error": "no data"})
+
     action = data.get("action")
 
     if action == "set_token":
         key = data.get("key")
-        if key in ("DISCORD_TOKEN", "GITHUB_TOKEN", "GROQ_API_KEY", "INSTAGRAM_SESSION"):
+        if key in ("DISCORD_TOKEN", "GITHUB_TOKEN", "GROQ_API_KEY",
+                   "OPENROUTER_API_KEY", "INSTAGRAM_SESSION", "HIBP_API_KEY",
+                   "APOLLO_API_KEY", "LUSHA_API_KEY"):
             config_service.set_sensitive(key, data.get("value", ""))
             return jsonify({"success": True})
         return jsonify({"success": False, "error": "invalid key"})
-    elif action == "toggle_tool":
+
+    if action == "toggle_tool":
         config_service.set_tool(data.get("key"), bool(data.get("enable", True)))
         return jsonify({"success": True})
-    elif action == "set_mode":
+
+    if action == "set_mode":
         config_service.mode = data.get("mode", "manual")
         config_service.save()
         return jsonify({"success": True})
-    elif action == "set_multi_guild":
+
+    if action == "set_multi_guild":
         config_service.multi_guild_search = bool(data.get("multi", False))
         config_service.save()
         return jsonify({"success": True})
-    elif action == "toggle_debug":
+
+    if action == "toggle_debug":
         config_service.debug = not config_service.debug
         config_service.save()
         return jsonify({"success": True, "debug": config_service.debug})
-    elif action == "set_pivot":
-        pivot = data.get("pivot", {})
-        setattr(config_service, "ENABLE_PIVOTING",       bool(pivot.get("enabled",        False)))
-        setattr(config_service, "PIVOT_EMAIL",           bool(pivot.get("pivot_email",     True)))
-        setattr(config_service, "PIVOT_USERNAME",        bool(pivot.get("pivot_username",  True)))
-        setattr(config_service, "PIVOT_MAX_DEPTH",       int( pivot.get("max_depth",       3)))
-        setattr(config_service, "PIVOT_MAX_SEEDS",       int( pivot.get("max_seeds",       5)))
-        setattr(config_service, "PIVOT_REQUIRE_CONFIRM", bool(pivot.get("require_confirm", False)))
+
+    if action == "set_pivot":
+        _apply_pivot_nested(data.get("pivot", {}) or {})
         try:
             config_service.save()
-        except Exception:
-            pass
+        except Exception as exc:
+            return jsonify({"success": False, "error": str(exc)})
         return jsonify({"success": True})
+
+    if action == "set_pivot_config":
+        _apply_pivot_flat(data)
+        try:
+            config_service.save()
+        except Exception as exc:
+            return jsonify({"success": False, "error": str(exc)})
+        return jsonify({"success": True})
+
+    if action == "set_enrichment":
+        enr = data.get("enrichment", {}) or {}
+        if "max_identifiers" in enr:
+            try:
+                config_service.enrichment_max_identifiers = int(enr["max_identifiers"])
+            except (TypeError, ValueError):
+                pass
+        if "phone_reveal" in enr:
+            config_service.enrichment_phone_reveal = bool(enr["phone_reveal"])
+        try:
+            config_service.save()
+        except Exception as exc:
+            return jsonify({"success": False, "error": str(exc)})
+        return jsonify({"success": True})
+
+    if action == "set_llm":
+        llm = data.get("llm", {}) or {}
+        if "provider" in llm:
+            config_service.llm_provider = str(llm["provider"])
+        if "model" in llm:
+            config_service.llm_model = str(llm["model"]).strip()
+        if "temperature" in llm:
+            config_service.llm_temperature = float(llm["temperature"])
+        if "max_tokens" in llm:
+            config_service.llm_max_tokens = int(llm["max_tokens"])
+        if "system_prompt" in llm:
+            config_service.llm_system_prompt = str(llm["system_prompt"])
+        if "intel_budget" in llm:
+            config_service.llm_intel_budget = int(llm["intel_budget"])
+        if "intel_include_raw" in llm:
+            config_service.llm_intel_include_raw = bool(llm["intel_include_raw"])
+        if "intel_exclude_meta" in llm:
+            config_service.llm_intel_exclude_meta = bool(llm["intel_exclude_meta"])
+        try:
+            config_service.save()
+        except Exception as exc:
+            return jsonify({"success": False, "error": str(exc)})
+        return jsonify({"success": True})
+
     return jsonify({"success": False, "error": "unknown action"})
+
+
+# ---------------------------------------------------------------------------
+# LLM model discovery
+# ---------------------------------------------------------------------------
+
+_GROQ_FALLBACK_MODELS = [
+    {"id": "llama-3.1-8b-instant",                             "owned_by": "groq", "free": True},
+    {"id": "llama-3.3-70b-versatile",                          "owned_by": "groq", "free": True},
+    {"id": "meta-llama/llama-4-maverick-17b-128e-instruct",    "owned_by": "groq", "free": True},
+    {"id": "meta-llama/llama-4-scout-17b-16e-instruct",        "owned_by": "groq", "free": True},
+    {"id": "openai/gpt-oss-120b",                              "owned_by": "groq", "free": True},
+    {"id": "openai/gpt-oss-20b",                               "owned_by": "groq", "free": True},
+    {"id": "qwen/qwen3-32b",                                   "owned_by": "groq", "free": True},
+    {"id": "moonshotai/kimi-k2-instruct",                      "owned_by": "groq", "free": True},
+    {"id": "gemma2-9b-it",                                     "owned_by": "groq", "free": True},
+    {"id": "groq/compound",                                    "owned_by": "groq", "free": True},
+    {"id": "groq/compound-mini",                               "owned_by": "groq", "free": True},
+]
+
+_OPENROUTER_FALLBACK_MODELS = [
+    {"id": "deepseek/deepseek-chat-v3.1:free",              "owned_by": "deepseek", "free": True},
+    {"id": "deepseek/deepseek-r1:free",                     "owned_by": "deepseek", "free": True},
+    {"id": "google/gemini-2.0-flash-exp:free",              "owned_by": "google",   "free": True},
+    {"id": "qwen/qwen3-coder:free",                         "owned_by": "qwen",     "free": True},
+    {"id": "meta-llama/llama-3.3-70b-instruct:free",        "owned_by": "meta",     "free": True},
+    {"id": "mistralai/mistral-7b-instruct:free",            "owned_by": "mistral",  "free": True},
+]
+
+_OPENROUTER_CURATED_PAID = {
+    "openai/gpt-4o-mini",
+    "openai/gpt-4o",
+    "anthropic/claude-3.5-sonnet",
+    "google/gemini-2.0-flash-001",
+    "deepseek/deepseek-chat",
+}
+
+
+def _fetch_models_for_provider() -> dict:
+    import requests as _req
+
+    provider = config_service.llm_provider
+
+    if provider == "openrouter":
+        key = config_service.openrouter_api_key or ""
+        headers = {"Accept": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+
+        try:
+            resp = _req.get(
+                "https://openrouter.ai/api/v1/models",
+                headers=headers, timeout=12,
+            )
+            if resp.status_code != 200:
+                return {
+                    "models": _OPENROUTER_FALLBACK_MODELS,
+                    "source": "fallback",
+                    "reason": f"OpenRouter returned HTTP {resp.status_code}",
+                }
+
+            payload = resp.json()
+            raw     = payload.get("data", []) or []
+
+            models: list[dict] = []
+            for m in raw:
+                if not isinstance(m, dict):
+                    continue
+                mid = m.get("id", "")
+                if not mid:
+                    continue
+                pricing = m.get("pricing") or {}
+                is_free = (
+                    mid.endswith(":free")
+                    or (str(pricing.get("prompt", "")) in ("0", "0.0")
+                        and str(pricing.get("completion", "")) in ("0", "0.0"))
+                )
+                if not is_free and mid not in _OPENROUTER_CURATED_PAID:
+                    continue
+                models.append({
+                    "id":       mid,
+                    "owned_by": mid.split("/")[0] if "/" in mid else "openrouter",
+                    "free":     is_free,
+                })
+
+            models.sort(key=lambda m: (not m["free"], m["id"]))
+            return {"models": models, "source": "live"}
+
+        except Exception as exc:
+            return {
+                "models": _OPENROUTER_FALLBACK_MODELS,
+                "source": "fallback",
+                "reason": str(exc),
+            }
+
+    key = config_service.groq_api_key or ""
+    if not key:
+        return {
+            "models": _GROQ_FALLBACK_MODELS,
+            "source": "fallback",
+            "reason": "GROQ_API_KEY not configured",
+        }
+
+    try:
+        resp = _req.get(
+            "https://api.groq.com/openai/v1/models",
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Accept":        "application/json",
+            },
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return {
+                "models": _GROQ_FALLBACK_MODELS,
+                "source": "fallback",
+                "reason": f"Groq returned HTTP {resp.status_code}",
+            }
+
+        payload = resp.json()
+        raw     = payload.get("data", []) or []
+        models = [
+            {
+                "id":       m.get("id", ""),
+                "owned_by": m.get("owned_by", "groq"),
+                "free":     True,
+            }
+            for m in raw
+            if isinstance(m, dict) and m.get("id")
+        ]
+        models.sort(key=lambda m: m["id"])
+        return {"models": models, "source": "live"}
+
+    except Exception as exc:
+        return {
+            "models": _GROQ_FALLBACK_MODELS,
+            "source": "fallback",
+            "reason": str(exc),
+        }
+
+
+@app.route("/api/llm/models", methods=["GET"])
+def api_llm_models():
+    return jsonify(_fetch_models_for_provider())
+
+
+@app.route("/api/groq/models", methods=["GET"])
+def api_groq_models():
+    return jsonify(_fetch_models_for_provider())
+
+
+# ---------------------------------------------------------------------------
+# Contact-enrichment provider test
+# ---------------------------------------------------------------------------
+
+@app.route("/api/enrichment/test/<provider>", methods=["POST"])
+def enrichment_test(provider: str):
+    """
+    Validate that the stored key works and, when the provider exposes it,
+    report the remaining credit balance. Never spends a credit — both
+    providers offer a 0-cost account/profile endpoint.
+    """
+    provider = (provider or "").strip().lower()
+
+    if provider == "apollo":
+        key = config_service.apollo_api_key
+        if not key:
+            return jsonify({
+                "ok": False, "balance": None,
+                "error": "No Apollo API key stored.",
+            }), 400
+        try:
+            from discord_osint.enrichment.apollo_client import ApolloClient
+            client = ApolloClient(key)
+            result = client.test_connection()
+            return jsonify(result)
+        except Exception as exc:
+            return jsonify({
+                "ok": False, "balance": None, "error": str(exc),
+            }), 500
+
+    if provider == "lusha":
+        key = config_service.lusha_api_key
+        if not key:
+            return jsonify({
+                "ok": False, "balance": None,
+                "error": "No Lusha API key stored.",
+            }), 400
+        try:
+            from discord_osint.enrichment.lusha_client import LushaClient
+            client = LushaClient(key)
+            result = client.test_connection()
+            return jsonify(result)
+        except Exception as exc:
+            return jsonify({
+                "ok": False, "balance": None, "error": str(exc),
+            }), 500
+
+    return jsonify({
+        "ok": False, "balance": None,
+        "error": f"Unknown provider: {provider}",
+    }), 404
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +646,6 @@ def run():
             config_service.save()
             target_label = username or email
 
-            # Bug 12: re-classify when only email is supplied
             if not username and email:
                 mode         = "email"
                 target_label = email
@@ -402,15 +700,19 @@ def run():
             config_service.mode         = "probe"
             target_label                = probe[:60]
 
-    except (ValueError, Exception) as exc:
+    except Exception as exc:
         return f"Validation error: {exc}", 400
 
+    cancel_event = threading.Event()
     with _JOBS_LOCK:
         _JOBS[job_id] = {
             "id": job_id, "target": target_label, "mode": mode,
             "started_at": datetime.utcnow().isoformat(), "status": "running",
             "report_html": None, "intel_path": None,
+            "cancel_event": cancel_event,
         }
+    _CANCEL_EVENTS[job_id] = cancel_event
+
     with _PIVOT_LOCK:
         _PIVOT_RESPONSES[job_id] = {
             "event": threading.Event(), "pending_seeds": [], "approved": None,
@@ -446,12 +748,16 @@ def run():
             approved_values = {e["value"] for e in slot["approved"]}
             return [(s, t) for s, t in seeds if s in approved_values]
 
-        require_confirm            = bool(getattr(config_service, "PIVOT_REQUIRE_CONFIRM", False))
-        active_confirm_fn          = _confirm_fn if require_confirm else None
+        require_confirm = bool(getattr(config_service, "PIVOT_REQUIRE_CONFIRM", False))
+        active_confirm_fn = _confirm_fn if require_confirm else None
+
         config_service._phase3_emit      = emitter
         config_service._pivot_confirm_fn = active_confirm_fn
+        config_service._cancel_event     = cancel_event
 
-        yield to_sse_line("job_start", {"job_id": job_id, "target": target_label, "mode": mode})
+        yield to_sse_line("job_start", {
+            "job_id": job_id, "target": target_label, "mode": mode,
+        })
 
         def _run():
             _STDOUT_ROUTER.set_capture(capture)
@@ -470,14 +776,20 @@ def run():
                 _STDOUT_ROUTER.clear_capture()
                 event_queue.put(None)
 
-        threading.Thread(target=_run, daemon=True).start()
+        worker = threading.Thread(target=_run, daemon=True)
+        _WORKER_THREADS[job_id] = worker
+        worker.start()
 
         error_occurred = False
+        cancelled      = False
+
         while True:
             try:
                 item = event_queue.get(timeout=60)
             except queue.Empty:
-                yield to_sse_line("heartbeat", {"ts": datetime.utcnow().isoformat()})
+                yield to_sse_line("heartbeat", {
+                    "ts": datetime.utcnow().isoformat(),
+                })
                 continue
             if item is None:
                 break
@@ -486,6 +798,8 @@ def run():
             if et == "error":
                 error_occurred = True
                 break
+            if et == "abort":
+                cancelled = True
             if et == "report_ready" and payload.get("format") == "html":
                 path = payload.get("path", "")
                 if os.path.isfile(path):
@@ -498,12 +812,20 @@ def run():
 
         with _PIVOT_LOCK:
             _PIVOT_RESPONSES.pop(job_id, None)
+        _CANCEL_EVENTS.pop(job_id, None)
+        _WORKER_THREADS.pop(job_id, None)
         with _JOBS_LOCK:
-            _JOBS[job_id]["status"] = "error" if error_occurred else "done"
+            if error_occurred:
+                _JOBS[job_id]["status"] = "error"
+            elif cancelled:
+                _JOBS[job_id]["status"] = "cancelled"
+            else:
+                _JOBS[job_id]["status"] = "done"
 
+        final_status = "error" if error_occurred else ("cancelled" if cancelled else "done")
         yield to_sse_line("stream_end", {
             "job_id":     job_id,
-            "status":     "error" if error_occurred else "done",
+            "status":     final_status,
             "report_url": f"/api/investigations/{job_id}/report",
         })
 
@@ -515,93 +837,166 @@ def run():
 
 
 # ---------------------------------------------------------------------------
+# /stop
+# ---------------------------------------------------------------------------
+
+@app.route("/stop", methods=["POST"])
+def stop():
+    data   = request.get_json(silent=True) or {}
+    job_id = (data.get("job_id") or "").strip() or None
+
+    with _JOBS_LOCK:
+        if job_id:
+            job = _JOBS.get(job_id)
+            if not job:
+                return jsonify({"success": False, "error": "job not found"}), 404
+            if job.get("status") != "running":
+                return jsonify({
+                    "success": False,
+                    "error": f"job is not running (status={job.get('status')})",
+                }), 409
+        else:
+            running = [j for j in _JOBS.values() if j.get("status") == "running"]
+            if not running:
+                return jsonify({"success": False, "error": "no running investigation"}), 404
+            running.sort(key=lambda j: j.get("started_at", ""), reverse=True)
+            job    = running[0]
+            job_id = job["id"]
+
+    cancel_event = _CANCEL_EVENTS.get(job_id)
+    if cancel_event is None:
+        return jsonify({
+            "success": False,
+            "error": "cancel token missing for job",
+        }), 500
+
+    cancel_event.set()
+    return jsonify({"success": True, "job_id": job_id})
+
+
+# ---------------------------------------------------------------------------
 # AI Chat endpoint
 # ---------------------------------------------------------------------------
 
-_CHAT_SYSTEM = (
+_CHAT_SYSTEM_DEFAULT = (
     "You are an elite OSINT analyst assistant embedded in the WhoCord "
-    "investigation canvas. The user shares their current map (a graph of "
-    "discovered entities) and asks questions. Be concise, structured, and "
-    "analytical. Use bullet points for multiple findings. Never invent data "
-    "not present in the map."
+    "investigation canvas. The user shares their current map and the "
+    "complete investigation dump. Be concise, structured, and analytical. "
+    "Use bullet points for multiple findings. Never invent data not "
+    "present in the dump."
 )
-_GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
-def _build_chat_prompt(message: str, map_data: dict) -> str:
-    node_count = map_data.get("node_count", 0)
-    edge_count = map_data.get("edge_count", 0)
-    nodes      = map_data.get("nodes", [])
+def _active_chat_system_prompt() -> str:
+    custom = (config_service.llm_system_prompt or "").strip()
+    return custom if custom else _CHAT_SYSTEM_DEFAULT
 
-    lines = [f"=== INVESTIGATION MAP ({node_count} nodes, {edge_count} edges) ===", ""]
 
-    by_type: dict[str, list[str]] = {}
-    for n in nodes:
-        etype = n.get("entityType", "unknown")
-        label = n.get("label", "")
-        info  = "; ".join(
-            f"{f['label']}: {f['value']}"
-            for f in n.get("infoFields", [])
-            if f.get("value")
-        )
-        entry = label + (f" [{info}]" if info else "")
-        by_type.setdefault(etype, []).append(entry)
+def _build_chat_context(message: str, map_data: dict, job_id: str | None) -> str:
+    from discord_osint.intelligence.intel_dump import (
+        build_canvas_dump, build_intel_dump,
+    )
 
-    for etype, entries in sorted(by_type.items()):
-        lines.append(f"{etype.upper()} ({len(entries)}):")
-        for e in entries[:20]:
-            lines.append(f"  • {e}")
-        if len(entries) > 20:
-            lines.append(f"  … and {len(entries) - 20} more")
-        lines.append("")
+    node_count = int(map_data.get("node_count", 0) or 0)
+    edge_count = int(map_data.get("edge_count", 0) or 0)
+    nodes      = map_data.get("nodes", []) or []
+    edges      = map_data.get("edges", []) or []
 
-    lines += ["=== USER QUESTION ===", message]
-    return "\n".join(lines)
+    total_budget  = config_service.llm_intel_budget
+    canvas_budget = max(1_500, min(8_000, int(total_budget * 0.5)))
+    intel_budget  = max(1_500, total_budget - canvas_budget)
+
+    canvas = build_canvas_dump(
+        nodes=nodes,
+        edges=edges,
+        status=str(map_data.get("status", "idle")),
+        current_stage=map_data.get("currentStage"),
+        target=str(map_data.get("target", "") or ""),
+        mode=str(map_data.get("mode", "") or ""),
+        job_id=job_id or map_data.get("jobId"),
+        pivot_depth=int(map_data.get("pivotDepth", 0) or 0),
+        pivots=map_data.get("pivots", []) or [],
+        logs=map_data.get("logs", []) or [],
+        findings=map_data.get("findings", []) or [],
+        budget=canvas_budget,
+    )
+
+    intel_block = ""
+    if job_id:
+        with _JOBS_LOCK:
+            job = _JOBS.get(job_id)
+        intel_path = job.get("intel_path") if job else None
+        if intel_path and os.path.isfile(intel_path):
+            try:
+                with open(intel_path, encoding="utf-8") as f:
+                    intel = json.load(f)
+                intel_block = build_intel_dump(
+                    intel,
+                    budget=intel_budget,
+                    include_raw=config_service.llm_intel_include_raw,
+                    exclude_meta=config_service.llm_intel_exclude_meta,
+                )
+            except Exception as exc:
+                print(f"  chat: could not load intel for {job_id}: {exc}")
+
+    header = f"=== INVESTIGATION MAP ({node_count} nodes, {edge_count} edges) ==="
+
+    sections = [header, "", canvas]
+    if intel_block:
+        sections.extend(["", intel_block])
+    sections.extend(["", "=== USER QUESTION ===", message])
+    return "\n".join(sections)
 
 
 @app.route("/api/ai/chat", methods=["POST"])
 def ai_chat():
-    groq_key = config_service.groq_api_key or getattr(config_service, "GROQ_API_KEY", "")
-    if not groq_key:
-        return jsonify({"error": "GROQ_API_KEY not configured"}), 503
+    base_url, api_key, extra_headers = get_llm_endpoint(config_service)
+
+    if not api_key:
+        provider_label = "GROQ_API_KEY" if config_service.llm_provider == "groq" else "OPENROUTER_API_KEY"
+        return jsonify({"error": f"{provider_label} not configured"}), 503
 
     body     = request.get_json(force=True, silent=True) or {}
     message  = str(body.get("message", "")).strip()
-    map_data = body.get("map", {})
+    map_data = body.get("map", {}) or {}
+    job_id   = (body.get("job_id") or map_data.get("jobId") or "").strip() or None
 
     if not message:
         return jsonify({"error": "message is required"}), 400
 
-    user_content = _build_chat_prompt(message, map_data)
+    user_content  = _build_chat_context(message, map_data, job_id)
+    system_prompt = _active_chat_system_prompt()
+    model         = config_service.llm_model
+    temperature   = config_service.llm_temperature
+    max_tokens    = min(config_service.llm_max_tokens, 4096)
+
+    chat_url = f"{base_url}/chat/completions"
 
     def generate():
         import requests as _req
 
         headers = {
-            "Authorization": f"Bearer {groq_key}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type":  "application/json",
+            **extra_headers,
         }
         payload = {
-            "model":       "llama3-8b-8192",
-            "temperature": 0.3,
-            "max_tokens":  1200,
+            "model":       model,
+            "temperature": temperature,
+            "max_tokens":  max_tokens,
             "stream":      True,
             "messages": [
-                {"role": "system", "content": _CHAT_SYSTEM},
+                {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": user_content},
             ],
         }
 
         try:
-            with _req.post(
-                _GROQ_CHAT_URL,
-                headers=headers,
-                json=payload,
-                stream=True,
-                timeout=60,
-            ) as resp:
+            with _req.post(chat_url, headers=headers, json=payload,
+                           stream=True, timeout=120) as resp:
                 if resp.status_code != 200:
-                    yield f"data: {json.dumps({'token': f'[Error {resp.status_code}]'})}\n\n"
+                    err = resp.text[:300]
+                    yield f"data: {json.dumps({'token': f'[LLM {resp.status_code}: {err}]'})}\n\n"
                     yield "data: [DONE]\n\n"
                     return
 
@@ -656,13 +1051,8 @@ def pivot_confirm(job_id: str):
 
 
 # ---------------------------------------------------------------------------
-# History + legacy endpoints
+# History
 # ---------------------------------------------------------------------------
-
-@app.route("/stop", methods=["POST"])
-def stop():
-    return jsonify({"success": False, "error": "Stop not yet implemented"})
-
 
 @app.route("/report")
 def report_legacy():

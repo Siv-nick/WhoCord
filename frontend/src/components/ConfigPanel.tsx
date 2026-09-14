@@ -1,16 +1,31 @@
 // src/components/ConfigPanel.tsx
 // Legacy config panel — kept for the /dashboard/config route.
 // The canvas uses CanvasConfigPanel instead.
+//
+// Change log
+// ----------
+// - OPENROUTER_API_KEY added to the token list.
+// - HIBP_API_KEY added to the token list.
+// - APOLLO_API_KEY and LUSHA_API_KEY added — both labelled as
+//   paid-credit keys so an analyst does not enable them without
+//   understanding the cost.
+// - Provider-aware token label helps the user know which LLM key to add.
 
 import React, { useEffect, useState } from "react";
 import {
   fetchConfig,
+  saveLLMConfig,
   savePivotConfig,
   setToken,
   toggleDebug,
   toggleTool,
 } from "../utils/api";
-import type { AppConfig, PivotConfig, ToolConfig } from "../types/investigation";
+import type {
+  AppConfig,
+  LLMProvider,
+  PivotConfig,
+  ToolConfig,
+} from "../types/investigation";
 import { Icon } from "./Icons";
 
 const DEFAULT_PIVOT: PivotConfig = {
@@ -96,6 +111,17 @@ export default function ConfigPanel() {
     await load();
   };
 
+  const handleSwitchProvider = async (next: LLMProvider) => {
+    if (!cfg) return;
+    if (next === cfg.llm.provider) return;
+    try {
+      await saveLLMConfig({ provider: next });
+      await load();
+    } catch (err) {
+      console.warn("provider switch failed:", err);
+    }
+  };
+
   const handleSavePivot = async () => {
     await savePivotConfig(pivot);
     setPivotSaved(true);
@@ -106,42 +132,54 @@ export default function ConfigPanel() {
   if (!cfg)    return <div className="p-8 text-rose-400 text-sm">Failed to load config.</div>;
 
   const TOKEN_LABELS: Record<string, string> = {
-    DISCORD_TOKEN:     "Discord Token",
-    GITHUB_TOKEN:      "GitHub Token",
-    GROQ_API_KEY:      "Groq API Key",
-    INSTAGRAM_SESSION: "Instagram Session",
+    DISCORD_TOKEN:      "Discord Token",
+    GITHUB_TOKEN:       "GitHub Token",
+    GROQ_API_KEY:       "Groq API Key",
+    OPENROUTER_API_KEY: "OpenRouter API Key",
+    HIBP_API_KEY:       "HIBP API Key (v3)",
+    INSTAGRAM_SESSION:  "Instagram Session",
+    APOLLO_API_KEY:     "Apollo.io API Key (paid credits)",
+    LUSHA_API_KEY:      "Lusha API Key (paid credits)",
   };
 
   return (
     <div className="space-y-6">
       {/* API Tokens */}
       <section>
-        <h3 className="text-[13px] font-bold text-white mb-3 flex items-center gap-2">
+        <h3 className="text-[13px] font-bold text-white mb-1 flex items-center gap-2">
           <Icon name="key" size={14} className="text-violet-300" />
           API Tokens
         </h3>
+        <p className="text-[11px] text-zinc-500 mb-3 leading-snug">
+          Stored in the OS keyring. The badge indicates presence only — it
+          does not validate the value with the provider. Apollo.io and Lusha
+          keys are both for paid-credit providers.
+        </p>
         <div className="space-y-3">
-          {Object.entries(TOKEN_LABELS).map(([key, label]) => (
-            <div key={key}>
-              <label className="flex items-center justify-between text-[11px] text-zinc-500 mb-1">
-                <span>{label}</span>
-                <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
-                  cfg.tokens[key as keyof typeof cfg.tokens]
-                    ? "bg-emerald-500/15 text-emerald-300"
-                    : "bg-white/[.03] text-zinc-500"
-                }`}>
-                  {cfg.tokens[key as keyof typeof cfg.tokens] ? "set" : "not set"}
-                </span>
-              </label>
-              <input
-                type="password"
-                placeholder={`Enter ${label}…`}
-                value={tokenInputs[key] ?? ""}
-                onChange={e => setTI(p => ({ ...p, [key]: e.target.value }))}
-                className="field !py-1.5 !text-sm"
-              />
-            </div>
-          ))}
+          {Object.entries(TOKEN_LABELS).map(([key, label]) => {
+            const isStored = Boolean(cfg.tokens[key as keyof typeof cfg.tokens]);
+            return (
+              <div key={key}>
+                <label className="flex items-center justify-between text-[11px] text-zinc-500 mb-1">
+                  <span>{label}</span>
+                  <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                    isStored
+                      ? "bg-emerald-500/15 text-emerald-300"
+                      : "bg-white/[.03] text-zinc-500"
+                  }`}>
+                    {isStored ? "stored" : "empty"}
+                  </span>
+                </label>
+                <input
+                  type="password"
+                  placeholder={isStored ? "Replace stored value…" : `Enter ${label}…`}
+                  value={tokenInputs[key] ?? ""}
+                  onChange={e => setTI(p => ({ ...p, [key]: e.target.value }))}
+                  className="field !py-1.5 !text-sm"
+                />
+              </div>
+            );
+          })}
         </div>
         <div className="flex items-center gap-3 mt-3">
           <button onClick={handleSaveTokens} className="btn btn-primary">
@@ -163,6 +201,48 @@ export default function ConfigPanel() {
           label="Verbose logging"
           sublabel="Write detailed output to the Live Logs panel"
         />
+      </section>
+
+      {/* LLM Provider */}
+      <section>
+        <h3 className="text-[13px] font-bold text-white mb-2 flex items-center gap-2">
+          <Icon name="sparkle" size={14} className="text-violet-300" />
+          LLM Provider
+          <span className="text-[10px] font-bold px-1.5 py-0.5 rounded
+                           bg-violet-500/15 text-violet-200 uppercase">
+            {cfg.llm.provider}
+          </span>
+        </h3>
+        <p className="text-[11px] text-zinc-500 mb-3 leading-snug">
+          Choose which OpenAI-compatible backend the AI features use. Full
+          model selection, temperature, and prompt settings live in the
+          canvas Configuration panel.
+        </p>
+        <div className="grid grid-cols-2 gap-2">
+          {(["groq", "openrouter"] as LLMProvider[]).map(p => {
+            const active = cfg.llm.provider === p;
+            return (
+              <button
+                key={p}
+                type="button"
+                onClick={() => handleSwitchProvider(p)}
+                className={[
+                  "rounded-lg border px-3 py-2 text-left transition-all",
+                  active
+                    ? "border-violet-500/60 bg-violet-500/15 text-violet-100"
+                    : "border-edge-1 bg-ink-800/50 text-zinc-300 hover:border-edge-2",
+                ].join(" ")}
+              >
+                <p className="text-[12px] font-bold">
+                  {p === "groq" ? "Groq" : "OpenRouter"}
+                </p>
+                <p className="text-[10px] text-zinc-500 leading-snug mt-0.5">
+                  {p === "groq" ? "Fast, TPM-limited" : "Broad catalog, request-limited"}
+                </p>
+              </button>
+            );
+          })}
+        </div>
       </section>
 
       {/* Pivoting */}
@@ -215,15 +295,11 @@ export default function ConfigPanel() {
                   onChange={e => setPivot(p => ({ ...p, max_depth: Number(e.target.value) }))}
                   className="w-full accent-violet-500"
                 />
-                <div className="flex justify-between text-[10px] text-zinc-600 mt-0.5">
-                  <span>1 (shallow)</span>
-                  <span>5 (deep)</span>
-                </div>
               </div>
 
               <div>
                 <label className="flex items-center justify-between text-[11px] text-zinc-500 mb-1.5">
-                  <span>Max seeds per depth level</span>
+                  <span>Batch size per pivot wave</span>
                   <span className="font-bold text-white">{pivot.max_seeds}</span>
                 </label>
                 <input
@@ -232,10 +308,10 @@ export default function ConfigPanel() {
                   onChange={e => setPivot(p => ({ ...p, max_seeds: Number(e.target.value) }))}
                   className="w-full accent-violet-500"
                 />
-                <div className="flex justify-between text-[10px] text-zinc-600 mt-0.5">
-                  <span>1 (conservative)</span>
-                  <span>20 (aggressive)</span>
-                </div>
+                <p className="mt-1 text-[10px] text-zinc-600 leading-snug">
+                  Seeds beyond this number are investigated in a subsequent
+                  wave at the same depth — none are dropped.
+                </p>
               </div>
 
               <Toggle
@@ -264,23 +340,25 @@ export default function ConfigPanel() {
         </h3>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
           {cfg.tools.map(tool => (
-            <label
+            <button
               key={tool.key}
+              type="button"
+              onClick={() => handleToggleTool(tool)}
               className="flex items-center justify-between rounded-lg
                          border border-edge-1 bg-ink-800/50 px-3 py-2 cursor-pointer
-                         hover:border-edge-2 transition-colors"
+                         hover:border-edge-2 transition-colors text-left w-full"
             >
               <span className="text-[11px] text-zinc-300">{tool.desc}</span>
               <div
-                onClick={() => handleToggleTool(tool)}
                 className={`relative w-8 h-4 rounded-full transition-colors shrink-0 ml-2 ${
                   tool.enabled ? "bg-violet-600" : "bg-edge-2"
                 }`}
+                aria-hidden="true"
               >
                 <div className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white
                                 transition-transform ${tool.enabled ? "translate-x-4" : ""}`} />
               </div>
-            </label>
+            </button>
           ))}
         </div>
       </section>
