@@ -1,21 +1,17 @@
+
 """
 discord_osint/utils/__init__.py
 -------------------------------
-Shared helpers: directory resolution, HTTP sessions with retry, subprocess
-wrappers, dependency checks, and the resilient_task decorator.
+Shared helpers: directory resolution, HTTP sessions with retry,
+subprocess wrappers, dependency checks, and the resilient_task
+decorator.
 
-Change log
-----------
-- ``debug_subprocess`` and ``run_external_tool`` now return
-  ``(CompletedProcess, stdout, stderr)``. The CompletedProcess carries
-  ``returncode``, which callers previously could not see (it was
-  discarded before the tuple was built). This is what lets a caller
-  distinguish "tool ran and produced no output" from "tool crashed on
-  launch".
-- ``resilient_task`` records every retry and the terminal failure to
-  ``log_trace`` so a run with DEBUG on leaves a durable trail.
-- ``_get_github_session`` bare-except fallback branches now log their
-  decisions.
+Permissions
+-----------
+``init_debug_log`` creates its directory tree with mode 0700. Debug
+logs record scraped PII and are world-readable under a default umask
+on a shared workstation. The directory is chmod'd on every call so an
+existing install with a permissive directory gets fixed.
 """
 
 import re
@@ -23,6 +19,7 @@ import time
 import requests
 import shutil
 import functools
+import hashlib
 import os
 import sys
 import threading
@@ -32,6 +29,80 @@ import logging.handlers
 from datetime import datetime
 import sys as _sys
 import os as _os
+
+
+def stable_target_id(seed: str) -> int:
+    """
+    Deterministic, cross-process target id for a username/email/domain
+    seed.
+
+    This replaces ``hash(seed) & 0x7FFFFFFF``. Python randomises string
+    hashing per interpreter process (PYTHONHASHSEED) specifically to
+    resist hash-flooding DoS attacks — which is the correct default,
+    but it means the *same username* produced a *different* target_id
+    on every run of the tool. Two things depended on that id being
+    stable across runs and silently broke:
+
+      * ``ENABLE_CACHING`` ("load previous intel"), which looks up a
+        prior snapshot by target_id and never found one after a
+        restart.
+      * History / report linkage — two runs against the same username
+        wrote to unrelated filenames, so a person's investigation
+        history could not be assembled across sessions.
+
+    SHA-256 is deterministic across processes and Python versions.
+    Truncating to 31 bits keeps every existing consumer working
+    unchanged: filenames, positive-int comparisons, and the
+    ``& 0x7FFFFFFF``-shaped call sites this replaces all still see a
+    small positive int.
+    """
+    digest = hashlib.sha256(seed.encode("utf-8", errors="replace")).digest()
+    return int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
+
+
+def intel_target_key(mode: str, seed: str) -> str:
+    """
+    The filename key used for this investigation's artifacts.
+
+    Every artifact written for a run is named ``<kind>_<key>_<ts>.<ext>``
+    where ``<key>`` is ``InvestigationCore.target_id`` stringified:
+
+      * ``intel_<key>_<ts>.json``     (core.save_state)
+      * ``report_<key>_<ts>.html``    (ReportingStage)
+      * ``manifest_<key>_<ts>.json``  (ReportingStage)
+
+    The web layer previously had no way to name that key. It stored a
+    *human label* on the job record (``discord:123``, an email, or a
+    URL truncated to 60 chars) and ``JobRegistry.find_intel_path`` then
+    globbed ``intel_{label}_*.json``. Because the pipeline derives the
+    key from ``stable_target_id`` — a 31-bit integer — the label and
+    the key never matched, so the glob fallback could not find a
+    snapshot for any live job and the route returned "no intel
+    snapshot found" whenever ``intel_path`` had not been recorded.
+
+    This function is the single definition of that key, so the readers
+    (the web layer) and the writers (the pipeline) cannot drift apart
+    again. It mirrors the two branches in ``run_osint_pipeline`` /
+    ``run_module_pipeline``:
+
+      * ``discord`` mode keys on the raw user id, because that mode
+        assigns ``target_id = config.TARGET_USER_ID`` directly.
+      * every other mode keys on ``stable_target_id(seed)``.
+
+    ``seed`` must be the *untruncated* sanitised target, i.e. the same
+    value that reaches ``config.MANUAL_*`` / ``PROBE_STRING`` — not the
+    display label.
+    """
+    s = (seed or "").strip()
+    if not s:
+        return ""
+    if mode == "discord":
+        # TARGET_USER_ID is coerced with int() before it reaches the
+        # pipeline, so strip any "discord:" prefix / stray characters
+        # and key on the digits to match str(int(...)).
+        digits = "".join(ch for ch in s if ch.isdigit()).lstrip("0")
+        return digits or "0"
+    return str(stable_target_id(s))
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -63,11 +134,27 @@ DEBUG_MODE = False
 _debug_logger = None
 
 
+def _ensure_private_dir(path: str) -> None:
+    """
+    Create *path* and its parent if missing, then chmod to 0700.
+
+    Used for directories that will receive PII — debug logs, cached
+    avatars, intel snapshots. Failing to chmod is not fatal: the
+    directory still gets created, and the failure is silent because
+    there is nothing useful the operator can do from a helper.
+    """
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
 def init_debug_log(target_id):
     global _debug_logger
-    os.makedirs(CACHE_DIR, exist_ok=True)
+    _ensure_private_dir(CACHE_DIR)
     log_dir = os.path.join(CACHE_DIR, "debug_logs")
-    os.makedirs(log_dir, exist_ok=True)
+    _ensure_private_dir(log_dir)
     log_path = os.path.join(
         log_dir,
         f"debug_{target_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -85,6 +172,10 @@ def init_debug_log(target_id):
     ch.setFormatter(logging.Formatter('%(message)s'))
     logger.addHandler(ch)
     _debug_logger = logger
+    try:
+        os.chmod(log_path, 0o600)
+    except OSError:
+        pass
     _debug_logger.info("=== Debug log started for target %s ===", target_id)
 
 
@@ -94,10 +185,6 @@ def log_trace(msg: str) -> None:
 
     No-op when DEBUG_MODE is off or no debug log has been initialised yet.
     Never raises — a debug-log failure must never crash a stage.
-
-    Import this from any module that wants to record fine-grained
-    decisions (URL classification, fetch results, skip reasons, etc.)
-    to the debug file without touching stdout.
     """
     if _debug_logger is None:
         return
@@ -156,14 +243,10 @@ def debug_subprocess(cmd, **kwargs):
             reader_thread.join(timeout=5)
 
         stdout_text = ''.join(captured_lines)
-        # In debug mode stdout and stderr are merged; report stderr as
-        # empty so callers don't double-count.
         result = _sp.CompletedProcess(args=cmd, returncode=proc.returncode,
                                       stdout=stdout_text, stderr='')
         return result, stdout_text, ''
 
-    # Non-debug path — keep stdout and stderr separate so the caller can
-    # log the actual error text when returncode is non-zero.
     kwargs['capture_output'] = True
     kwargs['text'] = True
     result = _sp.run(cmd, **kwargs)

@@ -19,7 +19,7 @@ const TYPES: Array<{ type: NodeEntityType; label: string; icon: IconName }> = [
   { type: "unknown",        label: "Other",     icon: "dot"    },
 ];
 
-export default function FilterPanel({ nodeCount }: { nodeCount: number }) {
+function FilterPanel({ nodeCount }: { nodeCount: number }) {
   const { filter, setTypeFilter, setSearchFilter, clearFilters } = useGraphState();
   const [open, setOpen] = useState(false);
   const allOn = TYPES.every(e => filter.types.has(e.type));
@@ -134,3 +134,6 @@ export default function FilterPanel({ nodeCount }: { nodeCount: number }) {
     </div>
   );
 }
+
+// Memoised: Re-rendered by unrelated canvas interactions.
+export default React.memo(FilterPanel);

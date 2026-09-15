@@ -1,3 +1,24 @@
+"""
+discord_osint/email_intel.py
+----------------------------
+Email enrichment: Holehe, h8mail, HIBP v3, EmailRep, GHunt, SMTP
+verification, Gravatar, Scylla, Blackbird, MOSINT.
+
+Change log
+----------
+- Blackbird API fetch routes through ``utils.url_safety.safe_get_pinned``.
+  The URL comes from Blackbird's email-search results and points at a
+  scraped profile page — attacker-influenced. The previous bare
+  ``requests.get`` bypassed the SSRF guard entirely.
+- ``enrich_email``'s Blackbird section records failures via
+  ``log_trace``. The previous silent ``except Exception: pass`` blocks
+  made a Blackbird crash indistinguishable from "the address has no
+  Blackbird-discoverable profiles."
+- HIBP contract: ``check_hibp`` returns ``None`` when the check could
+  not be performed, an empty list when the address is confirmed clean,
+  and a populated list otherwise.
+"""
+
 import re
 import time
 import subprocess as _sp
@@ -11,19 +32,17 @@ import sys
 import shutil
 
 from . import utils
-from .utils import resilient_task, tool_available, http_session
+from .utils import resilient_task, tool_available, http_session, log_trace
+from .utils.url_safety import safe_get_pinned, UnsafeURLError
 from .scraping import is_valid_email, is_valid_personal_email
 from .pipeline.base import EmitFn
 from .pipeline.context import InvestigationContext
 from .utils.mosint_wrapper import run_mosint
 
-# ── Bug 3 fix: never bind tool flags at import time. ──────────────────
+# Install-wide values (HIBP_API_KEY) still read from the module
+# directly; flag reads go through the active JobConfig.
 from . import config as _config_module
-
-
-def _flag(name: str, default: bool = False) -> bool:
-    """Read a config flag dynamically (Bug 3 fix)."""
-    return bool(getattr(_config_module, name, default))
+from .config import get_flag as _flag
 
 
 def generate_email_guesses(first, last, domains):
@@ -91,38 +110,21 @@ def run_holehe(email):
 
 @resilient_task(max_retries=1)
 def run_h8mail(email):
-    """
-    Compact breach summary or ``None`` when nothing interesting.
-
-    Change log
-    ----------
-    - "clean" results now return ``None`` instead of a dict carrying the
-      full h8mail ASCII banner.  Those dicts were treated as breach
-      records by the report generator and bloated intel size for zero
-      signal.
-    - Whitespace is compressed and the ANSI banner is stripped so the
-      remaining text is small and human-readable.
-    """
     if not tool_available("h8mail"):
         return None
     _, stdout, _ = utils.run_external_tool("h8mail", "-t", email, timeout=180)
     if stdout is None:
         return None
 
-    # Strip ANSI colour codes then collapse whitespace so we don't keep
-    # the ASCII art banner.
     clean = re.sub(r"\x1b\[[0-9;]*m", "", stdout)
     compact = re.sub(r"\s+", " ", clean).strip()
 
     if "Not Compromised" in compact:
-        # Nothing to report.  Don't store the banner.
         return None
 
-    # Try to pull the execution time out of the recap for context.
     m = re.search(r"Execution time\s*\(seconds\)\s*:\s*([\d.]+)", compact)
     elapsed = m.group(1) if m else ""
 
-    # Trim to a short tail so the stored value stays small.
     summary = compact[-500:] if len(compact) > 500 else compact
     return {"status": "compromised", "summary": summary, "elapsed_s": elapsed}
 
@@ -141,14 +143,6 @@ def run_gosearch(query):
 
 @resilient_task(max_retries=1)
 def run_ghunt(gmail):
-    """
-    Run GHunt against a Gmail address.
-
-    Change log
-    ----------
-    Skips cleanly when no GHunt session is configured instead of letting
-    the tool raise a Python traceback into the console output.
-    """
     import shutil, re, json as _json
 
     ghunt_bin = os.path.expanduser("~/.local/bin/ghunt")
@@ -161,8 +155,6 @@ def run_ghunt(gmail):
         print("  GHunt: not a Gmail address – skipping.")
         return None
 
-    # Detect missing session *before* invoking ghunt, otherwise the tool
-    # dumps a traceback.
     creds_dir = os.path.expanduser("~/.malfrats/ghunt")
     if not os.path.isdir(creds_dir) or not os.listdir(creds_dir):
         print("  GHunt: no session configured (run `ghunt login`) – skipping.")
@@ -246,29 +238,6 @@ def run_ghunt(gmail):
     return data
 
 
-# ──────────────────────────────────────────────────────────────────────
-# HaveIBeenPwned (v3 API)
-# ──────────────────────────────────────────────────────────────────────
-#
-# Change log
-# ----------
-# The old implementation called the retired v2 API and never sent the
-# authentication header that v3 requires — so it 404'd or 401'd and the
-# function always returned ``[]``. From the UI, "HIBP ran and found no
-# breaches" was indistinguishable from "HIBP was never actually usable."
-#
-# This version:
-#   • uses the v3 endpoint
-#   • sends ``hibp-api-key`` and the User-Agent HIBP requires
-#   • distinguishes "no breaches" (200 with empty body / 404) from
-#     "check could not be performed" (missing key, auth error, network)
-#   • returns ``None`` on failure so callers can log it honestly
-#
-# Return contract
-# ---------------
-#   list[dict]  – breaches found (may be empty = "no breaches")
-#   None        – the check could not be performed
-#
 _HIBP_API_URL = "https://haveibeenpwned.com/api/v3/breachedaccount/{email}"
 
 
@@ -277,8 +246,7 @@ def check_hibp(email):
     Query HaveIBeenPwned v3 for breaches affecting *email*.
 
     Returns a list of breach dicts (possibly empty) on success, or
-    ``None`` when the check could not be performed — no API key, invalid
-    key, rate-limited, or network failure.
+    ``None`` when the check could not be performed.
     """
     api_key = getattr(_config_module, "HIBP_API_KEY", "") or ""
     if not api_key:
@@ -286,8 +254,6 @@ def check_hibp(email):
         return None
 
     headers = {
-        # HIBP requires a descriptive User-Agent; a bare "Mozilla/5.0" is
-        # accepted but they prefer a tool identifier.
         "User-Agent":   "WhoCord-OSINT/1.1",
         "hibp-api-key": api_key,
         "Accept":       "application/json",
@@ -303,7 +269,6 @@ def check_hibp(email):
         print(f"  HIBP: network error ({type(exc).__name__}: {exc})")
         return None
 
-    # 200 → breaches found (JSON list)
     if r.status_code == 200:
         try:
             data = r.json()
@@ -312,23 +277,19 @@ def check_hibp(email):
             print("  HIBP: 200 OK but response was not valid JSON.")
             return None
 
-    # 404 → the account is not in any breach (valid "no breaches" result)
     if r.status_code == 404:
         return []
 
-    # 401 / 403 → key is missing, invalid, or lacks the required scope
     if r.status_code in (401, 403):
         print(f"  HIBP: authentication failed (HTTP {r.status_code}) — "
               f"check HIBP_API_KEY.")
         return None
 
-    # 429 → rate limited; caller can retry later
     if r.status_code == 429:
         retry_after = r.headers.get("Retry-After", "?")
         print(f"  HIBP: rate limited (HTTP 429, Retry-After={retry_after}).")
         return None
 
-    # Anything else
     print(f"  HIBP: unexpected HTTP {r.status_code} — {r.text[:120]!r}")
     return None
 
@@ -451,11 +412,8 @@ def enrich_email(
 ) -> None:
     """
     Run the full email enrichment suite and store results.
-
-    Email is normalised to lowercase at the top so intel keys stay
-    consistent regardless of how the address was discovered.
     """
-    email = email.strip().lower()       # <-- normalise once, up front
+    email = email.strip().lower()
     if not email or "@" not in email:
         return
 
@@ -480,10 +438,6 @@ def enrich_email(
             emit("finding", {"type": "h8mail", "email": email, "result": h8})
 
     # --- HIBP ---
-    # check_hibp returns None when the check could not be performed
-    # (no key, invalid key, network, rate limit). Distinguishing that
-    # from an empty list means the UI and the report can say "not
-    # checked" rather than the misleading "no breaches found".
     if cfg.ENABLE_HIBP:
         hibp = check_hibp(email)
         if hibp is None:
@@ -560,6 +514,13 @@ def enrich_email(
             emit("finding", {"type": "scylla", "email": email})
 
     # --- Blackbird email search + API fetch ---
+    # The API fetch previously used a bare requests.get. The URL comes
+    # from Blackbird's search results, which are attacker-influenced:
+    # a target who controls a page Blackbird indexes can plant a URL
+    # that resolves to an internal address. Now routed through
+    # safe_get_pinned, which resolves once, validates every address
+    # against the SSRF blocklist, and pins the TCP connect to the
+    # validated IP.
     if getattr(cfg, "ENABLE_BLACKBIRD", False):
         try:
             from .username_search import run_blackbird
@@ -574,8 +535,7 @@ def enrich_email(
                         source="blackbird_email",
                     )
                     try:
-                        import requests
-                        resp = requests.get(
+                        resp = safe_get_pinned(
                             url,
                             headers={"User-Agent": "Mozilla/5.0"},
                             timeout=10,
@@ -587,10 +547,21 @@ def enrich_email(
                             ctx.intel_core.add_intel("social_profiles", key,
                                                      json.dumps(data),
                                                      source="blackbird_api")
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                    except UnsafeURLError as exc:
+                        log_trace(
+                            f"enrich_email/blackbird_api: SSRF BLOCKED "
+                            f"{url[:80]} — {exc}"
+                        )
+                    except Exception as exc:
+                        log_trace(
+                            f"enrich_email/blackbird_api: "
+                            f"{type(exc).__name__}: {exc} for {url[:80]}"
+                        )
+        except Exception as exc:
+            log_trace(
+                f"enrich_email/blackbird: "
+                f"{type(exc).__name__}: {exc} for {email}"
+            )
 
     # --- MOSINT ---
     mosint_data = run_mosint(email)

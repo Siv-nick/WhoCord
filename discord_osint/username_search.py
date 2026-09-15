@@ -1,3 +1,4 @@
+
 import os
 import sys
 import io
@@ -16,12 +17,10 @@ from importlib import import_module
 from . import utils
 from .utils import resilient_task, tool_available, clean_username, CACHE_DIR, get_base_dir, log_trace
 
+# `_config_module` still read directly for BLACKBIRD_DIR (install-wide).
+# Flag reads go through the active JobConfig.
 from . import config as _config_module
-
-
-def _flag(name: str, default: bool = False) -> bool:
-    return bool(getattr(_config_module, name, default))
-
+from .config import get_flag as _flag
 
 from .scraping import is_likely_profile_url_v2
 
@@ -29,12 +28,6 @@ from .scraping import is_likely_profile_url_v2
 # ═══════════════════════════════════════════════════════════════════════════
 # User Scanner (kaifcodec/user-scanner) — replaces sherlock, naminter,
 # social_analyzer, and blackbird-username.
-#
-# Fixed: the tool frequently ignores `-o <file>` and prints JSON to stdout
-# instead. This version reads whichever channel actually contains data,
-# normalises every plausible JSON shape, and — critically — records the
-# reason when nothing parseable came back, so the operator can tell the
-# difference between "site not found" and "tool crashed on startup".
 # ═══════════════════════════════════════════════════════════════════════════
 
 _USER_SCANNER_NAMES = ("user-scanner", "user_scanner", "userscanner", "UserScanner")
@@ -52,11 +45,6 @@ def _user_scanner_binary() -> str | None:
 def _extract_json_blob(text: str):
     """
     Find and parse the first JSON object/array inside *text*.
-
-    Tools like user-scanner often print banners or progress lines before
-    the real payload, so we scan for the first balanced ``{...}`` or
-    ``[...]`` block instead of assuming the whole stdout is JSON.
-    Returns the parsed value or ``None``.
     """
     if not text:
         return None
@@ -103,10 +91,6 @@ def _entry_url(entry: dict) -> str:
 def _entry_is_negative(entry: dict) -> bool:
     """
     Return True only when the entry explicitly signals 'not found'.
-
-    Many user-scanner builds omit the status field entirely when a profile
-    is found, so we can't require status == "found".  We only reject
-    entries that carry an unambiguous negative marker.
     """
     for k in ("status", "exists", "found", "registered", "available", "taken"):
         if k not in entry:
@@ -229,10 +213,6 @@ def run_user_scanner(target: str, mode: str = "username") -> list[dict]:
 
     Returns a list of dicts:
         {"site": str, "url": str, "category": str, "extra": dict}
-
-    Failure modes are recorded via ``log_trace`` so the debug log
-    distinguishes "no hits" from "tool crashed on startup" from "tool
-    produced output we could not parse."
     """
     binary = _user_scanner_binary()
     if not binary:
@@ -242,8 +222,6 @@ def run_user_scanner(target: str, mode: str = "username") -> list[dict]:
         log_trace(msg)
         return []
 
-    # Multiple flag conventions — different releases accept different
-    # combinations. Stop at the first one that produces parsable output.
     flag = "-e" if mode == "email" else "-u"
     arg_variants = [
         [flag, target, "-f", "json", "-o", None],
@@ -291,7 +269,6 @@ def run_user_scanner(target: str, mode: str = "username") -> list[dict]:
                 pass
             continue
 
-        # 1. Prefer the output file
         if os.path.isfile(outfile) and os.path.getsize(outfile) > 0:
             try:
                 with open(outfile, "r", encoding="utf-8") as f:
@@ -301,14 +278,12 @@ def run_user_scanner(target: str, mode: str = "username") -> list[dict]:
             except json.JSONDecodeError as exc:
                 log_trace(f"user-scanner: output file not valid JSON: {exc}")
 
-        # 2. Try JSON on stdout
         blob = _extract_json_blob(last_stdout)
         if blob is not None:
             parsed_data = blob
             used_args   = args
             break
 
-        # 3. Last resort: URLs on stdout
         urls = re.findall(r'https?://[^\s"\'<>]+', last_stdout)
         if urls:
             parsed_data = [{"url": u} for u in urls]
@@ -320,7 +295,6 @@ def run_user_scanner(target: str, mode: str = "username") -> list[dict]:
         except OSError:
             pass
 
-    # ── Diagnostics ─────────────────────────────────────────────────────
     if parsed_data is None:
         snippet = (last_stdout or "").strip().replace("\n", " ⏎ ")[:300]
         err_snippet = (last_err or "").strip().replace("\n", " ⏎ ")[:200]
@@ -566,12 +540,24 @@ def run_blackbird(target, mode="username"):
     if not os.path.isfile(wmn_data):
         print("  Blackbird data file not found – downloading (one‑time, ~1 MB) …")
         try:
-            import urllib.request
+            # urlretrieve writes straight to disk with no status check,
+            # no size cap, and no shared session — a 404 page would be
+            # saved as "wmn-data.json" and then fail to parse later with
+            # a confusing error. Fetch it properly, validate it is the
+            # JSON we expect, and only then commit it to disk.
+            from .wmn_scanner import fetch_wmn_dataset_bytes
+
             os.makedirs(os.path.dirname(wmn_data), exist_ok=True)
-            urllib.request.urlretrieve(
-                "https://raw.githubusercontent.com/WebBreacher/WhatsMyName/main/wmn-data.json",
-                wmn_data,
-            )
+            raw = fetch_wmn_dataset_bytes()
+            if raw is None:
+                print("  Auto-download failed: could not retrieve dataset.")
+                log_trace("blackbird: wmn-data download returned nothing.")
+                return []
+
+            tmp_path = wmn_data + ".part"
+            with open(tmp_path, "wb") as fh:
+                fh.write(raw)
+            os.replace(tmp_path, wmn_data)
             print("  Done – data file downloaded successfully.")
         except Exception as e:
             print(f"  Auto‑download failed: {e}")

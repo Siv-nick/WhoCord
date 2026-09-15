@@ -11,7 +11,21 @@ interface Props {
   onClose: () => void;
 }
 
-export default function InfoCard({
+const CONFIDENCE_LABEL = (c: number): string => {
+  if (c >= 0.8) return "high";
+  if (c >= 0.6) return "medium";
+  if (c >= 0.4) return "low";
+  return "very low";
+};
+
+const CONFIDENCE_COLOR = (c: number): string => {
+  if (c >= 0.8) return "text-emerald-300";
+  if (c >= 0.6) return "text-lime-300";
+  if (c >= 0.4) return "text-amber-300";
+  return "text-rose-300";
+};
+
+function InfoCard({
   node, initialPos, onFieldChange, onClose,
 }: Props) {
   const [pos, setPos]        = useState(initialPos);
@@ -77,6 +91,40 @@ export default function InfoCard({
           <Icon name="close" size={14} />
         </button>
       </div>
+
+      {/* Confidence row — shown when we have a value for this node.
+          Placed above the avatar so it reads as a headline attribute,
+          not a per-field detail. */}
+      {typeof node.confidence === "number" && (
+        <div className="px-3.5 py-2.5 border-b border-edge-0 shrink-0">
+          <div className="flex items-center justify-between mb-1.5">
+            <span className="eyebrow">Confidence</span>
+            <span className={`text-[11px] font-bold tabular-nums ${
+              CONFIDENCE_COLOR(node.confidence)
+            }`}>
+              {Math.round(node.confidence * 100)}%
+              <span className="ml-1.5 text-[10px] font-medium opacity-80">
+                {CONFIDENCE_LABEL(node.confidence)}
+              </span>
+            </span>
+          </div>
+          <div className="h-1 rounded-full bg-ink-800 overflow-hidden">
+            <div
+              className="h-full rounded-full transition-all"
+              style={{
+                width: `${Math.round(node.confidence * 100)}%`,
+                background: node.confidence >= 0.8
+                  ? "linear-gradient(90deg, #10b981, #22c55e)"
+                  : node.confidence >= 0.6
+                  ? "linear-gradient(90deg, #84cc16, #bef264)"
+                  : node.confidence >= 0.4
+                  ? "linear-gradient(90deg, #f59e0b, #fbbf24)"
+                  : "linear-gradient(90deg, #f43f5e, #fb7185)",
+              }}
+            />
+          </div>
+        </div>
+      )}
 
       {/* Avatar */}
       {avatarField && (
@@ -240,3 +288,6 @@ function CopyBtn({ value }: { value: string }) {
     </button>
   );
 }
+
+// Memoised: Re-rendered by unrelated canvas interactions.
+export default React.memo(InfoCard);

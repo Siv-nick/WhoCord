@@ -117,21 +117,51 @@ def sanitize_user_id(raw: str) -> str:
 
 def sanitize_domain(raw: str) -> str:
     """
-    Strip protocol prefix and path, lowercase, then remove any
-    character that cannot appear in a hostname.
+    Strip protocol prefix, path, and port, lowercase, then validate.
 
-    Raises InputValidationError if the result is empty.
+    Raises InputValidationError if the result is empty or still contains
+    characters that cannot appear in a hostname.
+
+    Previously this ran ``_DOMAIN_INVALID.sub("", s)``, deleting illegal
+    characters instead of rejecting them. That silently rewrote one
+    target into a *different* one:
+
+        "example.com:8080" -> "example.com8080"   (nonexistent host)
+        "a_b.com"          -> "ab.com"            (a different real host)
+
+    Investigating a target the operator did not type is the worst
+    failure mode this tool has, so anything that is not a clean
+    hostname after removing the parts we deliberately discard
+    (scheme, path, query, port, trailing dot, userinfo) is now an
+    error the caller has to see.
     """
     if not isinstance(raw, str):
         raise InputValidationError("domain", "must be a string")
     s = raw.strip().lower()
     # Remove protocol
     s = re.sub(r"^https?://", "", s)
-    # Discard path and query string
+    # Discard userinfo ("user:pass@host"), path, and query string
     s = s.split("/")[0].split("?")[0]
-    s = _DOMAIN_INVALID.sub("", s)
+    if "@" in s:
+        s = s.rsplit("@", 1)[1]
+    # Discard an explicit port. Bracketed IPv6 literals are not valid
+    # targets for this mode, so only the simple "host:port" form is
+    # handled; anything else falls through to the validity check.
+    s = re.sub(r":\d{1,5}$", "", s)
+    # A fully-qualified name may carry a trailing dot.
+    s = s.rstrip(".")
+
     if not s:
         raise InputValidationError("domain", "empty after sanitisation")
+    if _DOMAIN_INVALID.search(s):
+        bad = sorted({c for c in s if _DOMAIN_INVALID.match(c)})
+        raise InputValidationError(
+            "domain",
+            f"contains characters that cannot appear in a hostname: "
+            f"{''.join(bad)!r}",
+        )
+    if ".." in s or s.startswith(".") or s.startswith("-"):
+        raise InputValidationError("domain", "malformed hostname")
     return s
 
 

@@ -3,26 +3,12 @@ discord_osint/enrichment/lusha_client.py
 ----------------------------------------
 Lusha V3 contact-enrichment client.
 
-Endpoint facts (as of the current docs):
-
-* ``POST /v3/contacts/search-and-enrich`` — search by identifier and
-  reveal full contact data in one call. Up to **100** contacts per
-  request.
-* Auth header is ``api_key: Bearer <key>``.
-* Accepted input identifiers: ``id`` (Lusha contact ID), ``linkedinUrl``,
-  ``email``, ``firstName`` + ``lastName`` + ``companyName`` or
-  ``companyDomain``. **Phones are not an input.**
-* Credit cost: 1 credit per result returned; bulk requests cost 1 credit
-  per 1–25 results. **A request that returns no results still costs a
-  minimum of 1 credit** — this is the single most important difference
-  from Apollo.
-* Credit balance: ``GET /v3/account/usage`` (5 req/min) returns
-  ``credits.total``, ``credits.used``, ``credits.remaining``.
-
-Because Lusha charges a minimum of 1 credit even for a zero-result
-batch, this client splits a batch into individual requests only when the
-caller explicitly asks for it. By default it submits all survivors in a
-single call so the per-batch minimum is paid once.
+Change log
+----------
+- Phase 5: requests calls route through the shared ``http_session``.
+  The Retry adapter handles transient 429s from Lusha's 5 req/min
+  account-usage limit and the search-and-enrich endpoint's per-minute
+  budget.
 """
 
 from __future__ import annotations
@@ -30,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import requests
+from ..utils import http_session
 
 try:
     from ..utils import log_trace
@@ -64,10 +50,6 @@ class LushaClient:
         self.api_key = (api_key or "").strip()
         self.timeout = timeout
 
-    # ------------------------------------------------------------------ #
-    # Internal
-    # ------------------------------------------------------------------ #
-
     def _headers(self) -> dict:
         return {
             "api_key":      f"Bearer {self.api_key}",
@@ -85,12 +67,6 @@ class LushaClient:
         *,
         reveal_phones: bool = False,
     ) -> LushaEnrichmentResult:
-        """
-        Submit *identifiers* in a single batched call (up to 100).
-
-        ``reveal_phones`` costs 5 extra credits per contact, so it
-        defaults to off. Emails are always revealed at 1 credit each.
-        """
         if not identifiers:
             return LushaEnrichmentResult([], 0.0, {})
 
@@ -103,12 +79,9 @@ class LushaClient:
         if not contacts:
             return LushaEnrichmentResult([], 0.0, {})
 
-        # Lusha accepts up to 100 contacts per call. Anything beyond that
-        # is split into additional calls — each of which pays its own
-        # minimum-credit cost.
-        all_contacts: list[dict] = []
-        total_credits = 0.0
-        last_raw: dict = {}
+        all_contacts:  list[dict] = []
+        total_credits: float      = 0.0
+        last_raw:      dict       = {}
 
         for i in range(0, len(contacts), _BATCH_MAX):
             chunk = contacts[i:i + _BATCH_MAX]
@@ -121,13 +94,13 @@ class LushaClient:
             }
 
             try:
-                resp = requests.post(
+                resp = http_session.post(
                     _SEARCH_ENRICH,
                     headers=self._headers(),
                     json=body,
                     timeout=self.timeout,
                 )
-            except requests.RequestException as exc:
+            except Exception as exc:
                 log_trace(f"lusha: network error on search-and-enrich: {exc}")
                 print(f"  [!] Lusha: network error ({exc}) — skipping batch.")
                 continue
@@ -151,7 +124,7 @@ class LushaClient:
                 raise LushaPlanError("Lusha plan does not permit reveal")
 
             if resp.status_code == 429:
-                log_trace("lusha: 429 rate limited.")
+                log_trace("lusha: 429 rate limited after retries.")
                 print("  [!] Lusha: rate limited — skipping batch.")
                 continue
 
@@ -171,8 +144,6 @@ class LushaClient:
 
             last_raw = data
 
-            # V3 search-and-enrich returns {"contacts": {...}, "companies": {...}}
-            # keyed by client reference id. Older shapes returned a list.
             if isinstance(data, dict):
                 contact_block = data.get("contacts")
                 if isinstance(contact_block, dict):
@@ -185,13 +156,9 @@ class LushaClient:
             except (TypeError, ValueError):
                 pass
 
-        # A zero-result batch still consumes the minimum 1 credit — record
-        # it so the report is honest about the spend.
         if not all_contacts and identifiers:
             total_credits = max(total_credits, 1.0)
-            log_trace(
-                f"lusha: batch returned 0 results — minimum 1 credit consumed."
-            )
+            log_trace("lusha: batch returned 0 results — minimum 1 credit consumed.")
 
         return LushaEnrichmentResult(
             contacts=all_contacts,
@@ -201,14 +168,12 @@ class LushaClient:
 
     @staticmethod
     def _identifier_to_contact(ident: Any, idx: int) -> dict | None:
-        """Map a trust-filter Identifier onto a Lusha ``contacts[]`` entry."""
         kind  = getattr(ident, "kind", "")
         value = (getattr(ident, "value", "") or "").strip()
         if not value:
             return None
 
         entry: dict = {"clientReferenceId": f"whocord-{idx}"}
-
         if kind == "email":
             entry["email"] = value
         elif kind == "linkedin":
@@ -216,7 +181,6 @@ class LushaClient:
         else:
             log_trace(f"lusha: dropping unsupported identifier kind={kind!r}")
             return None
-
         return entry
 
     # ------------------------------------------------------------------ #
@@ -224,19 +188,13 @@ class LushaClient:
     # ------------------------------------------------------------------ #
 
     def get_credit_balance(self) -> int | None:
-        """
-        Return the remaining credit balance, or ``None`` when unknown.
-
-        Uses ``GET /v3/account/usage``. The endpoint is rate-limited to
-        5 requests per minute, so callers should cache the result.
-        """
         try:
-            resp = requests.get(
+            resp = http_session.get(
                 _ACCOUNT_USAGE,
                 headers=self._headers(),
                 timeout=self.timeout,
             )
-        except requests.RequestException as exc:
+        except Exception as exc:
             log_trace(f"lusha: balance network error: {exc}")
             return None
 
@@ -259,18 +217,13 @@ class LushaClient:
             return None
 
     def test_connection(self) -> dict:
-        """
-        Return ``{"ok": bool, "balance": int|None, "error": str|None}``.
-
-        Uses the 0-credit account-usage endpoint.
-        """
         try:
-            resp = requests.get(
+            resp = http_session.get(
                 _ACCOUNT_USAGE,
                 headers=self._headers(),
                 timeout=self.timeout,
             )
-        except requests.RequestException as exc:
+        except Exception as exc:
             return {"ok": False, "balance": None, "error": f"network error: {exc}"}
 
         if resp.status_code == 401:

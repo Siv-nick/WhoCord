@@ -1,3 +1,4 @@
+
 """
 discord_osint/errors.py
 -----------------------
@@ -38,13 +39,32 @@ class InputValidationError(WhoCordError):
 
 
 class ToolExecutionError(WhoCordError):
-    """Raised when an external OSINT tool fails in a non-recoverable way."""
+    """
+    Raised when an external OSINT tool fails in a non-recoverable way.
 
-    def __init__(self, tool: str, details: str = ""):
-        msg = f"Tool '{tool}' failed"
+    Signature note
+    --------------
+    Every other exception in this hierarchy takes the human-readable
+    message first. This one used to take ``tool`` first, so
+    ``ToolExecutionError("h8mail timed out", tool="h8mail")`` — the
+    natural call shape, and the one the tests use — raised
+    ``TypeError: got multiple values for argument 'tool'``.
+
+    ``message`` is now first and positional; ``tool`` and ``details``
+    are keyword-only. When ``tool`` is supplied it is prefixed onto the
+    message so the rendered text is unchanged from before.
+    """
+
+    def __init__(self, message: str = "", *, tool: str = "", details: str = ""):
+        if tool and not message:
+            msg = f"Tool {tool!r} failed"
+        elif tool:
+            msg = f"Tool {tool!r} failed: {message}"
+        else:
+            msg = message or "Tool execution failed"
         if details:
-            msg += f": {details}"
-        super().__init__(msg, error_code="TOOL_ERROR")
+            msg += f" ({details})"
+        super().__init__(msg, error_code="TOOL_EXECUTION")
         self.tool = tool
         self.details = details
 
@@ -66,3 +86,4 @@ class PipelineAbortError(WhoCordError):
         )
         self.stage = stage
         self.reason = reason
+

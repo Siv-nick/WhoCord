@@ -109,12 +109,24 @@ export function calculateEdgePath(
     return `M ${startX} ${startY} L ${endX} ${endY}`;
   }
 
-  const mid     = midpoint(start, end);
-  const perp    = perpendicular(start, end, NODE_RADIUS + maxPenetration + 20);
-  const cp1     = { x: mid.x + perp.x, y: mid.y + perp.y };
-  const cp2     = { x: mid.x - perp.x, y: mid.y - perp.y };
-  const control = dist(cp1, worstObstacle.position) > dist(cp2, worstObstacle.position)
-    ? cp1 : cp2;
+  const mid  = midpoint(start, end);
+  const perp = perpendicular(start, end, NODE_RADIUS + maxPenetration + 20);
+  const cp1  = { x: mid.x + perp.x, y: mid.y + perp.y };
+  const cp2  = { x: mid.x - perp.x, y: mid.y - perp.y };
+
+  // Bow away from the obstacle. When the obstacle sits (almost) exactly
+  // on the midpoint the two candidates are equidistant from it, and a
+  // bare `>` resolved that degenerate tie on floating-point noise. While
+  // edges were routed in screen space that made the curve flip sides
+  // mid-pan, because panning changes the absolute coordinates and hence
+  // the rounding. Routing in graph space already removes the pan
+  // dependency; an explicit epsilon also stops the tie being decided by
+  // rounding at all, so the choice is reproducible run to run.
+  const d1 = dist(cp1, worstObstacle.position);
+  const d2 = dist(cp2, worstObstacle.position);
+  const control = Math.abs(d1 - d2) < 1e-6
+    ? cp1                 // degenerate: pick a side, deterministically
+    : (d1 > d2 ? cp1 : cp2);
 
   return `M ${startX} ${startY} Q ${control.x} ${control.y} ${endX} ${endY}`;
 }

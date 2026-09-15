@@ -1,66 +1,24 @@
 // src/types/investigation.ts
 import type { IconName } from "../components/Icons";
 
-// ---------------------------------------------------------------------------
-// Investigation modes
-// ---------------------------------------------------------------------------
-
 export type InvestigationMode =
-  | "manual"
-  | "discord"
-  | "email"
-  | "domain"
-  | "phone"
-  | "image"
-  | "url"
-  | "probe";
-
-// ---------------------------------------------------------------------------
-// Investigation status
-// ---------------------------------------------------------------------------
+  | "manual" | "discord" | "email" | "domain" | "phone" | "image" | "url" | "probe";
 
 export type InvestigationStatus =
-  | "idle"
-  | "running"
-  | "stopping"
-  | "done"
-  | "cancelled"
-  | "error";
-
-// ---------------------------------------------------------------------------
-// SSE event envelope
-// ---------------------------------------------------------------------------
+  | "idle" | "running" | "stopping" | "done" | "cancelled" | "error";
 
 export type EventType =
-  | "job_start"
-  | "stage_start"
-  | "stage_done"
-  | "stage_error"
-  | "abort"
-  | "progress"
-  | "finding"
-  | "report_ready"
-  | "pivot_start"
-  | "pivot_done"
-  | "pivot_error"
-  | "pivot_skipped"
-  | "pivot_confirm_request"
-  | "pivot_confirm_timeout"
-  | "log"
-  | "done"
-  | "error"
-  | "heartbeat"
-  | "stream_end"
+  | "job_start" | "stage_start" | "stage_done" | "stage_error"
+  | "abort" | "progress" | "finding" | "report_ready"
+  | "pivot_start" | "pivot_done" | "pivot_error" | "pivot_skipped"
+  | "pivot_confirm_request" | "pivot_confirm_timeout"
+  | "log" | "done" | "error" | "heartbeat" | "stream_end"
   | "profile_enrichment";
 
 export interface SSEEvent {
   type:    EventType;
   payload: Record<string, unknown>;
 }
-
-// ---------------------------------------------------------------------------
-// Pivot types
-// ---------------------------------------------------------------------------
 
 export interface PivotSeed {
   value: string;
@@ -82,10 +40,6 @@ export interface PivotInfo {
   depth:    number;
   status:   PivotStatus;
 }
-
-// ---------------------------------------------------------------------------
-// Finding payload
-// ---------------------------------------------------------------------------
 
 export interface FindingPayload {
   type:               string;
@@ -113,10 +67,6 @@ export interface FindingPayload {
   [key: string]:      unknown;
 }
 
-// ---------------------------------------------------------------------------
-// Stage state
-// ---------------------------------------------------------------------------
-
 export type StageStatus = "pending" | "running" | "done" | "error" | "aborted";
 
 export interface StageState {
@@ -128,10 +78,6 @@ export interface StageState {
   finishedAt?:   number;
   errorMessage?: string;
 }
-
-// ---------------------------------------------------------------------------
-// Finding card
-// ---------------------------------------------------------------------------
 
 export type FindingCategory =
   | "identity" | "email" | "social" | "breach"
@@ -149,10 +95,6 @@ export interface Finding {
   payload:   FindingPayload;
 }
 
-// ---------------------------------------------------------------------------
-// Investigation live state
-// ---------------------------------------------------------------------------
-
 export interface InvestigationState {
   jobId:               string | null;
   target:              string;
@@ -168,23 +110,17 @@ export interface InvestigationState {
   pivotConfirmPending: PivotConfirmRequestPayload | null;
 }
 
-// ---------------------------------------------------------------------------
-// History
-// ---------------------------------------------------------------------------
-
 export interface Job {
-  id:         string;
-  target:     string;
-  mode:       InvestigationMode | string;
-  started_at: string;
-  status:     "running" | "done" | "error";
-  has_report: boolean;
-  has_intel:  boolean;
+  id:            string;
+  target:        string;
+  mode:          InvestigationMode | string;
+  case_id:       string;
+  started_at:    string;
+  status:        "running" | "done" | "cancelled" | "error";
+  has_report:    boolean;
+  has_intel:     boolean;
+  has_manifest?: boolean;
 }
-
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
 
 export interface TokenStatus {
   DISCORD_TOKEN:      boolean;
@@ -195,6 +131,8 @@ export interface TokenStatus {
   INSTAGRAM_SESSION:  boolean;
   APOLLO_API_KEY:     boolean;
   LUSHA_API_KEY:      boolean;
+  CORD_CAT_API_KEY:   boolean;
+  TINEYE_API_KEY:     boolean;
 }
 
 export interface ToolConfig {
@@ -212,7 +150,7 @@ export interface PivotConfig {
   require_confirm: boolean;
 }
 
-export type LLMProvider = "groq" | "openrouter";
+export type LLMProvider = "groq" | "openrouter" | "ollama";
 
 export interface LLMConfig {
   provider:            LLMProvider;
@@ -224,8 +162,6 @@ export interface LLMConfig {
   intel_include_raw:   boolean;
   intel_exclude_meta:  boolean;
 }
-
-// ── Contact-enrichment configuration ──────────────────────────────────────
 
 export type EnrichmentProvider = "apollo" | "lusha";
 
@@ -248,20 +184,20 @@ export interface EnrichmentTestResult {
   error:   string | null;
 }
 
+export type OutputFormat = "html" | "markdown" | "json";
+
 export interface AppConfig {
   tokens:             TokenStatus;
   tools:              ToolConfig[];
   mode:               string;
   multi_guild_search: boolean;
   debug:              boolean;
+  output_format:      OutputFormat;
+  retention_days:     number;
   pivot:              PivotConfig;
   llm:                LLMConfig;
   enrichment:         EnrichmentConfig;
 }
-
-// ---------------------------------------------------------------------------
-// Run parameters
-// ---------------------------------------------------------------------------
 
 export interface RunParams {
   mode:         InvestigationMode;
@@ -271,11 +207,8 @@ export interface RunParams {
   guild_id?:    string;
   multi_guild?: boolean;
   target?:      string;
+  case_id?:     string;
 }
-
-// ---------------------------------------------------------------------------
-// Module metadata
-// ---------------------------------------------------------------------------
 
 export interface ModuleMeta {
   id:               InvestigationMode;
@@ -293,4 +226,38 @@ export interface ModuleMeta {
     required:    boolean;
     type:        "text" | "checkbox";
   }>;
+}
+
+// ---------------------------------------------------------------------------
+// Cost tracking (Phase 4)
+// ---------------------------------------------------------------------------
+
+export interface CostBreakdownEntry {
+  kind:            "llm" | "enrichment";
+  service?:        string;
+  model?:          string;
+  bytes_in?:       number;
+  bytes_out?:      number;
+  est_tokens_in?:  number;
+  est_tokens_out?: number;
+  cost_usd?:       number;
+  ok?:             boolean;
+  provider?:       string;
+  credits?:        number;
+  matched?:        number;
+}
+
+export interface CostSummary {
+  job_id:              string;
+  available:           boolean;
+  reason?:             string;
+  llm_calls:           number;
+  llm_bytes_in:        number;
+  llm_bytes_out:       number;
+  llm_est_tokens_in:   number;
+  llm_est_tokens_out:  number;
+  llm_cost_usd:        number;
+  enrichment_calls:    number;
+  enrichment_credits:  number;
+  breakdown:           CostBreakdownEntry[];
 }

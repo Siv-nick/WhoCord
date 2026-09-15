@@ -1,3 +1,20 @@
+"""
+discord_osint/discord_api.py
+--------------------------
+Discord API wrappers and URL classification.
+
+Change log
+----------
+- ``search_user_messages`` and ``get_all_user_guilds`` write an
+  ``elevated_risk_discord_search`` audit event before contacting the
+  private ``guilds/<id>/messages/search`` endpoint with a user token.
+  This is a self-bot pattern that violates Discord's Terms of Service
+  and can result in account termination; every use is recorded so the
+  audit log reflects the disclosure surface and the operational risk.
+- ``resolve_tracking_links`` runs the per-URL ShareTrace invocations in
+  a small worker pool.
+"""
+
 import re
 import time
 import json
@@ -12,15 +29,29 @@ import requests
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from . import utils
-from .utils import http_session, REQUEST_DELAY, clean_username
+from .utils import http_session, REQUEST_DELAY, clean_username, log_trace
+from .platforms import PLATFORMS, INVALID_SLUGS
+from . import audit as _audit
 
-# ── Bug 3 fix: never bind tool flags at import time. ──────────────────
-from . import config as _config_module
+from .config import get_flag as _flag
 
 
-def _flag(name: str, default: bool = False) -> bool:
-    """Read a config flag dynamically (Bug 3 fix)."""
-    return bool(getattr(_config_module, name, default))
+def _audit_elevated_risk(endpoint: str, **fields) -> None:
+    """
+    Record one self-bot user-token call.
+
+    Best-effort: an audit failure must never abort the API call. The
+    event name is fixed so an operator can grep for it in the log.
+    """
+    try:
+        _audit.write_event(
+            "elevated_risk_discord_search",
+            endpoint=endpoint,
+            reason="self-bot user-token against private endpoint",
+            **fields,
+        )
+    except Exception:
+        pass
 
 
 def get_discord_user_profile(token, uid, gid):
@@ -31,8 +62,11 @@ def get_discord_user_profile(token, uid, gid):
         )
         if r.status_code == 200:
             return r.json().get("user")
-    except Exception:
-        pass
+        log_trace(
+            f"get_discord_user_profile: HTTP {r.status_code} for uid={uid} gid={gid}"
+        )
+    except Exception as exc:
+        log_trace(f"get_discord_user_profile: {type(exc).__name__}: {exc}")
     return None
 
 
@@ -47,8 +81,9 @@ def enrich_discord_profile(token, uid):
         )
         if r.status_code == 200:
             return r.json()
-    except Exception:
-        pass
+        log_trace(f"enrich_discord_profile: HTTP {r.status_code} for uid={uid}")
+    except Exception as exc:
+        log_trace(f"enrich_discord_profile: {type(exc).__name__}: {exc}")
     return {}
 
 
@@ -58,6 +93,7 @@ def snowflake_to_datetime(snowflake: int):
 
 
 def get_all_user_guilds(token):
+    _audit_elevated_risk("users/@me/guilds")
     headers = {"Authorization": token}
     guilds = []
     try:
@@ -66,22 +102,19 @@ def get_all_user_guilds(token):
             for g in r.json():
                 if "id" in g:
                     guilds.append(g["id"])
-    except Exception:
-        pass
+        else:
+            log_trace(f"get_all_user_guilds: HTTP {r.status_code}")
+    except Exception as exc:
+        log_trace(f"get_all_user_guilds: {type(exc).__name__}: {exc}")
     return guilds
 
 
 def search_user_messages(token, gid, uid, quiet: bool = False):
-    """
-    Search one guild for messages authored by *uid*.
-
-    Parameters
-    ----------
-    quiet:
-        When True, suppress the in-place progress print. Set by the
-        parallel guild search so concurrent workers don't interleave
-        carriage-return progress on the same line.
-    """
+    _audit_elevated_risk(
+        "guilds/{gid}/messages/search",
+        guild_id=str(gid),
+        target_id=str(uid),
+    )
     h = {"Authorization": token, "Content-Type": "application/json",
          "User-Agent": "Mozilla/5.0"}
     base = f"https://discord.com/api/v9/guilds/{gid}/messages/search"
@@ -130,21 +163,6 @@ def search_user_messages(token, gid, uid, quiet: bool = False):
 
 
 def multi_guild_message_search(token, uid, preferred_gid=None):
-    """
-    Search every guild the token belongs to for messages by *uid*.
-
-    Change log
-    ----------
-    The previous implementation iterated guilds serially with a fixed
-    ``time.sleep(5)`` between each — an account in 40 guilds took 200+
-    seconds of pure sleep, on top of the actual API work. Each guild's
-    search is independent, so they now run in a small worker pool.
-
-    Concurrency is capped at 5 because Discord rate-limits per token,
-    not per guild. Each ``search_user_messages`` call still backs off on
-    429 (Retry-After header) so a burst doesn't get the token banned.
-    """
-    # <<< Bug 3 fix: read the flag dynamically >>>
     if preferred_gid and not _flag("MULTI_GUILD_SEARCH"):
         return search_user_messages(token, preferred_gid, uid)
 
@@ -154,9 +172,6 @@ def multi_guild_message_search(token, uid, preferred_gid=None):
             return search_user_messages(token, preferred_gid, uid)
         return []
 
-    # If the caller asked to search a specific guild too, include it even
-    # if it's already in the list (the list contains every guild the user
-    # is a member of, which may or may not include the target's guild).
     if preferred_gid and preferred_gid not in guilds:
         guilds = [preferred_gid] + list(guilds)
 
@@ -219,96 +234,74 @@ def extract_tracking_links(messages, uid):
     return tracked
 
 
+def _resolve_one_tracking_link(plat: str, url: str, sharetrace_dir: str):
+    print(f"  Resolving {plat} link: {url[:60]}...")
+    if getattr(sys, 'frozen', False):
+        python_exe = utils._get_frozen_python()
+        sharetrace_script = os.path.join(os.path.dirname(sys.executable), "sharetrace")
+        cmd = [python_exe, sharetrace_script, url, "--json"]
+    else:
+        cmd = [sys.executable, "-m", "sharetrace", url, "--json"]
+    try:
+        if utils.DEBUG_MODE:
+            utils.debug_subprocess(cmd, cwd=sharetrace_dir, timeout=30)
+            return plat, None
+        res = _sp.run(cmd, capture_output=True, text=True, timeout=30, cwd=sharetrace_dir)
+        if res.returncode == 0 and res.stdout.strip():
+            data = json.loads(res.stdout)
+            data["url"] = url
+            return plat, data
+    except Exception as e:
+        print(f"    ShareTrace error: {e}")
+    return plat, None
+
+
 def resolve_tracking_links(tracked):
-    resolved = {}
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    resolved: dict[str, list] = {}
+    project_root   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     sharetrace_dir = os.path.join(project_root, "sharetrace")
+
+    tasks: list[tuple[str, str]] = []
     for plat, urls in tracked.items():
         if plat == "facebook":
             continue
-        pr = []
         for url in urls:
-            print(f"  Resolving {plat} link: {url[:60]}...")
-            if getattr(sys, 'frozen', False):
-                python_exe = utils._get_frozen_python()
-                sharetrace_script = os.path.join(os.path.dirname(sys.executable), "sharetrace")
-                cmd = [python_exe, sharetrace_script, url, "--json"]
-            else:
-                cmd = [sys.executable, "-m", "sharetrace", url, "--json"]
+            tasks.append((plat, url))
+
+    if not tasks:
+        return resolved
+
+    max_workers = min(5, len(tasks))
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {
+            ex.submit(_resolve_one_tracking_link, plat, url, sharetrace_dir): (plat, url)
+            for plat, url in tasks
+        }
+        for fut in as_completed(futures):
             try:
-                if utils.DEBUG_MODE:
-                    utils.debug_subprocess(cmd, cwd=sharetrace_dir, timeout=30)
-                else:
-                    res = _sp.run(cmd, capture_output=True, text=True, timeout=30, cwd=sharetrace_dir)
-                    if res.returncode == 0 and res.stdout.strip():
-                        data = json.loads(res.stdout)
-                        data["url"] = url
-                        pr.append(data)
-            except Exception as e:
-                print(f"    ShareTrace error: {e}")
-        if pr:
-            resolved[plat] = pr
-            time.sleep(2)
+                plat, data = fut.result()
+            except Exception as exc:
+                log_trace(f"resolve_tracking_links: worker raised "
+                          f"{type(exc).__name__}: {exc}")
+                continue
+            if data is not None:
+                resolved.setdefault(plat, []).append(data)
+
     return resolved
-
-
-PLATFORM_MAP = {
-    "twitter.com": "twitter", "x.com": "twitter", "instagram.com": "instagram",
-    "github.com": "github", "tiktok.com": "tiktok", "twitch.tv": "twitch",
-    "youtube.com": "youtube", "reddit.com": "reddit",
-    "steamcommunity.com": "steam", "facebook.com": "facebook",
-}
-INVALID_SLUGS = {"r", "i", "c", "user", "watch", "play", "wiki", "blog",
-                 "channel", "u", "explore", "search", "status", "share", "groups"}
 
 
 def classify_url(url):
     if not url or not url.startswith("http"):
         return None, None
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return None, None
-    domain = parsed.netloc.lower().replace("www.", "")
-    if domain not in PLATFORM_MAP:
-        return None, None
-    platform = PLATFORM_MAP[domain]
-    parts = parsed.path.strip("/").split("/")
-    if platform == "reddit":
-        if len(parts) >= 2 and parts[0] in ("user", "u"):
-            slug = parts[1].lower()
-            return (platform, slug) if slug not in INVALID_SLUGS else (None, None)
-        return None, None
-    if platform in ("twitter", "instagram", "tiktok", "twitch", "github", "youtube"):
-        if not parts:
-            return None, None
-        slug = parts[0].lower()
-        if slug in INVALID_SLUGS or slug.startswith("?") or slug.startswith("#"):
-            return None, None
-        if platform == "github":
-            if not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$', slug):
-                return None, None
-        return platform, slug
-    if platform == "facebook":
-        if "profile.php" in url:
-            m = re.search(r'id=(\d+)', url)
-            if m:
-                return platform, m.group(1)
-        if parts:
-            slug = parts[0]
-            if slug and slug not in ("pages", "groups", "events", "help", "settings", "watch", "share"):
-                return platform, slug
-        return None, None
-    if platform == "steam":
-        if "id" in parts:
-            idx = parts.index("id") + 1
-            if idx < len(parts):
-                return platform, parts[idx]
-        if "profiles" in parts:
-            idx = parts.index("profiles") + 1
-            if idx < len(parts):
-                return platform, parts[idx]
-        return None, None
+    for platform in PLATFORMS.values():
+        for pattern in platform.url_patterns:
+            m = re.match(pattern, url, re.IGNORECASE)
+            if not m:
+                continue
+            slug = m.group("slug").lower()
+            if slug in INVALID_SLUGS:
+                continue
+            return platform.key, slug
     return None, None
 
 

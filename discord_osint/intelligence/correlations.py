@@ -1,3 +1,4 @@
+
 """
 discord_osint/intelligence/correlations.py
 --------------------------------------------
@@ -268,7 +269,21 @@ def detect_username_variants(
 
             dist = _levenshtein(a_low, b_low)
             if 0 < dist <= MAX_DIST:
-                conf = 0.78 if dist == 1 else 0.55
+                # Matching is case-insensitive because most platforms
+                # treat usernames that way — 'Bob' and 'bob' are the
+                # same handle. But folding case before measuring threw
+                # away a real signal: 'bob' → 'bob_' is one edit, and
+                # 'bob' → 'Bob2' is one edit *plus* a case change, yet
+                # both scored an identical 0.78.
+                #
+                # So: the case-folded distance sets the band, and a
+                # raw-form distance that exceeds it applies a penalty.
+                # More transformations to get from one handle to the
+                # other means less confidence they are the same person.
+                raw_dist = _levenshtein(a.value, b.value)
+                case_penalty = 0.06 if raw_dist > dist else 0.0
+
+                conf = (0.78 if dist == 1 else 0.55) - case_penalty
                 plat_a = a.platform or "unknown"
                 plat_b = b.platform or "unknown"
 

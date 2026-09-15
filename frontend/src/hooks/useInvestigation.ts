@@ -1,18 +1,27 @@
 // src/hooks/useInvestigation.ts
-// Connects an SSE stream (/run) to the canvas graph state and exposes
-// status / findings / pivots so the AI chat can include them.
 //
-// Stop plumbing
-// -------------
-// `stop()` calls the /stop endpoint with the current job id, tracks a
-// `stopping` state while the server acknowledges, and lets the pipeline
-// tear down cleanly at the next stage boundary. The old `stop()`
-// implementation was purely client-side — it closed the EventSource
-// while the server kept running the investigation.
+// Streams the /run SSE response over a POST fetch.
+//
+// EventSource cannot set custom headers, so it was replaced with
+// fetch + ReadableStream — the same pattern useChat.ts already uses.
+//
+// Change log
+// ----------
+// - Phase 4: derives a confidence value for each created node from
+//   the finding payload (via classify.confidenceForFinding) and
+//   stores it on the GraphNode. The canvas renders this as a thin
+//   ring around the node and the InfoCard shows it explicitly.
+// - Pre-existing bug fixed: the finding handler used to read
+//   currentStage from a stale closure captured at start() time, so
+//   every Finding was recorded with stage="". Now read through a ref.
 
-import { useCallback, useRef, useState } from "react";
-import { buildRunUrl, stopInvestigation } from "../utils/api";
-import { classifyInput, findingTypeToEntityType } from "../utils/classify";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { apiFetch, runUrl, stopInvestigation } from "../utils/api";
+import {
+  classifyInput,
+  confidenceForFinding,
+  findingTypeToEntityType,
+} from "../utils/classify";
 import { childPosition } from "../utils/graphLayout";
 import { newEdgeId, newNodeId, useGraphState } from "./useGraphState";
 import type {
@@ -137,6 +146,18 @@ function extractLabel(ftype: string, p: Record<string, unknown>): string {
       return `Gravatar: ${String(p.email ?? "")}`.slice(0, 60);
     case "name_clue":
       return String(p.value ?? "").slice(0, 60);
+    case "cordcat_user":
+      return `CordCat: ${String(p.username ?? "")}`.slice(0, 60);
+    case "cordcat_breach":
+      return `CordCat breach: ${String(p.count ?? "?")}`;
+    case "cordcat_fivem":
+      return `CordCat FiveM: ${String(p.count ?? "?")}`;
+    case "cordcat_dsa_statement":
+      return `DSA: ${String(p.facts ?? "").slice(0, 50)}`;
+    case "cordcat_score":
+      return `CordCat score: ${String(p.value ?? "?")}`;
+    case "activity_profile":
+      return `Activity: ${String(p.offset ?? "?")}`;
     default:
       return (
         String(p.value  ?? "") ||
@@ -293,6 +314,77 @@ function buildInfoFields(ftype: string, p: Record<string, unknown>): InfoField[]
       }
       break;
     }
+    case "cordcat_user": {
+      push("username", "Username", String(p.username ?? ""));
+      push("display_name", "Display Name", String(p.display_name ?? ""));
+      push("account_created", "Account Created", String(p.account_created ?? ""));
+      const badges = p.badges;
+      if (Array.isArray(badges) && badges.length) {
+        push("badges", "Badges", (badges as string[]).join(", "));
+      }
+      const avatar = String(p.avatar ?? "");
+      if (avatar && isAvatarUrl(avatar)) {
+        fields.push({ key: "avatar", label: "Avatar", value: avatar, editable: false, isImage: true });
+      }
+      break;
+    }
+    case "cordcat_breach": {
+      push("count", "Entries", String(p.count ?? ""));
+      const datasets = p.datasets;
+      if (Array.isArray(datasets) && datasets.length) {
+        push("datasets", "Datasets", (datasets as string[]).join(", "));
+      }
+      const exposed = p.exposed_fields;
+      if (Array.isArray(exposed) && exposed.length) {
+        push("exposed_fields", "Exposed Fields", (exposed as string[]).join(", "));
+      }
+      if (p.geo && typeof p.geo === "object") {
+        const g = p.geo as Record<string, unknown>;
+        const parts = Object.entries(g).map(([k, v]) => `${k}: ${v}`);
+        if (parts.length) push("geo", "GeoIP", parts.join(", "));
+      }
+      if (p.asn && typeof p.asn === "object") {
+        const a = p.asn as Record<string, unknown>;
+        const parts = Object.entries(a).map(([k, v]) => `${k}: ${v}`);
+        if (parts.length) push("asn", "ASN", parts.join(", "));
+      }
+      break;
+    }
+    case "cordcat_fivem": {
+      push("count", "Records", String(p.count ?? ""));
+      const records = p.records;
+      if (Array.isArray(records) && records.length) {
+        const first = records[0];
+        if (first && typeof first === "object") {
+          for (const [k, v] of Object.entries(first as Record<string, unknown>)) {
+            if (v && typeof v !== "object") push(k, k, String(v));
+          }
+        }
+      }
+      break;
+    }
+    case "cordcat_dsa_statement": {
+      push("facts", "Facts", String(p.facts ?? ""));
+      push("scope", "Scope", String(p.scope ?? ""));
+      push("grounds", "Legal Grounds", String(p.grounds ?? ""));
+      break;
+    }
+    case "cordcat_score": {
+      push("value", "Score", String(p.value ?? ""));
+      const reasons = p.reasons;
+      if (Array.isArray(reasons) && reasons.length) {
+        push("reasons", "Reasons", (reasons as string[]).join(", "));
+      }
+      break;
+    }
+    case "activity_profile": {
+      push("offset", "Inferred Timezone", String(p.offset ?? ""));
+      push("active", "Active Hours", String(p.active ?? ""));
+      push("cadence", "Posting Cadence", String(p.cadence ?? ""));
+      push("confidence", "Confidence", String(p.confidence ?? ""));
+      push("sample", "Sample Size", String(p.sample ?? ""));
+      break;
+    }
     default: {
       const url = String(p.url ?? "");
       const val = String(p.value ?? "");
@@ -346,6 +438,12 @@ const FINDING_CATEGORIES: Record<string, FindingCategory> = {
   pivot_done:          "pivot",
   pivot_error:         "pivot",
   pivot_skipped:       "pivot",
+  cordcat_user:        "identity",
+  cordcat_breach:      "breach",
+  cordcat_fivem:       "identity",
+  cordcat_dsa_statement: "identity",
+  cordcat_score:       "intelligence",
+  activity_profile:    "intelligence",
 };
 
 let _fid = 0;
@@ -375,8 +473,8 @@ export interface UseInvestigationResult {
 export function useInvestigation(): UseInvestigationResult {
   const { addNode, addEdge, updateNode } = useGraphState();
 
-  const esRef        = useRef<EventSource | null>(null);
-  const urlToNodeId  = useRef<Map<string, string>>(new Map());
+  const abortRef        = useRef<AbortController | null>(null);
+  const urlToNodeId     = useRef<Map<string, string>>(new Map());
   const parentNextIndex = useRef<Map<string, number>>(new Map());
   const parentNodeKeys  = useRef<Map<string, Set<string>>>(new Map());
   const jobIdRef        = useRef<string | null>(null);
@@ -397,20 +495,22 @@ export function useInvestigation(): UseInvestigationResult {
   const [pivots,     setPivots]     = useState<PivotInfo[]>([]);
   const [findings,   setFindings]   = useState<Finding[]>([]);
 
+  // Live currentStage for the finding handler.
+  const currentStageRef = useRef<string | null>(null);
+  currentStageRef.current = currentStage;
+
   const closeStream = useCallback(() => {
-    esRef.current?.close();
-    esRef.current = null;
+    abortRef.current?.abort();
+    abortRef.current = null;
   }, []);
 
-  /**
-   * Signal the running investigation to abort. The server sets a
-   * cancellation token which the pipeline checks at the next stage
-   * boundary; the stream then delivers an `abort` event and finally
-   * `stream_end` with status="cancelled".
-   *
-   * We do NOT close the EventSource here — the stream needs to stay
-   * open long enough to deliver the terminal event.
-   */
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+      abortRef.current = null;
+    };
+  }, []);
+
   const stop = useCallback(async () => {
     if (!running && status !== "running") return;
     setStopping(true);
@@ -418,18 +518,12 @@ export function useInvestigation(): UseInvestigationResult {
 
     const result = await stopInvestigation(jobIdRef.current ?? undefined);
     if (!result.success) {
-      // The server refused — job may have already finished. Surface it
-      // but leave the stream alone in case it's mid-teardown.
       console.warn("stopInvestigation failed:", result.error);
       setStopping(false);
-      // If the server says "job is not running", the stream will
-      // deliver stream_end shortly. If it says something else, we
-      // fall back to running state.
       if (result.error && !result.error.includes("not running")) {
         setStatus("running");
       }
     }
-    // On success we stay in "stopping" until `stream_end` arrives.
   }, [running, status]);
 
   const resetParentCounter = useCallback((parentNodeId: string) => {
@@ -453,7 +547,8 @@ export function useInvestigation(): UseInvestigationResult {
   );
 
   const start = useCallback((parentNodeId: string, params: RunParams) => {
-    if (esRef.current) esRef.current.close();
+    abortRef.current?.abort();
+
     urlToNodeId.current = new Map();
     parentNodeKeys.current.set(parentNodeId, new Set<string>());
     parentRef.current = parentNodeId;
@@ -484,20 +579,15 @@ export function useInvestigation(): UseInvestigationResult {
 
     updateNode(parentNodeId, { investigating: true, progress: 0 });
 
-    const sseUrl  = buildRunUrl(params);
-    const es      = new EventSource(sseUrl);
-    esRef.current = es;
-
     const parentNode = liveNodes.find(n => n.id === parentNodeId);
     const parentPos  = parentNode?.position ?? { x: 0, y: 0 };
 
     let currentIndex = startIndex;
 
-    es.onmessage = (evt: MessageEvent) => {
-      let parsed: { type: string; payload: Record<string, unknown> };
-      try { parsed = JSON.parse(evt.data); }
-      catch { return; }
+    const controller = new AbortController();
+    abortRef.current = controller;
 
+    const handleEvent = (parsed: { type: string; payload: Record<string, unknown> }) => {
       const { type: evtType, payload: p } = parsed;
 
       switch (evtType) {
@@ -575,9 +665,16 @@ export function useInvestigation(): UseInvestigationResult {
           }
 
           const newLabel = name || String(p.username ?? "");
+
+          // Scraped profile data — the source is the scraping layer,
+          // so the confidence comes from the same table the backend
+          // uses for its own graph.
+          const conf = confidenceForFinding(p);
+
           updateNode(existingId, {
             infoFields: enriched,
             ...(newLabel ? { label: newLabel } : {}),
+            ...(conf !== undefined ? { confidence: conf } : {}),
           });
           break;
         }
@@ -594,10 +691,13 @@ export function useInvestigation(): UseInvestigationResult {
           if (shouldSkipAsDuplicate(parentNodeId, ftype, p)) break;
 
           const category = FINDING_CATEGORIES[ftype] ?? "other";
+          const stageNow = currentStageRef.current;
+          const confidence = confidenceForFinding(p);
+
           setFindings(prev => {
             const entry: Finding = {
               id:        nextFindingId(),
-              stage:     String(currentStage ?? ""),
+              stage:     String(stageNow ?? ""),
               type:      ftype,
               category,
               label:     extractLabel(ftype, p),
@@ -626,6 +726,7 @@ export function useInvestigation(): UseInvestigationResult {
               infoFields,
               rawData:       p as Record<string, unknown>,
               createdAt:     Date.now(),
+              confidence,
             };
             const newEdge: GraphEdge = {
               id:       newEdgeId(),
@@ -659,6 +760,7 @@ export function useInvestigation(): UseInvestigationResult {
             infoFields,
             rawData:       p as Record<string, unknown>,
             createdAt:     Date.now(),
+            confidence,
           };
 
           const edge: GraphEdge = {
@@ -716,12 +818,14 @@ export function useInvestigation(): UseInvestigationResult {
         }
 
         case "pivot_confirm_timeout": {
-          // Emitted when the confirmation window elapses without a
-          // response. We surface it in the logs so the analyst knows
-          // the pivot ran with the full seed set (server default).
+          const depth  = p.depth ?? "?";
+          const reason = String(p.reason ?? "timeout");
+          const why = reason === "cancelled"
+            ? "investigation cancelled"
+            : "confirmation window elapsed";
           setLogs(prev => [
             ...prev,
-            `[pivot] confirmation window elapsed at depth ${p.depth ?? "?"} — running full seed set`,
+            `[pivot] ${why} at depth ${depth} — skipping seeds`,
           ].slice(-600));
           break;
         }
@@ -731,7 +835,6 @@ export function useInvestigation(): UseInvestigationResult {
           break;
 
         case "abort": {
-          // The pipeline stopped early (user cancel or a stage aborted).
           const reason = String(p.reason ?? "aborted");
           setLogs(prev => [...prev, `[abort] ${reason}`].slice(-600));
           break;
@@ -757,7 +860,6 @@ export function useInvestigation(): UseInvestigationResult {
 
           setRunning(false);
           setStopping(false);
-          closeStream();
           break;
         }
 
@@ -767,18 +869,91 @@ export function useInvestigation(): UseInvestigationResult {
           setCurrentStage(null);
           setRunning(false);
           setStopping(false);
-          closeStream();
           break;
       }
     };
 
-    // Native EventSource will retry automatically. Only treat the
-    // connection as failed if it can't be re-established — the hook
-    // (not this one) tracks retry count. Here we just log.
-    es.onerror = () => {
-      setLogs(prev => [...prev, "[sse] connection interrupted — retrying…"].slice(-600));
-    };
-  }, [addNode, addEdge, updateNode, closeStream, shouldSkipAsDuplicate, currentStage]);
+    (async () => {
+      try {
+        const res = await apiFetch(runUrl(), {
+          method:  "POST",
+          headers: { "Content-Type": "application/json" },
+          body:    JSON.stringify(params),
+          signal:  controller.signal,
+        });
+
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          setLogs(prev => [
+            ...prev,
+            `[error] /run returned HTTP ${res.status}: ${text.slice(0, 200)}`,
+          ].slice(-600));
+          setStatus("error");
+          setRunning(false);
+          setStopping(false);
+          updateNode(parentNodeId, { investigating: false, progress: 0 });
+          return;
+        }
+
+        if (!res.body) {
+          setLogs(prev => [...prev, "[error] /run returned no response body"].slice(-600));
+          setStatus("error");
+          setRunning(false);
+          setStopping(false);
+          updateNode(parentNodeId, { investigating: false, progress: 0 });
+          return;
+        }
+
+        const reader  = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const raw = line.slice(6).trim();
+            if (!raw) continue;
+            try {
+              const parsed = JSON.parse(raw) as { type: string; payload: Record<string, unknown> };
+              handleEvent(parsed);
+            } catch {
+              // Ignore malformed frames.
+            }
+          }
+        }
+
+        setRunning(prev => {
+          if (prev) {
+            updateNode(parentNodeId, { investigating: false, progress: 0 });
+            setCurrentStage(null);
+          }
+          return false;
+        });
+        setStopping(false);
+      } catch (err: unknown) {
+        if ((err as Error)?.name === "AbortError") {
+          // Expected on unmount or when start() is called again.
+        } else {
+          setLogs(prev => [...prev, `[sse] error: ${err}`].slice(-600));
+          setStatus("error");
+          updateNode(parentNodeId, { investigating: false, progress: 0 });
+          setRunning(false);
+          setStopping(false);
+        }
+      } finally {
+        if (abortRef.current === controller) {
+          abortRef.current = null;
+        }
+      }
+    })();
+  }, [addNode, addEdge, updateNode, shouldSkipAsDuplicate]);
 
   return {
     progress, running, stopping, jobId, reportUrl, logs, currentStage,

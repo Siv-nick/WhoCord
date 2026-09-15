@@ -1,3 +1,4 @@
+
 """
 discord_osint/pipeline/context.py
 ----------------------------------
@@ -12,9 +13,19 @@ New optional fields for the six investigation modules:
   manual_image_url : str  – image URL for the Image module
   manual_url       : str  – arbitrary URL for the URL module
   probe_string     : str  – raw input for the Data Probe auto-detect module
-  module_mode      : str  – active module ID so stages can self-identify
-                            ("manual" | "discord" | "email" | "domain" |
-                             "phone" | "image" | "url" | "probe")
+  module_mode      : str  – active module ID
+
+Evidence snapshot path
+----------------------
+``intel_snapshot_path`` is set by ``Pipeline.run`` immediately after
+``intel_core.save_state()``. The reporting stage reads it to include
+the raw intel JSON in the signed evidence manifest — the primary
+evidence artifact must be tamper-evident, not just the derived reports.
+
+Structured logging
+------------------
+``ctx.log`` returns a StructuredLogger bound to the pipeline's emitter
+(or a stdout fallback in CLI mode).
 """
 
 from __future__ import annotations
@@ -22,89 +33,52 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..utils.logger import StructuredLogger
+
 
 @dataclass
 class InvestigationContext:
-    """
-    Shared state for one investigation run.
+    # ``mode``, ``username`` and ``target_id`` carry defaults because a
+    # module-mode run (email / domain / phone / image / url / probe) has
+    # no username, and callers were passing dummy values to satisfy the
+    # signature. Every production call site uses keyword arguments, so
+    # adding defaults is source-compatible.
+    config: Any = None
+    mode: str = ""
+    username: str = ""
+    target_id: Any = 0
 
-    Fields set by the caller (pipeline/__init__.py)
-    ------------------------------------------------
-    config      : Config / ConfigService object with all feature flags
-    mode        : "discord" | "manual"
-    username    : seed username (discord handle or manual input)
-    target_id   : int | str  – Discord snowflake or hash(username)
-
-    Fields pre-populated or optional
-    ---------------------------------
-    target_user_id  : raw Discord user ID (only discord mode)
-    target_guild_id : guild ID used for profile fetch / message search
-    manual_email    : email supplied via --email or UI
-    extra_targets   : additional usernames / emails from config
-
-    Phase 4 module fields
-    ----------------------
-    manual_domain    : domain name for Domain module
-    manual_phone     : phone number for Phone module
-    manual_image_url : image URL for Image module
-    manual_url       : arbitrary URL for URL module
-    probe_string     : raw input for Data Probe (auto-detect)
-    module_mode      : which Phase 4 module is active (or "" for legacy modes)
-
-    Phase 2 pivot metadata (read-only after construction)
-    ------------------------------------------------------
-    depth       : recursion depth (0 = root)
-    seed_type   : "email" | "username" | ""
-    seed_value  : the seed that spawned this sub-pipeline
-    """
-
-    # --- Required ---
-    config: Any
-    mode: str
-    username: str
-    target_id: Any
-
-    # --- Optional / discord-specific ---
     target_user_id: Any = None
     target_guild_id: Any = None
     manual_email: str = ""
     extra_targets: list = field(default_factory=list)
 
-    # --- Mutable stage outputs ---
+    # Per-stage scratch space. Stages that want to hand structured
+    # output to a later stage without going through intel_core (which
+    # is serialised into the report) write here instead.
+    results: dict = field(default_factory=dict, repr=False)
+
     intel_core: Any = field(default=None, repr=False)
     avatar_urls: set = field(default_factory=set, repr=False)
     discovery: list = field(default_factory=list, repr=False)
     all_urls: list = field(default_factory=list, repr=False)
     messages: list = field(default_factory=list, repr=False)
 
-    # --- Phase 2: pivot metadata ---
     depth: int = 0
     seed_type: str = ""
     seed_value: str = ""
 
-    # --- Phase 4: module-specific inputs ---
     manual_domain: str = ""
-    """Target domain name for the Domain investigation module."""
-
     manual_phone: str = ""
-    """Target phone number for the Phone investigation module."""
-
     manual_image_url: str = ""
-    """Image URL or path for the Image Analysis module."""
-
     manual_url: str = ""
-    """Arbitrary URL for the URL Analysis module."""
-
     probe_string: str = ""
-    """Raw user-supplied string for the Data Probe auto-detect module."""
-
     module_mode: str = ""
-    """
-    Active Phase 4 module ID.  One of:
-    "email" | "domain" | "phone" | "image" | "url" | "probe"
-    Empty string for legacy manual/discord pipelines.
-    """
     discovery_done: bool = False
+
+    # Path to the intel JSON snapshot written by Pipeline.run. Set after
+    # save_state(); consumed by ReportingStage for the manifest.
+    intel_snapshot_path: str = ""
 
     def __post_init__(self) -> None:
         if self.intel_core is None:
@@ -112,8 +86,55 @@ class InvestigationContext:
             self.intel_core = InvestigationCore(self.target_id)
 
     # ------------------------------------------------------------------ #
+    # Structured logger
+    # ------------------------------------------------------------------ #
+
+    @property
+    def log(self) -> StructuredLogger:
+        cached = getattr(self, "_log_cache", None)
+        if cached is not None:
+            return cached
+
+        emit = getattr(self.config, "_phase3_emit", None)
+        logger = (
+            StructuredLogger(sink=emit)
+            if emit is not None
+            else StructuredLogger.stdout()
+        )
+        self._log_cache = logger
+        return logger
+
+    # ------------------------------------------------------------------ #
     # Convenience helpers
     # ------------------------------------------------------------------ #
+
+    @property
+    def intel(self) -> dict:
+        """
+        The live intel dict owned by ``intel_core``.
+
+        Stages that only need to read or poke a category should not have
+        to know that the store is wrapped. This is the same object, not
+        a copy — mutating it mutates the investigation.
+        """
+        return self.intel_core.intel
+
+    @property
+    def discovered_emails(self) -> set:
+        """
+        Mutable set of emails discovered so far.
+
+        Backed by a plain set on the context rather than derived from
+        ``intel_core`` on each access, because callers add to it
+        (``ctx.discovered_emails.add(...)``) and a derived set would
+        silently discard those writes. ``all_known_emails()`` remains
+        the validated, intel-backed view.
+        """
+        existing = getattr(self, "_discovered_emails", None)
+        if existing is None:
+            existing = set()
+            object.__setattr__(self, "_discovered_emails", existing)
+        return existing
 
     def add_avatar(self, url: str) -> None:
         if url and isinstance(url, str) and url.startswith("http"):
@@ -132,8 +153,6 @@ class InvestigationContext:
             if is_valid_email(v.get("value", ""))
         }
 
-    # --- Phase 2 helpers ---
-
     @property
     def is_root(self) -> bool:
         return self.depth == 0
@@ -144,14 +163,8 @@ class InvestigationContext:
             return "root"
         return f"{self.seed_type}:{self.seed_value} [d={self.depth}]"
 
-    # --- Phase 4 helpers ---
-
     @property
     def effective_target(self) -> str:
-        """
-        Return the primary target value regardless of module mode.
-        Useful for logging and report headers.
-        """
         if self.module_mode == "email":
             return self.manual_email
         if self.module_mode == "domain":

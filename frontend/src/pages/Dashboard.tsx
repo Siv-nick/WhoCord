@@ -3,7 +3,6 @@ import React, { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import ModuleCard from "../components/ModuleCard";
 import { Icon } from "../components/Icons";
-import { buildRunUrl } from "../utils/api";
 import type {
   InvestigationMode,
   ModuleMeta,
@@ -188,10 +187,12 @@ export default function Dashboard() {
       params.target = target;
     }
 
-    const sseUrl = buildRunUrl(params);
-    navigate("/live", {
+    // The legacy live view now streams /run via POST + fetch (see
+    // InvestigationLive). EventSource can't set the token header, so
+    // we pass the params through nav state and let the consumer POST.
+    navigate("/dashboard/live", {
       state: {
-        sseUrl,
+        params,
         mode,
         target: String(
           formValues["input"] ?? params.username ?? params.email ?? "",

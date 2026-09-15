@@ -2,6 +2,7 @@
 import React from "react";
 import { NavLink, Outlet } from "react-router-dom";
 import { Icon, type IconName } from "./Icons";
+import { shutdownServer } from "../utils/api";
 
 const NAV_ITEMS: Array<{ to: string; label: string; icon: IconName; hide?: boolean }> = [
   { to: "/",        label: "Investigate", icon: "search"   },
@@ -48,7 +49,7 @@ export default function Layout() {
           <button
             onClick={async () => {
               if (confirm("Shut down WhoCord server?")) {
-                await fetch("/shutdown", { method: "POST" }).catch(() => {});
+                await shutdownServer();
                 setTimeout(() => window.close(), 400);
               }
             }}

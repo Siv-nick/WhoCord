@@ -1,3 +1,4 @@
+
 """
 discord_osint/intelligence/html_report.py
 -------------------------------------------
@@ -5,20 +6,18 @@ Generates a fully self-contained, dark-themed HTML investigation report.
 
 Change log
 ----------
-Adds three new renderers for Apollo / Lusha contact-enrichment output:
-
-* ``_render_enrichment_section``    — matched profile cards + spend bar
-* ``_render_enrichment_rejections`` — collapsed audit block listing every
-                                      identifier the trust filter rejected,
-                                      with its one-line reason
-* ``_render_enrichment_profile_card`` — one matched contact card
-
-Both new sections are additive: when neither provider ran, neither
-section renders and the report is byte-identical to the previous
-version.
-
-``_safe_href()`` and ``_safe_img_src()`` gate every ``href=`` and
-``src=`` in the report, as before.
+- Phase 4: new CordCat section rendering the Discord profile
+  enrichment, breach exposure, FiveM records, EU DSA statements, and
+  the derived risk score returned by cord.cat.
+- Phase 6 item 4: report accent color aligned to the canvas theme
+  (violet #8b5cf6). Previously the report used indigo (#6366f1) while
+  the canvas used violet, so the two surfaces read as two different
+  products.
+- Platform icons and display names come from
+  :mod:`discord_osint.platforms`.
+- Adds three renderers for Apollo / Lusha contact-enrichment output.
+- ``_safe_href()`` and ``_safe_img_src()`` gate every ``href=`` and
+  ``src=`` in the report.
 """
 
 from __future__ import annotations
@@ -30,6 +29,8 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
+
+from ..platforms import PLATFORMS, DEFAULT_PLATFORM as _DEFAULT_PLATFORM
 
 
 # ---------------------------------------------------------------------------
@@ -89,52 +90,19 @@ def _safe_img_src(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Platform metadata
+# Platform metadata (delegated to discord_osint.platforms)
 # ---------------------------------------------------------------------------
 
-_PLATFORM_META: dict[str, tuple[str, str]] = {
-    "google":     ("🔍", "Google"),
-    "github":     ("🐙", "GitHub"),
-    "twitter":    ("🐦", "Twitter / X"),
-    "reddit":     ("🤖", "Reddit"),
-    "instagram":  ("📸", "Instagram"),
-    "linkedin":   ("💼", "LinkedIn"),
-    "facebook":   ("📘", "Facebook"),
-    "youtube":    ("▶️", "YouTube"),
-    "tiktok":     ("🎵", "TikTok"),
-    "twitch":     ("🎮", "Twitch"),
-    "steam":      ("🎮", "Steam"),
-    "spotify":    ("🎧", "Spotify"),
-    "pinterest":  ("📌", "Pinterest"),
-    "soundcloud": ("🎵", "SoundCloud"),
-    "medium":     ("✍️", "Medium"),
-    "dev":        ("💻", "Dev.to"),
-    "gitlab":     ("🦊", "GitLab"),
-    "bitbucket":  ("🪣", "Bitbucket"),
-    "keybase":    ("🔑", "Keybase"),
-    "telegram":   ("✈️", "Telegram"),
-    "discord":    ("💬", "Discord"),
-    "gravatar":   ("🌐", "Gravatar"),
-    "patreon":    ("🎨", "Patreon"),
-    "tumblr":     ("📝", "Tumblr"),
-    "mastodon":   ("🐘", "Mastodon"),
-    "hackernews": ("🔶", "Hacker News"),
-    "producthunt":("🚀", "Product Hunt"),
-    "snapchat":   ("👻", "Snapchat"),
-    "whatsapp":   ("💬", "WhatsApp"),
-    "viber":      ("📱", "Viber"),
-    "line":       ("💚", "Line"),
-}
-
-_DEFAULT_PLATFORM_META = ("🌐", "Unknown Platform")
-
-
 def _platform_icon(platform: str) -> str:
-    return _PLATFORM_META.get(platform.lower(), _DEFAULT_PLATFORM_META)[0]
+    p = PLATFORMS.get((platform or "").lower())
+    return p.icon if p else _DEFAULT_PLATFORM.icon
 
 
 def _platform_label(platform: str) -> str:
-    return _PLATFORM_META.get(platform.lower(), (_DEFAULT_PLATFORM_META[0], platform.title()))[1]
+    p = PLATFORMS.get((platform or "").lower())
+    if p:
+        return p.display_name
+    return (platform or "Unknown").title()
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +305,10 @@ _CSS = """
   --bg:#0a0a0a;--surface:#141414;--surface2:#1c1c1c;
   --border:#2a2a2a;--border2:#333;
   --text:#e2e8f0;--text2:#94a3b8;--text3:#64748b;
-  --indigo:#6366f1;--indigo-dark:#4f46e5;--indigo-bg:#1e1b4b;
+  /* Accent aligned to the canvas theme (frontend/src/index.css
+     --accent #8b5cf6) so the report and the app share one visual
+     language. */
+  --indigo:#8b5cf6;--indigo-dark:#7c3aed;--indigo-bg:#1e1b4b;
   --emerald:#10b981;--emerald-bg:#064e3b;
   --amber:#f59e0b;--amber-bg:#451a03;
   --red:#ef4444;--red-bg:#450a0a;
@@ -484,7 +455,6 @@ a:hover{text-decoration:underline}
 .report-footer{text-align:center;padding:2rem 0;color:var(--text3);font-size:.78rem;
   border-top:1px solid var(--border);margin-top:3rem}
 
-/* Enrichment */
 .enr-provider-tag{display:inline-block;padding:.1rem .45rem;border-radius:4px;
   font-size:.65rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;
   background:var(--indigo-bg);color:#c7d2fe;margin-left:.4rem}
@@ -917,11 +887,240 @@ def _render_intelligence_section(intel: dict) -> str:
             parts.append(
                 f'<div class="corr-item">'
                 f'<span class="corr-badge {cls}">{_e(ctype)}</span>'
-                f'<span class="corr-desc">{_e(desc)} <em style="color:#6366f1">({conf:.0%})</em></span>'
+                f'<span class="corr-desc">{_e(desc)} <em style="color:#8b5cf6">({conf:.0%})</em></span>'
                 f'</div>'
             )
 
     return "".join(parts) if parts else '<div class="empty">No intelligence data.</div>'
+
+
+def _render_cordcat_section(intel: dict) -> str:
+    """
+    Render the CordCat enrichment block.
+
+    Returns "" when the stage did not run or the lookup returned no
+    data. The section shows the profile fields, breach details, FiveM
+    records, DSA statements, and the risk/bot score.
+    """
+    block = intel.get("cordcat") or {}
+    lookup = block.get("lookup") if isinstance(block, dict) else None
+    if not isinstance(lookup, dict):
+        return ""
+
+    user_info  = lookup.get("user_info")  or {}
+    breach     = lookup.get("breach")     or {}
+    fivem      = lookup.get("fivem")      or {}
+    statements = lookup.get("statements") or []
+    score      = lookup.get("score")      or {}
+
+    parts: list[str] = []
+
+    # --- Profile card ---
+    profile_rows: list[str] = []
+    username = user_info.get("username") or user_info.get("name") or ""
+    if username:
+        profile_rows.append(
+            f'<div class="data-row">'
+            f'<span class="data-label">Username</span>'
+            f'<span class="data-value">{_e(username)}</span>'
+            f'</div>'
+        )
+    display = (
+        user_info.get("display_name")
+        or user_info.get("global_name")
+        or ""
+    )
+    if display:
+        profile_rows.append(
+            f'<div class="data-row">'
+            f'<span class="data-label">Display Name</span>'
+            f'<span class="data-value">{_e(display)}</span>'
+            f'</div>'
+        )
+    created = (
+        user_info.get("created_at")
+        or user_info.get("creation_date")
+        or ""
+    )
+    if created:
+        profile_rows.append(
+            f'<div class="data-row">'
+            f'<span class="data-label">Account Created</span>'
+            f'<span class="data-value">{_e(str(created))}</span>'
+            f'</div>'
+        )
+    badges = user_info.get("badges") or []
+    if isinstance(badges, list) and badges:
+        badge_str = ", ".join(_e(str(b)) for b in badges[:10])
+        profile_rows.append(
+            f'<div class="data-row">'
+            f'<span class="data-label">Badges</span>'
+            f'<span class="data-value">{badge_str}</span>'
+            f'</div>'
+        )
+    if profile_rows:
+        parts.append(
+            f'<div class="tech-card">'
+            f'<h4>🅲 CordCat Profile</h4>'
+            f'{"".join(profile_rows)}'
+            f'</div>'
+        )
+
+    # --- Breach ---
+    if breach:
+        breach_rows: list[str] = []
+        count = breach.get("count")
+        if count:
+            breach_rows.append(
+                f'<div class="data-row">'
+                f'<span class="data-label">Entries</span>'
+                f'<span class="data-value">{_e(str(count))}</span>'
+                f'</div>'
+            )
+        datasets = breach.get("datasets") or breach.get("sources") or []
+        if isinstance(datasets, list) and datasets:
+            tags = "".join(
+                f'<span class="breach-tag">{_e(str(d))}</span>'
+                for d in datasets[:12]
+            )
+            breach_rows.append(
+                f'<div class="data-row">'
+                f'<span class="data-label">Datasets</span>'
+                f'<span class="data-value">{tags}</span>'
+                f'</div>'
+            )
+        fields = breach.get("exposed_fields") or breach.get("fields") or []
+        if isinstance(fields, list) and fields:
+            tags = "".join(
+                f'<span class="site-tag">{_e(str(f))}</span>'
+                for f in fields[:12]
+            )
+            breach_rows.append(
+                f'<div class="data-row">'
+                f'<span class="data-label">Exposed</span>'
+                f'<span class="data-value">{tags}</span>'
+                f'</div>'
+            )
+        geo = breach.get("geo") or breach.get("geoip") or {}
+        if isinstance(geo, dict) and geo:
+            geo_str = ", ".join(
+                f"{_e(str(k))}: {_e(str(v))}" for k, v in geo.items()
+            )
+            breach_rows.append(
+                f'<div class="data-row">'
+                f'<span class="data-label">GeoIP</span>'
+                f'<span class="data-value">{geo_str}</span>'
+                f'</div>'
+            )
+        asn = breach.get("asn") or breach.get("network") or {}
+        if isinstance(asn, dict) and asn:
+            asn_str = ", ".join(
+                f"{_e(str(k))}: {_e(str(v))}" for k, v in asn.items()
+            )
+            breach_rows.append(
+                f'<div class="data-row">'
+                f'<span class="data-label">ASN</span>'
+                f'<span class="data-value">{asn_str}</span>'
+                f'</div>'
+            )
+        if breach_rows:
+            parts.append(
+                f'<div class="tech-card">'
+                f'<h4>🔓 CordCat Breach Exposure</h4>'
+                f'{"".join(breach_rows)}'
+                f'</div>'
+            )
+
+    # --- FiveM ---
+    if fivem:
+        records = fivem.get("records") or fivem.get("entries") or []
+        if isinstance(records, list) and records:
+            fivem_rows: list[str] = []
+            for rec in records[:5]:
+                if not isinstance(rec, dict):
+                    continue
+                line_bits: list[str] = []
+                for k in ("license", "steam", "name", "identifier"):
+                    if rec.get(k):
+                        line_bits.append(f"{k}={rec[k]}")
+                if line_bits:
+                    fivem_rows.append(
+                        f'<div class="data-row">'
+                        f'<span class="data-label">Record</span>'
+                        f'<span class="data-value">{_e(", ".join(line_bits))}</span>'
+                        f'</div>'
+                    )
+            if fivem_rows:
+                parts.append(
+                    f'<div class="tech-card">'
+                    f'<h4>🎮 CordCat FiveM Records</h4>'
+                    f'{"".join(fivem_rows)}'
+                    f'</div>'
+                )
+
+    # --- EU DSA statements ---
+    if isinstance(statements, list) and statements:
+        stmt_rows: list[str] = []
+        for stmt in statements[:5]:
+            if not isinstance(stmt, dict):
+                continue
+            facts = stmt.get("facts") or stmt.get("statement") or ""
+            scope = stmt.get("scope") or stmt.get("territory") or ""
+            grounds = stmt.get("grounds") or stmt.get("legal_basis") or ""
+            row_bits = []
+            if facts:
+                row_bits.append(f"Facts: {_e(str(facts))}")
+            if scope:
+                row_bits.append(f"Scope: {_e(str(scope))}")
+            if grounds:
+                row_bits.append(f"Grounds: {_e(str(grounds))}")
+            if row_bits:
+                stmt_rows.append(
+                    f'<div class="data-row">'
+                    f'<span class="data-label">Statement</span>'
+                    f'<span class="data-value">{"; ".join(row_bits)}</span>'
+                    f'</div>'
+                )
+        if stmt_rows:
+            parts.append(
+                f'<div class="tech-card">'
+                f'<h4>⚖️ EU DSA Statements</h4>'
+                f'{"".join(stmt_rows)}'
+                f'</div>'
+            )
+
+    # --- Score ---
+    if score:
+        score_rows: list[str] = []
+        value = score.get("value") or score.get("score")
+        if value is not None:
+            score_rows.append(
+                f'<div class="data-row">'
+                f'<span class="data-label">Score</span>'
+                f'<span class="data-value">{_e(str(value))}</span>'
+                f'</div>'
+            )
+        reasons = score.get("reasons") or score.get("signals") or []
+        if isinstance(reasons, list) and reasons:
+            tags = "".join(
+                f'<span class="site-tag">{_e(str(r))}</span>'
+                for r in reasons[:10]
+            )
+            score_rows.append(
+                f'<div class="data-row">'
+                f'<span class="data-label">Reasons</span>'
+                f'<span class="data-value">{tags}</span>'
+                f'</div>'
+            )
+        if score_rows:
+            parts.append(
+                f'<div class="tech-card">'
+                f'<h4>⚠️ CordCat Risk Signals</h4>'
+                f'{"".join(score_rows)}'
+                f'</div>'
+            )
+
+    return "".join(parts)
 
 
 def _render_pivot_section(intel: dict) -> str:
@@ -997,7 +1196,23 @@ def _render_technical_section(intel: dict) -> str:
                     if isinstance(data, dict):
                         rows = []
                         for rtype, records in data.items():
-                            rows.append(f'<div class="data-row"><span class="data-label">{rtype}</span><span class="data-value">{", ".join(records[:5])}</span></div>')
+                            # Both halves of this row are attacker-
+                            # controlled. DNS record values come
+                            # straight off the wire from the *target's*
+                            # nameserver, and a TXT record can contain
+                            # arbitrary text — so anyone who controls a
+                            # domain could put markup here and have it
+                            # execute inside the generated report.
+                            # Neither value was escaped.
+                            if not isinstance(records, (list, tuple)):
+                                records = [records]
+                            joined = ", ".join(str(r) for r in records[:5])
+                            rows.append(
+                                f'<div class="data-row">'
+                                f'<span class="data-label">{_e(str(rtype))}</span>'
+                                f'<span class="data-value">{_e(joined)}</span>'
+                                f'</div>'
+                            )
                         parts.append(
                             f'<div class="tech-card">'
                             f'<h4>📡 DNS · {_e(domain_key)}</h4>'
@@ -1017,7 +1232,17 @@ def _render_technical_section(intel: dict) -> str:
                     if isinstance(data, dict):
                         rows = []
                         for k, v in data.items():
-                            rows.append(f'<div class="data-row"><span class="data-label">{k.replace("_", " ").title()}</span><span class="data-value">{_e(str(v))}</span></div>')
+                            # The *key* is as untrusted as the value:
+                            # these dicts are parsed from a remote
+                            # certificate or a third-party geo API, so
+                            # the caller does not control the key set.
+                            label = _e(str(k).replace("_", " ").title())
+                            rows.append(
+                                f'<div class="data-row">'
+                                f'<span class="data-label">{label}</span>'
+                                f'<span class="data-value">{_e(str(v))}</span>'
+                                f'</div>'
+                            )
                         parts.append(
                             f'<div class="tech-card">'
                             f'<h4>🔒 SSL Certificate · {_e(domain_key)}</h4>'
@@ -1036,7 +1261,17 @@ def _render_technical_section(intel: dict) -> str:
                     if isinstance(data, dict):
                         rows = []
                         for k, v in data.items():
-                            rows.append(f'<div class="data-row"><span class="data-label">{k.replace("_", " ").title()}</span><span class="data-value">{_e(str(v))}</span></div>')
+                            # The *key* is as untrusted as the value:
+                            # these dicts are parsed from a remote
+                            # certificate or a third-party geo API, so
+                            # the caller does not control the key set.
+                            label = _e(str(k).replace("_", " ").title())
+                            rows.append(
+                                f'<div class="data-row">'
+                                f'<span class="data-label">{label}</span>'
+                                f'<span class="data-value">{_e(str(v))}</span>'
+                                f'</div>'
+                            )
                         parts.append(
                             f'<div class="tech-card">'
                             f'<h4>📍 IP Geolocation</h4>'
@@ -1285,7 +1520,16 @@ def _render_technical_section(intel: dict) -> str:
                 except Exception:
                     pass
         if not has_metadata and http_status and http_status != 200:
-            rows.append(f'<div class="data-row"><span class="data-label">Note</span><span class="data-value">Page returned status {http_status} – no metadata could be extracted.</span></div>')
+            # http_status is read out of a JSON blob, so it is not
+            # guaranteed to be the int it looks like.
+            rows.append(
+                f'<div class="data-row">'
+                f'<span class="data-label">Note</span>'
+                f'<span class="data-value">'
+                f'Page returned status {_e(str(http_status))} – '
+                f'no metadata could be extracted.'
+                f'</span></div>'
+            )
         elif not has_metadata:
             rows.append(f'<div class="data-row"><span class="data-label">Note</span><span class="data-value">No page metadata (title/description) found.</span></div>')
 
@@ -1400,7 +1644,6 @@ def _render_technical_section(intel: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def _render_enrichment_profile_card(provider: str, person: dict) -> str:
-    """Render one enriched contact (Apollo or Lusha) as a card."""
     if not isinstance(person, dict):
         return ""
 
@@ -1489,11 +1732,6 @@ def _render_enrichment_profile_card(provider: str, person: dict) -> str:
 
 
 def _render_enrichment_section(intel: dict) -> str:
-    """
-    Matched Apollo / Lusha profiles, plus the spend summary.
-
-    Returns "" when the enrichment stage did not run.
-    """
     profiles = intel.get("enrichment_profiles") or {}
     spend    = intel.get("enrichment_spend") or {}
     if not profiles and not spend:
@@ -1501,7 +1739,6 @@ def _render_enrichment_section(intel: dict) -> str:
 
     parts: list[str] = []
 
-    # Spend summary pills.
     if spend:
         pills: list[str] = []
         for provider, info in spend.items():
@@ -1526,7 +1763,6 @@ def _render_enrichment_section(intel: dict) -> str:
         if pills:
             parts.append(f'<div class="stats-bar">{"".join(pills)}</div>')
 
-    # Per-provider profile cards.
     for provider, people in profiles.items():
         if not people:
             continue
@@ -1549,10 +1785,6 @@ def _render_enrichment_section(intel: dict) -> str:
 
 
 def _render_enrichment_rejections(intel: dict) -> str:
-    """
-    Collapsed audit block listing every identifier the trust filter
-    rejected, per provider, with its one-line reason.
-    """
     decisions = intel.get("enrichment_decisions") or {}
     if not decisions:
         return ""
@@ -1628,6 +1860,7 @@ def generate_html_report(intel_core: Any, target_id: Any) -> str:
     pivot_count   = len(intel.get("pivot_reports", []))
     has_intel     = bool(intel.get("intelligence_report"))
     has_enrich    = bool(intel.get("enrichment_profiles") or intel.get("enrichment_spend"))
+    has_cordcat   = bool((intel.get("cordcat") or {}).get("lookup"))
     generated_at  = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
 
     if breach_count > 5 or email_count > 3:
@@ -1638,6 +1871,15 @@ def generate_html_report(intel_core: Any, target_id: Any) -> str:
         risk_label, risk_class = "Low", "risk-low"
     else:
         risk_label, risk_class = "Minimal", "risk-info"
+
+    cordcat_html    = _render_cordcat_section(intel)
+    cordcat_section = ""
+    if cordcat_html:
+        cordcat_section = f"""
+        <div class="section">
+          <div class="section-title"><span class="icon">🅲</span>CordCat Enrichment</div>
+          {cordcat_html}
+        </div>"""
 
     pivot_html    = _render_pivot_section(intel)
     pivot_section = ""
@@ -1685,6 +1927,7 @@ def generate_html_report(intel_core: Any, target_id: Any) -> str:
       <span class="risk-badge {risk_class}">{risk_label} Risk</span>
       {f'<span class="risk-badge risk-info">🧠 Intelligence</span>' if has_intel else ""}
       {f'<span class="risk-badge risk-info">🛰 Enriched</span>' if has_enrich else ""}
+      {f'<span class="risk-badge risk-info">🅲 CordCat</span>' if has_cordcat else ""}
       {f'<span class="risk-badge risk-info">🔄 {pivot_count} Pivot{"s" if pivot_count!=1 else ""}</span>' if pivot_count else ""}
     </div>
     <div class="meta">Generated {generated_at} · WhoCord v1.1</div>
@@ -1704,6 +1947,8 @@ def generate_html_report(intel_core: Any, target_id: Any) -> str:
       {_render_identity_section(intel)}
       {_render_persona_section(intel)}
     </div>
+
+    {cordcat_section}
 
     <div class="section">
       <div class="section-title"><span class="icon">🔗</span>Social Profiles ({profile_count})</div>

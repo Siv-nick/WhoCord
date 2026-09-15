@@ -10,6 +10,7 @@ import {
   useSelectedNode,
 } from "../hooks/useGraphState";
 import { useInvestigation } from "../hooks/useInvestigation";
+import { useJobCost } from "../hooks/useJobCost";
 import { useToast } from "../components/Toast";
 import { useTheme } from "../hooks/useTheme";
 
@@ -29,7 +30,7 @@ import CommandPalette, { type PaletteAction } from "../components/CommandPalette
 import { Icon, type IconName } from "../components/Icons";
 
 import type { GraphEdge, GraphNode, NodeModule } from "../types/graph";
-import type { InvestigationMode, RunParams } from "../types/investigation";
+import type { InvestigationMode, RunParams, CostSummary } from "../types/investigation";
 import { classifyInput, MODULE_LABELS } from "../utils/classify";
 import { childPosition } from "../utils/graphLayout";
 
@@ -64,16 +65,40 @@ export default function GraphCanvas() {
   const canvasRef       = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: window.innerWidth, h: window.innerHeight });
 
-  const {
-    nodes, edges, viewport,
-    addNode, removeNode, updateNode,
-    addEdge,
-    selectNode,
-    setViewport, panBy, zoomTo,
-  } = useGraphState();
+  // Subscribe field by field. Calling useGraphState() with no selector
+  // returns the whole store object, which is a new reference on every
+  // set() — so GraphCanvas re-rendered on *any* store change: every
+  // pan frame, every hover, every filter checkbox. Because this
+  // component is the parent of nearly every panel, that single call
+  // was the reason unrelated interactions felt heavy across the whole
+  // app. Actions are stable identities in Zustand, so selecting them
+  // individually costs nothing and never triggers a re-render.
+  const nodes       = useGraphState(s => s.nodes);
+  const edges       = useGraphState(s => s.edges);
+  const viewport    = useGraphState(s => s.viewport);
+  const addNode     = useGraphState(s => s.addNode);
+  const removeNode  = useGraphState(s => s.removeNode);
+  const updateNode  = useGraphState(s => s.updateNode);
+  const addEdge     = useGraphState(s => s.addEdge);
+  const selectNode  = useGraphState(s => s.selectNode);
+  const setViewport = useGraphState(s => s.setViewport);
+  const panBy       = useGraphState(s => s.panBy);
+  const zoomTo      = useGraphState(s => s.zoomTo);
 
   const selectedNode = useSelectedNode();
   const filteredIds  = useFilteredNodeIds();
+
+  // Signature of every node position. The edge-path memo keys on this
+  // instead of the `nodes` array identity: updateNode() rebuilds the
+  // array via s.nodes.map(...), so any unrelated node change (a status
+  // flag, a progress tick) produced a fresh array reference and
+  // invalidated the path memo for every edge in the graph. Rebuilding
+  // this string is O(N) once per nodes change, versus the O(N x E)
+  // obstacle scan it prevents.
+  const nodePosKey = useMemo(
+    () => nodes.map(n => `${n.id}:${n.position.x},${n.position.y}`).join("|"),
+    [nodes],
+  );
 
   const nodeById = useMemo(() => {
     const m = new Map<string, GraphNode>();
@@ -113,6 +138,8 @@ export default function GraphCanvas() {
     pivots: invPivots, findings: invFindings,
   } = inv;
   const { start: startInvestigation } = inv;
+
+  const jobCost = useJobCost(invJobId, running);
 
   const rightPanelWidth = showChat ? 380 : showCardList ? 400 : showLogPanel ? 340 : 0;
 
@@ -397,37 +424,53 @@ export default function GraphCanvas() {
           onPointerUp={onBgPointerUp}
         />
 
-        {edges.map(edge => {
-          const src = nodeById.get(edge.sourceId);
-          const tgt = nodeById.get(edge.targetId);
-          if (!src || !tgt) return null;
-          const dimmed = !filteredIds.has(src.id) || !filteredIds.has(tgt.id);
-          return (
-            <EdgeLine
-              key={edge.id}
-              edge={edge}
-              source={src}
-              target={tgt}
-              allNodes={nodes}
-              viewport={viewport}
-              dimmed={dimmed}
-            />
-          );
-        })}
+        {/*
+          Both layers are laid out in graph space and the viewport
+          transform is applied here, once, for everything. Panning and
+          zooming mutate a single attribute that the browser resolves,
+          instead of re-running edge routing and re-rendering every node
+          in React on each frame. Nodes must stay in the SAME group as
+          edges — if they are transformed separately the two layers can
+          disagree by a frame during a fast pan and edges visibly detach
+          from their nodes.
+        */}
+        <g
+          transform={
+            `translate(${viewport.x} ${viewport.y}) scale(${viewport.zoom})`
+          }
+        >
+          {edges.map(edge => {
+            const src = nodeById.get(edge.sourceId);
+            const tgt = nodeById.get(edge.targetId);
+            if (!src || !tgt) return null;
+            const dimmed = !filteredIds.has(src.id) || !filteredIds.has(tgt.id);
+            return (
+              <EdgeLine
+                key={edge.id}
+                edge={edge}
+                source={src}
+                target={tgt}
+                allNodes={nodes}
+                nodePosKey={nodePosKey}
+                dimmed={dimmed}
+              />
+            );
+          })}
 
-        {nodes.map(node => (
-          <GraphNodeComp
-            key={node.id}
-            node={node}
-            viewport={viewport}
-            selected={node.id === selectedNode?.id}
-            highlighted={node.id === highlightedNodeId}
-            dimmed={!filteredIds.has(node.id)}
-            compact={compactMode}
-            onSelect={handleNodeSelect}
-            onDragEnd={handleNodeDragEnd}
-          />
-        ))}
+          {nodes.map(node => (
+            <GraphNodeComp
+              key={node.id}
+              node={node}
+              zoom={viewport.zoom}
+              selected={node.id === selectedNode?.id}
+              highlighted={node.id === highlightedNodeId}
+              dimmed={!filteredIds.has(node.id)}
+              compact={compactMode}
+              onSelect={handleNodeSelect}
+              onDragEnd={handleNodeDragEnd}
+            />
+          ))}
+        </g>
       </svg>
 
       {showPopup && selectedNode && (
@@ -597,6 +640,10 @@ export default function GraphCanvas() {
           <span className="tabular-nums">{edges.length}</span>
         </div>
 
+        {jobCost?.available && (jobCost.llm_calls > 0 || jobCost.enrichment_calls > 0) && (
+          <CostPill cost={jobCost} />
+        )}
+
         <button
           onClick={() => setPaletteOpen(true)}
           className="btn"
@@ -758,5 +805,45 @@ function ToolbarTab({
     >
       <Icon name={icon} size={13} /> {label}
     </button>
+  );
+}
+
+function CostPill({ cost }: { cost: CostSummary }) {
+  const hasUsd     = cost.llm_cost_usd > 0;
+  const hasCredits = cost.enrichment_credits > 0;
+
+  const title = [
+    `${cost.llm_calls} LLM call${cost.llm_calls === 1 ? "" : "s"}`,
+    `${cost.llm_est_tokens_in.toLocaleString()} in / ${cost.llm_est_tokens_out.toLocaleString()} out (est.)`,
+    cost.enrichment_calls
+      ? `${cost.enrichment_calls} enrichment call${cost.enrichment_calls === 1 ? "" : "s"}, ${cost.enrichment_credits.toFixed(1)} credit(s)`
+      : null,
+    hasUsd ? "" : "Set LLM_COST_PER_1K_INPUT/OUTPUT to track USD.",
+  ].filter(Boolean).join("\n");
+
+  return (
+    <div
+      className="surface !rounded-xl px-3 py-2 text-[11px] flex items-center gap-2"
+      title={title}
+    >
+      <Icon name="sparkle" size={11} className="text-violet-300 shrink-0" />
+      <span className="text-zinc-400 tabular-nums">
+        {cost.llm_calls}
+        <span className="text-zinc-600 ml-0.5">calls</span>
+      </span>
+      {hasUsd && (
+        <span className="text-emerald-400 tabular-nums">
+          ${cost.llm_cost_usd < 0.01
+              ? cost.llm_cost_usd.toFixed(4)
+              : cost.llm_cost_usd.toFixed(2)}
+        </span>
+      )}
+      {hasCredits && (
+        <span className="text-amber-400 tabular-nums">
+          {cost.enrichment_credits.toFixed(1)}
+          <span className="text-zinc-600 ml-0.5">cr</span>
+        </span>
+      )}
+    </div>
   );
 }

@@ -1,3 +1,4 @@
+
 """
 discord_osint/intelligence/graph.py
 -------------------------------------
@@ -202,10 +203,34 @@ def build_graph(entities: list[BaseEntity]) -> Any:
             continue
         for i, a in enumerate(bucket):
             for b in bucket[i + 1:]:
+                if _platforms_conflict(a, b):
+                    continue
                 if not G.has_edge(a.id, b.id):
                     _add_edge(a, b, "co_occurrence", 0.30)
 
     return G
+
+
+def _platforms_conflict(a: Any, b: Any) -> bool:
+    """
+    True when both entities name a platform and the platforms differ.
+
+    Co-occurrence exists to link things that arrived together from one
+    source when no stronger rule fired. But "arrived from the same
+    scraper" is weak evidence, and it should never outrank a direct
+    contradiction: a twitter handle and a github profile URL scraped in
+    the same pass are not the same account, however adjacent they were
+    in the response.
+
+    Without this check the co-occurrence rule silently reintroduced
+    exactly the edge that Rule 2 (same-platform) deliberately refused
+    to create, so the platform check in Rule 2 had no effect whenever
+    the two entities shared a source.
+    """
+    pa = (getattr(a, "platform", None) or "").strip().lower()
+    pb = (getattr(b, "platform", None) or "").strip().lower()
+    return bool(pa and pb and pa != pb)
+
 
 
 def graph_summary(G: Any) -> dict:

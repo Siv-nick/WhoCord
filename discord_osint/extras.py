@@ -1,21 +1,22 @@
 """
 discord_osint/extras.py
 -----------------------
-Supplementary OSINT helpers: avatar download, reverse image search,
-EXIF extraction, WHOIS, Wayback availability, location/language inference,
-and socialscan URL filtering.
+Supplementary OSINT helpers.
 
 Change log
 ----------
-- Silent `except Exception: pass` branches in `download_avatar`,
-  `reverse_image_search`, `whois_domain`, and `wayback_available` now
-  record the failure reason via `log_trace` so a debug-log run
-  distinguishes "no result" from "tool crashed".
-- `socialscan_filter` now distinguishes "not installed", "crashed on
-  launch", "produced malformed JSON", and "nothing available" — each of
-  which previously collapsed into "keep all URLs and print one line".
+- ``download_avatar`` chmod's the written file to 0600. Avatar images
+  often carry EXIF GPS metadata and are cached on disk; on a shared
+  workstation they must not be readable by other local users.
+- (Already present from an earlier pass) ``download_avatar`` routes
+  through ``safe_get_pinned`` and uses a stable ``sha256`` of the URL
+  as the cache filename.
+- ``socialscan_filter``'s URL-parsing loop records failures via
+  ``log_trace`` rather than swallowing them silently.
+- ``wayback_available`` builds its query via ``params=``.
 """
 
+import hashlib
 import os
 import re
 import subprocess as _sp
@@ -27,32 +28,40 @@ from collections import Counter
 
 from .utils import http_session, tool_available, REQUEST_DELAY, CACHE_DIR, log_trace
 from . import utils
+from .utils.url_safety import safe_get_pinned, UnsafeURLError
 
-# ── Bug 3 fix: never bind tool flags at import time. ──────────────────
-from . import config as _config_module
-
-
-def _flag(name: str, default: bool = False) -> bool:
-    return bool(getattr(_config_module, name, default))
-
+from .config import get_flag as _flag
 
 from .discord_api import classify_url
 from .scraping import is_likely_profile_url_v2
 
 
 def download_avatar(url, save_dir):
+    """
+    Download an avatar image, guarded by SSRF pinning.
+
+    The written file is chmod'd to 0600 — cached avatars contain the
+    target's photographs and sometimes EXIF GPS coordinates.
+    """
     try:
-        r = http_session.get(url, timeout=10)
+        r = safe_get_pinned(url, timeout=10)
         if r.status_code == 200 and len(r.content) > 1024:
             ext = url.rsplit(".", 1)[-1].split("?")[0]
             if ext not in ("jpg", "jpeg", "png", "webp", "gif"):
                 ext = "jpg"
-            fname = os.path.join(save_dir, f"avatar_{hash(url) & 0x7FFFFFFF}.{ext}")
+            digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+            fname = os.path.join(save_dir, f"avatar_{digest}.{ext}")
             with open(fname, 'wb') as f:
                 f.write(r.content)
+            try:
+                os.chmod(fname, 0o600)
+            except OSError:
+                pass
             return fname
         log_trace(f"download_avatar: HTTP {r.status_code} or body too small "
                   f"({len(r.content)} bytes) for {url[:80]}")
+    except UnsafeURLError as exc:
+        log_trace(f"download_avatar: SSRF BLOCKED {url[:80]} — {exc}")
     except Exception as exc:
         log_trace(f"download_avatar: EXCEPTION {type(exc).__name__}: {exc} "
                   f"for {url[:80]}")
@@ -60,6 +69,10 @@ def download_avatar(url, save_dir):
 
 
 def reverse_image_search(image_url):
+    """
+    SauceNAO reverse image search. Strong on anime and illustrations,
+    weak on photographs. Returns a list of matching domain names.
+    """
     if not _flag("ENABLE_REVERSE_IMG"):
         return []
     if any(x in image_url.lower() for x in ["default", "logo", "placeholder",
@@ -85,6 +98,79 @@ def reverse_image_search(image_url):
         print(f"  Reverse image search error: {e}")
         log_trace(f"reverse_image_search: EXCEPTION {type(e).__name__}: {e}")
     return []
+
+
+def reverse_image_search_tineye(image_url: str, api_key: str = "",
+                                timeout: int = 20) -> list[str]:
+    """
+    TinEye reverse image search. Complementary to SauceNAO.
+    """
+    if not api_key:
+        log_trace("reverse_image_search_tineye: no API key configured.")
+        return []
+
+    try:
+        r = http_session.get(
+            "https://api.tineye.com/rest/search/",
+            headers={
+                "X-API-Key":  api_key,
+                "User-Agent": "WhoCord-OSINT/1.1",
+                "Accept":     "application/json",
+            },
+            params={
+                "image_url": image_url,
+                "sort":      "score",
+                "order":     "desc",
+                "limit":     "10",
+            },
+            timeout=timeout,
+        )
+    except Exception as exc:
+        log_trace(f"reverse_image_search_tineye: network error: "
+                  f"{type(exc).__name__}: {exc}")
+        return []
+
+    if r.status_code == 401:
+        log_trace("reverse_image_search_tineye: API key rejected (401).")
+        return []
+
+    if r.status_code == 429:
+        retry_after = r.headers.get("Retry-After", "?")
+        log_trace(f"reverse_image_search_tineye: rate limited "
+                  f"(Retry-After={retry_after}).")
+        return []
+
+    if r.status_code != 200:
+        log_trace(f"reverse_image_search_tineye: HTTP {r.status_code} — "
+                  f"{r.text[:160]}")
+        return []
+
+    try:
+        data = r.json()
+    except Exception as exc:
+        log_trace(f"reverse_image_search_tineye: JSON parse error: {exc}")
+        return []
+
+    results = data.get("results") if isinstance(data, dict) else None
+    matches = results.get("matches") if isinstance(results, dict) else None
+    if not isinstance(matches, list):
+        log_trace("reverse_image_search_tineye: unexpected response shape.")
+        return []
+
+    seen: set[str] = set()
+    domains: list[str] = []
+    for m in matches:
+        if not isinstance(m, dict):
+            continue
+        domain = m.get("domain") or ""
+        if not isinstance(domain, str):
+            continue
+        domain = domain.strip().lower()
+        if not domain or domain in seen:
+            continue
+        seen.add(domain)
+        domains.append(domain)
+    return domains
 
 
 def extract_metadata(filepath):
@@ -182,8 +268,19 @@ def whois_domain(domain):
 
 
 def wayback_available(url):
+    """
+    Return the closest Wayback snapshot URL for *url*, or None.
+
+    Uses ``params=`` so a URL containing ``&``, ``#``, or other reserved
+    characters is percent-encoded by requests instead of silently
+    corrupting the query string.
+    """
     try:
-        r = http_session.get("https://archive.org/wayback/available?url=" + url, timeout=10)
+        r = http_session.get(
+            "https://archive.org/wayback/available",
+            params={"url": url},
+            timeout=10,
+        )
         if r.status_code == 200:
             data = r.json()
             snapshots = data.get("archived_snapshots", {})
@@ -195,6 +292,114 @@ def wayback_available(url):
         log_trace(f"wayback_available: EXCEPTION {type(exc).__name__}: {exc} "
                   f"for {url[:80]}")
     return None
+
+
+def crt_sh_subdomains(domain: str, timeout: int = 20) -> list[str]:
+    """
+    Return every subdomain that has ever appeared in a Certificate
+    Transparency log for *domain*.
+    """
+    domain = (domain or "").strip().lower()
+    if not domain or "." not in domain:
+        return []
+
+    if "://" in domain:
+        domain = urlparse(domain).netloc or domain
+    domain = domain.split("/")[0].split("?")[0]
+    if not domain or "." not in domain:
+        return []
+
+    url = f"https://crt.sh/?q=%25.{domain}&output=json"
+    headers = {
+        "User-Agent": "WhoCord-OSINT/1.1",
+        "Accept":     "application/json",
+    }
+
+    max_bytes = 10 * 1024 * 1024
+
+    for attempt in range(2):
+        try:
+            resp = http_session.get(
+                url, headers=headers, timeout=timeout, stream=True,
+            )
+        except Exception as exc:
+            log_trace(f"crt_sh: network error for {domain}: "
+                      f"{type(exc).__name__}: {exc}")
+            if attempt == 0:
+                time.sleep(2)
+                continue
+            return []
+
+        if resp.status_code in (502, 503, 504) and attempt == 0:
+            log_trace(f"crt_sh: HTTP {resp.status_code} for {domain}, retrying")
+            time.sleep(2)
+            continue
+
+        if resp.status_code != 200:
+            log_trace(f"crt_sh: HTTP {resp.status_code} for {domain}")
+            return []
+
+        chunks: list[bytes] = []
+        total = 0
+        truncated = False
+        try:
+            for chunk in resp.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                total += len(chunk)
+                if total >= max_bytes:
+                    truncated = True
+                    break
+        except Exception as exc:
+            log_trace(f"crt_sh: read error for {domain}: "
+                      f"{type(exc).__name__}: {exc}")
+            if attempt == 0:
+                time.sleep(2)
+                continue
+            return []
+
+        if truncated:
+            log_trace(f"crt_sh: response truncated at {max_bytes} bytes for {domain}")
+
+        body = b"".join(chunks)
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError as exc:
+            log_trace(f"crt_sh: JSON parse error for {domain}: {exc}")
+            if attempt == 0:
+                time.sleep(2)
+                continue
+            return []
+
+        if not isinstance(data, list):
+            log_trace(f"crt_sh: expected JSON array, got {type(data).__name__}")
+            return []
+
+        subdomains: set[str] = set()
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            name_value = entry.get("name_value", "")
+            if not isinstance(name_value, str) or not name_value:
+                continue
+            for raw_name in name_value.split("\n"):
+                name = raw_name.strip().lower()
+                if not name:
+                    continue
+                if name.startswith("*."):
+                    name = name[2:]
+                if not name or name == domain:
+                    continue
+                if not name.endswith("." + domain):
+                    continue
+                if any(c.isspace() for c in name):
+                    continue
+                subdomains.add(name)
+
+        return sorted(subdomains)
+
+    return []
 
 
 import re as _re
@@ -223,9 +428,6 @@ def detect_language(text):
     return None
 
 
-# ── Fix: socialscan username extraction was picking path segments like
-#         "oembed" from API endpoints. Now it rejects obvious non-usernames
-#         and prefers classify_url() results exclusively.
 _NON_USERNAME_SEGMENTS = frozenset({
     "oembed", "lookup", "profile", "users", "user", "api", "signup",
     "sign-in", "signin", "signup", "register", "login", "auth", "oauth",
@@ -247,7 +449,6 @@ def socialscan_filter(urls):
         log_trace("socialscan_filter: socialscan not on PATH — keeping all URLs.")
         return urls
 
-    # ── Prefer classify_url() — it knows the actual platform slug. ──────
     username = None
     for url in urls:
         pl, sl = classify_url(url)
@@ -255,7 +456,6 @@ def socialscan_filter(urls):
             username = sl
             break
 
-    # ── Fallback: extract last path segment ONLY from non-API URLs. ─────
     if not username:
         for url in urls:
             try:
@@ -272,8 +472,12 @@ def socialscan_filter(urls):
                 if _is_plausible_username(path):
                     username = path
                     break
-            except Exception:
-                pass
+            except Exception as exc:
+                log_trace(
+                    f"socialscan_filter: url parse failed for "
+                    f"{url[:80]!r}: {type(exc).__name__}: {exc}"
+                )
+                continue
 
     if not username:
         log_trace("socialscan_filter: no plausible username extracted — "
@@ -281,7 +485,11 @@ def socialscan_filter(urls):
         return urls
 
     temp_dir = os.path.join(CACHE_DIR, "socialscan_tmp")
-    os.makedirs(temp_dir, exist_ok=True)
+    os.makedirs(temp_dir, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(temp_dir, 0o700)
+    except OSError:
+        pass
     outfile = os.path.join(temp_dir, f"scan_{username}.json")
 
     if getattr(sys, 'frozen', False):

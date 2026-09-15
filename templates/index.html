@@ -60,7 +60,6 @@ button {
 button:hover { background: var(--accent-hover); }
 button.danger { background: var(--danger); }
 
-/* Tool grid */
 .tool-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
@@ -81,7 +80,6 @@ button.danger { background: var(--danger); }
   white-space: pre-wrap;
   word-break: break-word;
 }
-/* Every log line is a block div whose textContent is set — never innerHTML. */
 #log-container .log-line { display: block; }
 #log-container .log-line.err  { color: var(--danger); }
 #log-container .log-line.sys  { color: #7aa2f7; }
@@ -110,7 +108,6 @@ button.danger { background: var(--danger); }
 </nav>
 
 <main>
-  <!-- Investigation Tab -->
   <div id="tab-investigate" class="tab-content active">
     <div class="card">
       <div style="text-align:center; margin-bottom:1rem;">
@@ -144,7 +141,6 @@ button.danger { background: var(--danger); }
     </div>
   </div>
 
-  <!-- Configuration Tab -->
   <div id="tab-config" class="tab-content">
     <div class="card">
       <h2>Tokens / API Keys</h2>
@@ -165,7 +161,6 @@ button.danger { background: var(--danger); }
       <div id="tools-list" class="tool-grid"></div>
       <button id="upgrade-tools-btn" style="margin-top:1rem;">⬆ Upgrade All Tools</button>
     </div>
-    <!-- Debug Mode Card -->
     <div class="card">
       <h2>Debug Mode <span id="debug-badge" class="badge off">OFF</span></h2>
       <div class="tool-item">
@@ -174,7 +169,6 @@ button.danger { background: var(--danger); }
       </div>
       <p style="margin-top:0.5em; font-size:0.85em;">When enabled, detailed output will appear in the Live Logs.</p>
     </div>
-    <!-- Phase 2: Pivot Configuration -->
     <div class="card">
       <h2>🌀 Adaptive Pivoting <span id="pivot-badge" class="badge off">OFF</span></h2>
       <div class="tool-item">
@@ -202,7 +196,6 @@ button.danger { background: var(--danger); }
     </div>
   </div>
 
-  <!-- Live Logs Tab -->
   <div id="tab-logs" class="tab-content">
     <div class="card">
       <h2>Live Progress</h2>
@@ -210,38 +203,54 @@ button.danger { background: var(--danger); }
     </div>
   </div>
 
-  <!-- Report Tab -->
   <div id="tab-report" class="tab-content">
     <div class="card">
       <h2>Report</h2>
       <!--
-        sandbox="" isolates the report iframe: scripts cannot run and it
-        cannot touch the parent document even if a scraped value were to
-        sneak an executable payload past the server-side escaper.
-        allow-popups lets target="_blank" links in the report still open.
+        allow-same-origin is deliberately absent. The report runs in an
+        opaque origin and cannot reach window.parent or any
+        authenticated endpoint. The Flask route also sets
+        Content-Security-Policy: sandbox on the response, so the
+        sandbox applies even if this attribute is dropped.
       -->
       <iframe id="report-frame"
-              sandbox="allow-popups allow-popups-to-escape-sandbox"
+              sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
               srcdoc="<p style='color:#333;text-align:center;margin-top:2em;'>Run an investigation first.</p>"></iframe>
     </div>
   </div>
 </main>
 
 <script>
-// --- Global var for active SSE ---
-let eventSource = null;
+// ─────────────────────────────────────────────────────────────────────
+// Auth is cookie-based. The server sets an HttpOnly whocord_session
+// cookie when the dashboard is served; every fetch below sends it via
+// credentials: 'same-origin'. No token is read from the DOM and no URL
+// carries ?token=.
+// ─────────────────────────────────────────────────────────────────────
 
-// ─────────────────────────────────────────────────────────────────────
-// Safe log append — the ONLY way log text reaches the DOM.
-// Never uses innerHTML, so nothing in a scraped bio / username / page
-// title can ever become live markup in the analyst's browser.
-// ─────────────────────────────────────────────────────────────────────
+const FETCH_DEFAULTS = { credentials: 'same-origin' };
+
+function apiFetch(url, init = {}) {
+  return fetch(url, { ...FETCH_DEFAULTS, ...init });
+}
+
+function jsonFetch(url, body) {
+  return apiFetch(url, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify(body),
+  });
+}
+
+// Controller for the currently-running investigation stream.
+let investigationAbort = null;
+
 function appendLog(text, cls) {
   const container = document.getElementById('log-container');
   if (!container) return;
   const line = document.createElement('div');
   line.className = 'log-line' + (cls ? ' ' + cls : '');
-  line.textContent = String(text);   // <-- textContent, not innerHTML
+  line.textContent = String(text);
   container.appendChild(line);
   container.scrollTop = container.scrollHeight;
 }
@@ -251,8 +260,6 @@ function clearLog() {
   if (container) container.textContent = '';
 }
 
-// --- Tab switching ---
-// Fixed: no longer relies on the deprecated global `event` object.
 function switchTab(name, anchorEl) {
   document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
   const tab = document.getElementById('tab-' + name);
@@ -262,7 +269,6 @@ function switchTab(name, anchorEl) {
   if (anchorEl) anchorEl.classList.add('active');
 }
 
-// --- Show/hide Discord fields ---
 document.getElementById('mode-select').addEventListener('change', function(e) {
   if (e.target.value === 'discord') {
     document.getElementById('manual-fields').classList.add('hidden');
@@ -273,12 +279,10 @@ document.getElementById('mode-select').addEventListener('change', function(e) {
   }
 });
 
-// --- Load current config & populate UI ---
 async function loadConfig() {
-  const res = await fetch('/get_config');
+  const res = await apiFetch('/get_config');
   const cfg = await res.json();
 
-  // Token badges
   const statusMap = {
     'DISCORD_TOKEN': 'disc-token-status',
     'GITHUB_TOKEN': 'gh-token-status',
@@ -298,7 +302,6 @@ async function loadConfig() {
     }
   }
 
-  // Tool toggles — build with DOM nodes, not innerHTML
   const toolsDiv = document.getElementById('tools-list');
   toolsDiv.textContent = '';
   cfg.tools.forEach(tool => {
@@ -306,7 +309,7 @@ async function loadConfig() {
     div.className = 'tool-item';
 
     const label = document.createElement('label');
-    label.textContent = tool.desc;             // textContent, not innerHTML
+    label.textContent = tool.desc;
 
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
@@ -321,7 +324,6 @@ async function loadConfig() {
     toolsDiv.appendChild(div);
   });
 
-  // Debug toggle
   const debugToggle = document.getElementById('debug-toggle');
   const debugBadge = document.getElementById('debug-badge');
   if (debugToggle && debugBadge) {
@@ -330,7 +332,6 @@ async function loadConfig() {
     debugBadge.className = cfg.debug ? 'badge' : 'badge off';
   }
 
-  // Pivot config
   const pivotEnable = document.getElementById('pivot-enable-toggle');
   const pivotBadge = document.getElementById('pivot-badge');
   const pivotOptions = document.getElementById('pivot-options');
@@ -353,23 +354,13 @@ async function loadConfig() {
   if (pivotMaxSeeds) pivotMaxSeeds.value = cfg.pivot_max_seeds;
 }
 
-// --- Tool toggle handler ---
 function toggleTool(key, enable) {
-  fetch('/config', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'toggle_tool', key, enable})
-  });
+  jsonFetch('/config', { action: 'toggle_tool', key, enable });
 }
 
-// --- Debug mode toggle handler ---
 async function toggleDebug(e) {
   const enable = e.target.checked;
-  await fetch('/config', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'toggle_debug'})
-  });
+  await jsonFetch('/config', { action: 'toggle_debug' });
   appendLog(`[CONFIG] Debug mode ${enable ? 'ENABLED' : 'DISABLED'}`, 'sys');
   const badge = document.getElementById('debug-badge');
   if (badge) {
@@ -378,7 +369,6 @@ async function toggleDebug(e) {
   }
 }
 
-// --- Pivot toggle & settings handlers ---
 function updatePivotBadge() {
   const enable = document.getElementById('pivot-enable-toggle').checked;
   const badge = document.getElementById('pivot-badge');
@@ -392,10 +382,6 @@ function updatePivotBadge() {
   }
 }
 
-// FIXED: sends the nested `pivot` object that web_app.py's
-// `action: "set_pivot"` handler actually understands. The previous
-// flat-key payload (`action: "set_pivot_config"`) silently fell
-// through to `unknown action` and nothing was ever saved.
 async function savePivotConfig() {
   const enable = document.getElementById('pivot-enable-toggle').checked;
   const email = document.getElementById('pivot-email-toggle').checked;
@@ -404,20 +390,16 @@ async function savePivotConfig() {
   const maxSeeds = parseInt(document.getElementById('pivot-max-seeds').value, 10) || 5;
 
   try {
-    const res = await fetch('/config', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        action: 'set_pivot',
-        pivot: {
-          enabled:         enable,
-          pivot_email:     email,
-          pivot_username:  username,
-          max_depth:       maxDepth,
-          max_seeds:       maxSeeds,
-          require_confirm: false
-        }
-      })
+    const res = await jsonFetch('/config', {
+      action: 'set_pivot',
+      pivot: {
+        enabled:         enable,
+        pivot_email:     email,
+        pivot_username:  username,
+        max_depth:       maxDepth,
+        max_seeds:       maxSeeds,
+        require_confirm: false
+      }
     });
     const body = await res.json();
     if (!body.success) {
@@ -430,7 +412,6 @@ async function savePivotConfig() {
   updatePivotBadge();
 }
 
-// Attach event listeners after DOM ready
 document.addEventListener('DOMContentLoaded', () => {
   loadConfig();
 
@@ -453,18 +434,13 @@ document.addEventListener('DOMContentLoaded', () => {
   updatePivotBadge();
 });
 
-// --- Token form submit ---
 document.getElementById('token-form').addEventListener('submit', async function(e) {
   e.preventDefault();
   const formData = new FormData(e.target);
   let anySent = false;
   for (let [key, value] of formData.entries()) {
     if (value) {
-      await fetch('/config', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({action: 'set_token', key, value})
-      });
+      await jsonFetch('/config', { action: 'set_token', key, value });
       anySent = true;
     }
   }
@@ -475,15 +451,6 @@ document.getElementById('token-form').addEventListener('submit', async function(
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────
-// SSE message handler.
-//
-// The backend emits structured JSON envelopes via to_sse_line():
-//     data: {"type": "log", "payload": {"line": "…"}}
-//
-// This handler parses the JSON and renders each event safely. Any
-// unparseable frame is treated as a raw log line and appended as text.
-// ─────────────────────────────────────────────────────────────────────
 function handleSseEvent(raw) {
   let parsed;
   try {
@@ -500,44 +467,33 @@ function handleSseEvent(raw) {
     case 'log':
       appendLog(payload.line ?? '');
       break;
-
     case 'stage_start':
       appendLog(`[stage] ${payload.stage ?? ''} starting…`, 'sys');
       break;
-
     case 'stage_done':
       appendLog(`[stage] ${payload.stage ?? ''} done`, 'sys');
       break;
-
     case 'stage_error':
       appendLog(`[stage error] ${payload.stage ?? ''}: ${payload.error ?? ''}`, 'err');
       break;
-
     case 'progress':
       if (payload.message) appendLog(`  … ${payload.message}`, 'sys');
       break;
-
     case 'finding':
       appendLog(`[finding] ${payload.type ?? ''} ${payload.value ?? payload.url ?? ''}`.trim());
       break;
-
     case 'report_ready':
       appendLog(`[report] ${payload.format ?? ''} → ${payload.path ?? ''}`, 'sys');
       break;
-
     case 'error':
       appendLog('[ERROR] ' + (payload.message ?? 'unknown error'), 'err');
       break;
-
     case 'done':
     case 'stream_end':
       appendLog('[done] investigation complete', 'done');
       return 'done';
-
     case 'heartbeat':
-      // silent — connection keepalive
       break;
-
     default:
       appendLog(`[${type}] ${JSON.stringify(payload)}`);
   }
@@ -545,11 +501,10 @@ function handleSseEvent(raw) {
 }
 
 function loadReport(reportUrl) {
-  // Report is fetched as HTML text and injected via srcdoc inside a
-  // sandboxed iframe. The sandbox blocks script execution and origin
-  // access, so even if a scraped value were rendered as raw markup it
-  // cannot reach the parent page.
-  fetch(reportUrl)
+  // Same-origin fetch with credentials; the HttpOnly session cookie
+  // rides along. The response is injected into the iframe via srcdoc,
+  // which is why an <iframe src=> would not work here.
+  apiFetch(reportUrl)
     .then(res => res.text())
     .then(html => {
       const frame = document.getElementById('report-frame');
@@ -559,68 +514,104 @@ function loadReport(reportUrl) {
     .catch(err => appendLog('[report] failed to load: ' + err, 'err'));
 }
 
-// --- Start investigation (SSE) ---
-document.getElementById('investigate-form').addEventListener('submit', function(e) {
+document.getElementById('investigate-form').addEventListener('submit', async function(e) {
   e.preventDefault();
   const formData = new FormData(e.target);
+  const params = {};
+  formData.forEach((value, key) => { params[key] = value; });
 
   clearLog();
   switchTab('logs', document.querySelectorAll('nav a')[2]);
   document.getElementById('stop-button').style.display = 'inline-block';
 
-  eventSource = new EventSource('/run?' + new URLSearchParams(formData));
+  if (investigationAbort) investigationAbort.abort();
+  investigationAbort = new AbortController();
+  const controller = investigationAbort;
 
-  eventSource.onmessage = function(event) {
-    const kind = handleSseEvent(event.data);
-    if (kind === 'done' || kind === 'stream_end') {
-      // Pull the report URL from the same envelope if present
-      let payload = {};
-      try { payload = JSON.parse(event.data).payload || {}; } catch (_) {}
-      const reportUrl = payload.report_url;
-      if (reportUrl) loadReport(reportUrl);
+  try {
+    const res = await apiFetch('/run', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(params),
+      signal:  controller.signal,
+    });
 
-      eventSource.close();
-      eventSource = null;
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      appendLog(`[error] /run returned HTTP ${res.status}: ${txt.slice(0, 200)}`, 'err');
       document.getElementById('stop-button').style.display = 'none';
+      investigationAbort = null;
+      return;
     }
-  };
 
-  eventSource.onerror = function(/* event */) {
-    // Network drop — EventSource will retry natively unless we close.
-    // We do NOT close here; instead we surface the hiccup and let the
-    // browser reconnect. Only a terminal "error" event closes the stream.
-    appendLog('[sse] connection interrupted — retrying…', 'sys');
-  };
+    if (!res.body) {
+      appendLog('[error] /run returned no response body', 'err');
+      document.getElementById('stop-button').style.display = 'none';
+      investigationAbort = null;
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const raw = line.slice(6).trim();
+        if (!raw) continue;
+        const kind = handleSseEvent(raw);
+        if (kind === 'done' || kind === 'stream_end') {
+          let payload = {};
+          try { payload = JSON.parse(raw).payload || {}; } catch (_) {}
+          if (payload.report_url) loadReport(payload.report_url);
+          document.getElementById('stop-button').style.display = 'none';
+          investigationAbort = null;
+          return;
+        }
+      }
+    }
+
+    document.getElementById('stop-button').style.display = 'none';
+    investigationAbort = null;
+  } catch (err) {
+    if (err && err.name === 'AbortError') {
+      appendLog('[stop] stream aborted', 'sys');
+    } else {
+      appendLog('[sse] error: ' + err, 'err');
+    }
+    document.getElementById('stop-button').style.display = 'none';
+    investigationAbort = null;
+  }
 });
 
-// --- Stop Investigation button ---
 document.getElementById('stop-button').addEventListener('click', async function() {
-  if (eventSource) {
-    try {
-      const res  = await fetch('/stop', { method: 'POST' });
-      const body = await res.json();
-      if (body.success) {
-        appendLog('[stop] stop signal sent — waiting for worker to exit…', 'sys');
-      } else {
-        appendLog('[stop] server could not honour stop request: ' +
-                  (body.error || 'unknown'), 'err');
-      }
-    } catch (err) {
-      appendLog('[stop] failed to reach server: ' + err, 'err');
+  try {
+    const res  = await jsonFetch('/stop', {});
+    const body = await res.json();
+    if (body.success) {
+      appendLog('[stop] stop signal sent — waiting for worker to exit…', 'sys');
+    } else {
+      appendLog('[stop] server could not honour stop request: ' +
+                (body.error || 'unknown'), 'err');
     }
-    eventSource.close();
-    eventSource = null;
+  } catch (err) {
+    appendLog('[stop] failed to reach server: ' + err, 'err');
   }
   document.getElementById('stop-button').style.display = 'none';
 });
 
-// --- Upgrade tools button ---
 document.getElementById('upgrade-tools-btn').addEventListener('click', function() {
   switchTab('logs', document.querySelectorAll('nav a')[2]);
   clearLog();
   document.getElementById('stop-button').style.display = 'none';
 
-  fetch('/upgrade_tools', { method: 'POST' })
+  apiFetch('/upgrade_tools', { method: 'POST' })
     .then(response => {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -635,7 +626,6 @@ document.getElementById('upgrade-tools-btn').addEventListener('click', function(
             if (line.startsWith('data: ')) {
               const data = line.slice(6);
               if (data) {
-                // Upgrade stream also carries JSON envelopes.
                 handleSseEvent(data);
               }
             }
@@ -652,7 +642,7 @@ document.getElementById('upgrade-tools-btn').addEventListener('click', function(
 
 function shutdownServer() {
   if (confirm('Shut down WhoCord server?')) {
-    fetch('/shutdown', { method: 'POST' })
+    jsonFetch('/shutdown', {})
       .then(() => setTimeout(() => window.close(), 400))
       .catch(() => window.close());
   }

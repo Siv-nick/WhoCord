@@ -1,33 +1,19 @@
 """
 discord_osint/intelligence/engine.py
 --------------------------------------
-``IntelligenceEngine`` – orchestrates the four-step intelligence pipeline:
+``IntelligenceEngine`` – orchestrates the four-step intelligence pipeline.
 
-  1. **Extract**     – parse raw intel into typed entities
-  2. **Graph**       – build a networkx knowledge graph
-  3. **Correlations**– run all detector functions
-  4. **Narrative**   – generate an AI intelligence report via Groq
+Per-job config
+--------------
+``run()`` accepts an optional ``config`` object, threaded into
+``generate_narrative`` so per-job LLM settings are used.
 
-Usage
------
-::
-
-    engine = IntelligenceEngine(groq_api_key=cfg.GROQ_API_KEY)
-    report = engine.run(
-        intel=ctx.intel_core.intel,
-        avatar_urls=ctx.avatar_urls,
-        emit=emit,
-        cancel_event=getattr(cfg, "_cancel_event", None),
-    )
-    # report is a plain dict – safe to store in intel_core
-
-Cancellation
-------------
-The engine checks ``cancel_event`` before each of the four steps. The
-most useful check is the one before step 4 — if the user hit Stop while
-the graph was being built, we skip the ~45 s Groq narrative roundtrip
-rather than burning the call. The returned report is a partial dict with
-whatever steps completed.
+Structured logging
+------------------
+``run()`` also accepts an optional ``log`` (StructuredLogger). When
+supplied, the engine's own progress messages become structured events
+and the third-party contact event from the narrative call inherits
+the same log.
 """
 
 from __future__ import annotations
@@ -40,7 +26,6 @@ from .graph import build_graph, graph_summary
 from .correlations import run_all_detectors, Correlation
 from ..utils import log_trace
 
-# Type alias matching the pipeline emit signature
 EmitFn = Callable[[str, dict], None]
 _NOOP: EmitFn = lambda *_: None
 
@@ -49,20 +34,11 @@ class IntelligenceEngine:
     """
     Orchestrate entity extraction → graph construction →
     correlation detection → AI narrative generation.
-
-    Parameters
-    ----------
-    groq_api_key:
-        Groq API key.  When empty the narrative step is skipped
-        (no error; report will have an empty ``"narrative"`` dict).
     """
 
-    def __init__(self, groq_api_key: str = "") -> None:
+    def __init__(self, groq_api_key: str = "", config: Any = None) -> None:
         self.groq_api_key = groq_api_key
-
-    # ------------------------------------------------------------------ #
-    # Public entry point
-    # ------------------------------------------------------------------ #
+        self.config       = config
 
     def run(
         self,
@@ -70,43 +46,31 @@ class IntelligenceEngine:
         avatar_urls: Optional[Set[str]] = None,
         emit: EmitFn = _NOOP,
         cancel_event: Any = None,
+        config: Any = None,
+        log: Any = None,
     ) -> dict[str, Any]:
         """
         Execute the full intelligence pipeline.
 
-        Parameters
-        ----------
-        intel:
-            ``InvestigationCore.intel`` – the raw collected data.
-        avatar_urls:
-            ``InvestigationContext.avatar_urls`` – image URLs.
-        emit:
-            Pipeline event callback; called with structured progress events.
-        cancel_event:
-            Optional ``threading.Event``. When set, remaining steps are
-            skipped and the partial report is returned. If not supplied,
-            the engine falls back to
-            ``getattr(ctx.config, "_cancel_event", None)`` via the caller
-            (the stage already does this) — passing it explicitly here is
-            the recommended path.
-
-        Returns
-        -------
-        dict
-            Serialisable report with keys:
-
-            - ``"entities"``       – list of entity dicts
-            - ``"entity_counts"``  – counts per entity type
-            - ``"graph_summary"``  – networkx graph statistics
-            - ``"correlations"``   – list of correlation dicts
-            - ``"narrative"``      – AI narrative dict (may be ``{}``)
-            - ``"cancelled"``      – True if the pipeline stopped early
+        ``log`` is an optional StructuredLogger. When supplied, the
+        engine emits structured progress lines and forwards the logger
+        to the narrative step so its third-party contact event is
+        captured.
         """
         avatar_urls = avatar_urls or set()
+        effective_config = config if config is not None else self.config
         cancelled = False
 
         def _is_cancelled() -> bool:
             return cancel_event is not None and cancel_event.is_set()
+
+        def _info(msg: str) -> None:
+            print(msg)
+            if log is not None:
+                try:
+                    log.info(msg)
+                except Exception:
+                    pass
 
         # ---------------------------------------------------------------- #
         # Step 1 – Entity extraction                                         #
@@ -118,7 +82,7 @@ class IntelligenceEngine:
         for e in entities:
             entity_counts[e.entity_type] = entity_counts.get(e.entity_type, 0) + 1
 
-        print(
+        _info(
             f"\n  Intelligence – entities extracted: {len(entities)}"
             + (
                 f"  ({', '.join(f'{v} {k}' for k, v in entity_counts.items())})"
@@ -134,22 +98,22 @@ class IntelligenceEngine:
 
         if _is_cancelled():
             cancelled = True
-            print("  Intelligence – cancelled after extraction.")
+            _info("  Intelligence – cancelled after extraction.")
         else:
             emit("progress", {"message": "Intelligence: building knowledge graph"})
             try:
                 G = build_graph(entities)
                 g_summary = graph_summary(G)
-                print(
+                _info(
                     f"  Intelligence – graph: "
                     f"{g_summary.get('total_nodes', 0)} nodes, "
                     f"{g_summary.get('total_edges', 0)} edges, "
                     f"density={g_summary.get('density', 0.0):.4f}"
                 )
             except ImportError:
-                print("  Intelligence – networkx not installed; graph step skipped.")
+                _info("  Intelligence – networkx not installed; graph step skipped.")
             except Exception as exc:
-                print(f"  Intelligence – graph error (continuing): {exc}")
+                _info(f"  Intelligence – graph error (continuing): {exc}")
                 log_trace(f"IntelligenceEngine graph step failed: "
                           f"{type(exc).__name__}: {exc}")
 
@@ -160,14 +124,14 @@ class IntelligenceEngine:
 
         if cancelled or _is_cancelled():
             cancelled = True
-            print("  Intelligence – cancelled before correlation step.")
+            _info("  Intelligence – cancelled before correlation step.")
         else:
             emit("progress", {"message": "Intelligence: running correlation detectors"})
             correlations = run_all_detectors(entities, G)
 
-            print(f"  Intelligence – correlations found: {len(correlations)}")
+            _info(f"  Intelligence – correlations found: {len(correlations)}")
             for c in correlations[:5]:
-                print(f"    [{c.correlation_type}] conf={c.confidence:.2f}  "
+                _info(f"    [{c.correlation_type}] conf={c.confidence:.2f}  "
                       f"{c.description[:80]}{'…' if len(c.description) > 80 else ''}")
 
             if correlations:
@@ -185,37 +149,42 @@ class IntelligenceEngine:
 
         if cancelled or _is_cancelled():
             cancelled = True
-            # Skipping the narrative is the whole point of the check
-            # here — the Groq call takes up to 45 seconds and cannot be
-            # interrupted once in flight.
-            print("  Intelligence – cancelled; skipping AI narrative step.")
+            _info("  Intelligence – cancelled; skipping AI narrative step.")
             emit("progress", {"message": "Intelligence: narrative skipped (cancelled)"})
-        elif self.groq_api_key:
-            emit("progress", {"message": "Intelligence: generating AI narrative"})
-            try:
-                from .narrative import generate_narrative
-                narrative = generate_narrative(
-                    graph_summary=g_summary,
-                    correlations=correlations,
-                    entities=entities,
-                    intel=intel,
-                    groq_api_key=self.groq_api_key,
-                )
-                if narrative:
-                    print("  Intelligence – AI narrative generated successfully.")
-                    emit("finding", {"type": "intelligence_narrative"})
-                else:
-                    print("  Intelligence – narrative returned empty (LLM parse issue).")
-            except Exception as exc:
-                print(f"  Intelligence – narrative generation failed: {exc}")
-                log_trace(f"IntelligenceEngine narrative step failed: "
-                          f"{type(exc).__name__}: {exc}")
         else:
-            print("  Intelligence – no Groq API key; narrative step skipped.")
+            key_available = False
+            if effective_config is not None:
+                from ..config_service import get_llm_endpoint
+                _, key, _ = get_llm_endpoint(effective_config)
+                key_available = bool(key)
+            else:
+                key_available = bool(self.groq_api_key)
 
-        # ---------------------------------------------------------------- #
-        # Package results into a serialisable dict                          #
-        # ---------------------------------------------------------------- #
+            if key_available:
+                emit("progress", {"message": "Intelligence: generating AI narrative"})
+                try:
+                    from .narrative import generate_narrative
+                    narrative = generate_narrative(
+                        graph_summary=g_summary,
+                        correlations=correlations,
+                        entities=entities,
+                        intel=intel,
+                        groq_api_key=self.groq_api_key,
+                        config=effective_config,
+                        log=log,
+                    )
+                    if narrative:
+                        _info("  Intelligence – AI narrative generated successfully.")
+                        emit("finding", {"type": "intelligence_narrative"})
+                    else:
+                        _info("  Intelligence – narrative returned empty (LLM parse issue).")
+                except Exception as exc:
+                    _info(f"  Intelligence – narrative generation failed: {exc}")
+                    log_trace(f"IntelligenceEngine narrative step failed: "
+                              f"{type(exc).__name__}: {exc}")
+            else:
+                _info("  Intelligence – no LLM API key; narrative step skipped.")
+
         return {
             "entities":      self._serialise_entities(entities),
             "entity_counts": entity_counts,
@@ -225,11 +194,6 @@ class IntelligenceEngine:
             "cancelled":     cancelled,
         }
 
-    # ------------------------------------------------------------------ #
-    # Private helpers
-    # ------------------------------------------------------------------ #
-
     @staticmethod
     def _serialise_entities(entities: list[BaseEntity]) -> list[dict]:
-        """Convert entity objects to plain dicts for JSON storage."""
         return [e.to_dict() for e in entities]

@@ -1,9 +1,11 @@
 // src/components/CanvasConfigPanel.tsx
 import React, { useEffect, useRef, useState } from "react";
 import {
+  apiFetch,
   fetchConfig,
   fetchLLMModels,
   saveLLMConfig,
+  saveOutputFormat,
   savePivotConfig,
   saveEnrichmentConfig,
   setToken,
@@ -18,6 +20,7 @@ import type {
   AppConfig,
   EnrichmentTestResult,
   LLMProvider,
+  OutputFormat,
   PivotConfig,
   ToolConfig,
 } from "../types/investigation";
@@ -46,11 +49,19 @@ const DEFAULT_LLM: LLMConfig = {
 const PROVIDER_DESCRIPTIONS: Record<LLMProvider, string> = {
   groq:       "Ultra-fast inference. Free tier is per-minute token limited — pick a small model on big graphs.",
   openrouter: "Routes to hundreds of models. Free tier is request-count limited (50/day) — no per-minute token cap.",
+  ollama:     "Local inference via Ollama. No investigation data leaves your machine — the full intel dump stays on disk.",
 };
 
 const PROVIDER_DEFAULT_MODEL: Record<LLMProvider, string> = {
   groq:       "llama3-8b-8192",
   openrouter: "deepseek/deepseek-chat-v3.1:free",
+  ollama:     "llama3.2:latest",
+};
+
+const OUTPUT_FORMAT_LABELS: Record<OutputFormat, string> = {
+  html:     "HTML report (recommended)",
+  markdown: "Markdown only",
+  json:     "JSON only",
 };
 
 interface Props {
@@ -112,7 +123,9 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
   const [llmLoading,   setLLMLoading]   = useState(false);
   const [llmSaved,     setLLMSaved]     = useState(false);
 
-  // ── Enrichment UI state ────────────────────────────────────────────
+  const [outputFormat, setOutputFormat] = useState<OutputFormat>("html");
+  const [formatSaved,  setFormatSaved]  = useState(false);
+
   const [enrMaxIdents, setEnrMaxIdents] = useState<number>(25);
   const [enrPhone,     setEnrPhone]     = useState<boolean>(false);
   const [enrSaved,     setEnrSaved]     = useState(false);
@@ -131,6 +144,7 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
       setCfg(data);
       setPivot(data.pivot ?? DEFAULT_PIVOT);
       if (data.llm) setLLM({ ...DEFAULT_LLM, ...data.llm });
+      if (data.output_format) setOutputFormat(data.output_format);
       if (data.enrichment) {
         setEnrMaxIdents(data.enrichment.max_identifiers ?? 25);
         setEnrPhone(data.enrichment.phone_reveal ?? false);
@@ -203,20 +217,28 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
     }
   };
 
+  const handleSaveFormat = async () => {
+    try {
+      await saveOutputFormat(outputFormat);
+      setFormatSaved(true);
+      setTimeout(() => setFormatSaved(false), 2500);
+    } catch (err) {
+      console.warn("saveOutputFormat failed:", err);
+    }
+  };
+
   const handleSwitchProvider = async (next: LLMProvider) => {
     if (next === llm.provider) return;
 
-    const looksLikeGroq = !llm.model.includes("/");
-    const looksLikeOpenRouter = llm.model.includes("/");
-
-    let nextModel = llm.model;
-    if (next === "openrouter" && looksLikeGroq) {
-      nextModel = PROVIDER_DEFAULT_MODEL.openrouter;
-    } else if (next === "groq" && looksLikeOpenRouter) {
-      nextModel = PROVIDER_DEFAULT_MODEL.groq;
-    }
-
-    const nextLlm: LLMConfig = { ...llm, provider: next, model: nextModel };
+    // Always use the target provider's default model on switch. The old
+    // heuristic ("contains a slash → openrouter") can't distinguish
+    // Ollama's family:tag names from Groq's names, and it silently
+    // carried over an unusable model id.
+    const nextLlm: LLMConfig = {
+      ...llm,
+      provider: next,
+      model:    PROVIDER_DEFAULT_MODEL[next],
+    };
     setLLM(nextLlm);
     try {
       await saveLLMConfig(nextLlm);
@@ -255,7 +277,7 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
     setLog([]);
     setUpgrading(true);
     try {
-      const res    = await fetch(upgradeToolsUrl(), { method: "POST" });
+      const res    = await apiFetch(upgradeToolsUrl(), { method: "POST" });
       const reader = res.body?.getReader();
       const dec    = new TextDecoder();
       if (!reader) {
@@ -303,6 +325,8 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
     INSTAGRAM_SESSION:  "Instagram Session",
     APOLLO_API_KEY:     "Apollo.io API Key (paid credits)",
     LUSHA_API_KEY:      "Lusha API Key (paid credits)",
+    CORD_CAT_API_KEY:   "CordCat API Key",
+    TINEYE_API_KEY:     "TinEye API Key (paid API)",
   };
 
   const llmModelOptions = (() => {
@@ -313,10 +337,13 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
 
   const providerKeyStored = (() => {
     if (!cfg) return false;
+    if (llm.provider === "ollama") return true;   // local server, no key
     return llm.provider === "groq"
       ? cfg.tokens.GROQ_API_KEY
       : cfg.tokens.OPENROUTER_API_KEY;
   })();
+
+  const discordTokenMissing = cfg && !cfg.tokens.DISCORD_TOKEN;
 
   return (
     <>
@@ -352,6 +379,23 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
 
           {!loading && (
             <div className="flex-1 overflow-y-auto px-6 py-5 space-y-8">
+
+              {discordTokenMissing && (
+                <div className="rounded-lg border border-amber-500/30 bg-amber-500/[.06]
+                                px-3 py-2.5 text-[12px] text-amber-200 leading-snug">
+                  <div className="flex items-start gap-2">
+                    <span className="shrink-0 mt-0.5"><Icon name="alert" size={13} /></span>
+                    <div>
+                      <p className="font-semibold">Discord token is not set.</p>
+                      <p className="text-amber-200/80 mt-0.5">
+                        Discord mode and guild message search will not run.
+                        All other modules work without it. Add a token below
+                        if you intend to investigate Discord users.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               <section>
                 <h3 className="text-[13px] font-bold text-white mb-3 flex items-center gap-2">
@@ -420,6 +464,51 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
 
               <section>
                 <h3 className="text-[13px] font-bold text-white mb-1 flex items-center gap-2">
+                  <Icon name="layout" size={14} className="text-violet-300" />
+                  Report Output
+                </h3>
+                <p className="text-[11px] text-zinc-500 mb-3 leading-snug">
+                  Format written at the end of every investigation. The HTML
+                  report is self-contained and opens offline; markdown and
+                  JSON are useful when feeding the result into another tool.
+                </p>
+                <div className="space-y-1.5">
+                  {(["html", "markdown", "json"] as OutputFormat[]).map(fmt => {
+                    const active = outputFormat === fmt;
+                    return (
+                      <button
+                        key={fmt}
+                        type="button"
+                        onClick={() => setOutputFormat(fmt)}
+                        className={[
+                          "w-full text-left rounded-lg border px-3 py-2 transition-all",
+                          active
+                            ? "border-violet-500/60 bg-violet-500/15 text-violet-100"
+                            : "border-edge-1 bg-ink-800/50 text-zinc-300 hover:border-edge-2",
+                        ].join(" ")}
+                      >
+                        <p className="text-[12px] font-bold">
+                          {fmt.toUpperCase()}
+                        </p>
+                        <p className="text-[10px] text-zinc-500 leading-snug mt-0.5">
+                          {OUTPUT_FORMAT_LABELS[fmt]}
+                        </p>
+                      </button>
+                    );
+                  })}
+                </div>
+                <div className="flex items-center gap-3 mt-3">
+                  <button onClick={handleSaveFormat} className="btn btn-primary">
+                    <Icon name="check" size={12} /> Save format
+                  </button>
+                  {formatSaved && (
+                    <span className="text-[12px] text-emerald-400">Saved</span>
+                  )}
+                </div>
+              </section>
+
+              <section>
+                <h3 className="text-[13px] font-bold text-white mb-1 flex items-center gap-2">
                   <Icon name="sparkle" size={14} className="text-violet-300" />
                   AI Model &amp; Prompt
                   {llmModelsSrc === "live" && (
@@ -445,9 +534,17 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
                   <label className="block text-[11px] text-zinc-500 mb-1.5">
                     Provider
                   </label>
-                  <div className="grid grid-cols-2 gap-2">
-                    {(["groq", "openrouter"] as LLMProvider[]).map(p => {
+                  <div className="grid grid-cols-3 gap-2">
+                    {(["groq", "openrouter", "ollama"] as LLMProvider[]).map(p => {
                       const active = llm.provider === p;
+                      const sub =
+                        p === "groq"       ? "Fast, TPM-limited"
+                        : p === "openrouter" ? "Broad, request-limited"
+                        : "Local, offline";
+                      const label =
+                        p === "groq"       ? "Groq"
+                        : p === "openrouter" ? "OpenRouter"
+                        : "Ollama";
                       return (
                         <button
                           key={p}
@@ -460,11 +557,9 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
                               : "border-edge-1 bg-ink-800/50 text-zinc-300 hover:border-edge-2",
                           ].join(" ")}
                         >
-                          <p className="text-[12px] font-bold">
-                            {p === "groq" ? "Groq" : "OpenRouter"}
-                          </p>
+                          <p className="text-[12px] font-bold">{label}</p>
                           <p className="text-[10px] text-zinc-500 leading-snug mt-0.5">
-                            {p === "groq" ? "Fast, TPM-limited" : "Broad catalog, request-limited"}
+                            {sub}
                           </p>
                         </button>
                       );
@@ -473,7 +568,7 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
                   <p className="mt-1.5 text-[10px] text-zinc-500 leading-snug">
                     {PROVIDER_DESCRIPTIONS[llm.provider]}
                   </p>
-                  {!providerKeyStored && (
+                  {!providerKeyStored && llm.provider !== "ollama" && (
                     <p className="mt-1.5 text-[10px] text-amber-400/80 leading-snug">
                       {llm.provider === "groq"
                         ? "No Groq API key stored. Add one in the API Tokens section above."
@@ -643,7 +738,6 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
                 </div>
               </section>
 
-              {/* ── Contact Enrichment ─────────────────────────────── */}
               {cfg && (
                 <section>
                   <h3 className="text-[13px] font-bold text-white mb-1 flex items-center gap-2">
@@ -851,7 +945,7 @@ export default function CanvasConfigPanel({ isOpen, onClose }: Props) {
                           }))
                         }
                         label="Confirm before each pivot"
-                        sublabel="Show all seeds at a depth, then wait for your approval (45s default)"
+                        sublabel="Show all seeds at a depth, then wait for your approval (45s default; timeouts skip)"
                       />
                     </div>
                   )}

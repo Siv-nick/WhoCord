@@ -20,19 +20,14 @@ export default function ReportViewer() {
     setEM("");
   }, [reportUrl]);
 
+  // The iframe is sandboxed without allow-same-origin, so
+  // contentDocument is inaccessible from here. We can no longer
+  // inspect the report body for error markers; a missing report
+  // shows up as the "Report not yet available" text the Flask route
+  // returns, rendered inside the frame. If richer status detection
+  // is needed later, expose a JSON status endpoint the viewer can
+  // call before mounting the iframe.
   const handleIframeLoad = () => {
-    try {
-      const doc = iframeRef.current?.contentDocument;
-      const title = doc?.title ?? "";
-      const body  = doc?.body?.innerText ?? "";
-      if (title === "404" || body.includes("not found") || body.includes("No report")) {
-        setLS("error");
-        setEM("Report not found or not yet generated.");
-        return;
-      }
-    } catch {
-      // cross-origin iframe — assume it loaded fine
-    }
     setLS("ready");
   };
 
@@ -104,11 +99,23 @@ export default function ReportViewer() {
               </div>
             </div>
           )}
+          {/*
+            allow-same-origin is deliberately absent. Without it the
+            framed document runs in an opaque origin and cannot reach
+            window.parent, the whocord-token meta tag, or any
+            authenticated endpoint. allow-scripts keeps the report's
+            own collapsible-section script working.
+
+            The Flask route also sets Content-Security-Policy: sandbox
+            on the report response, so the sandbox applies even if this
+            attribute is ever dropped or the report is opened directly.
+          */}
           <iframe
             ref={iframeRef}
             src={reportUrl}
             title="Investigation Report"
             className="w-full h-full border-0 bg-white"
+            sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
             onLoad={handleIframeLoad}
             onError={handleIframeError}
           />

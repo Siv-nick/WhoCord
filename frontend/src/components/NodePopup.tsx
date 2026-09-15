@@ -21,7 +21,7 @@ const COLORS = [
   "#f59e0b", "#f43f5e", "#f472b6", "#22d3ee", "#a3e635",
 ];
 
-export default function NodePopup({
+function NodePopup({
   node, hasChildren, screenPos,
   onConnect, onViewDetails, onInvestigate,
   onColourChange, onDelete, onClose,
@@ -196,3 +196,6 @@ function MenuBtn({
     </button>
   );
 }
+
+// Memoised: Re-rendered by unrelated canvas interactions.
+export default React.memo(NodePopup);

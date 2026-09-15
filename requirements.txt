@@ -1,3 +1,4 @@
+
 Flask>=3.0
 requests>=2.31
 beautifulsoup4>=4.12
@@ -18,3 +19,5 @@ phonenumbers>=8.13
 rapidfuzz>=3.5
 langdetect>=1.0.9
 socid-extractor>=0.0.27
+pyOpenSSL>=24.0
+

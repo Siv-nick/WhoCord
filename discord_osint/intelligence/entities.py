@@ -1,3 +1,4 @@
+
 """
 discord_osint/intelligence/entities.py
 ---------------------------------------
@@ -34,7 +35,7 @@ def _short_id() -> str:
 # Base entity
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(eq=False)
 class BaseEntity:
     """
     Attributes shared by every entity type.
@@ -61,7 +62,14 @@ class BaseEntity:
         """Discriminator string used as the graph node ``entity_type`` attribute."""
         return "base"
 
-    # Make entities hashable so they can live in sets / dict keys.
+    # Identity is the node id, never the field tuple.
+    #
+    # Every subclass below is declared ``@dataclass(eq=False)``. Without
+    # that flag, @dataclass synthesises an __eq__ on each subclass that
+    # compares every field, silently shadowing the one defined here —
+    # so two entities with the same id but different values compared
+    # unequal, and an entity whose value was enriched mid-run stopped
+    # matching its own graph node.
     def __hash__(self) -> int:
         return hash(self.id)
 
@@ -85,7 +93,7 @@ class BaseEntity:
 # Concrete entity types
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(eq=False)
 class EmailEntity(BaseEntity):
     """A discovered email address."""
 
@@ -104,7 +112,7 @@ class EmailEntity(BaseEntity):
         return self.value.split("@")[1] if "@" in self.value else ""
 
 
-@dataclass
+@dataclass(eq=False)
 class UsernameEntity(BaseEntity):
     """
     A plain username / handle (not a full URL).
@@ -125,7 +133,7 @@ class UsernameEntity(BaseEntity):
         return d
 
 
-@dataclass
+@dataclass(eq=False)
 class PlatformProfileEntity(BaseEntity):
     """
     A full profile URL on a known platform.
@@ -148,7 +156,7 @@ class PlatformProfileEntity(BaseEntity):
         return d
 
 
-@dataclass
+@dataclass(eq=False)
 class NameEntity(BaseEntity):
     """A real-world name clue (full name or partial name)."""
 
@@ -157,7 +165,7 @@ class NameEntity(BaseEntity):
         return "name"
 
 
-@dataclass
+@dataclass(eq=False)
 class LocationEntity(BaseEntity):
     """
     An inferred or stated location.
@@ -171,7 +179,7 @@ class LocationEntity(BaseEntity):
         return "location"
 
 
-@dataclass
+@dataclass(eq=False)
 class AvatarEntity(BaseEntity):
     """
     An avatar image.
@@ -192,3 +200,4 @@ class AvatarEntity(BaseEntity):
         d["url"] = self.url
         d["phash"] = self.phash
         return d
+

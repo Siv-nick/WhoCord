@@ -1,19 +1,18 @@
+
 """
 discord_osint/wmn_scanner.py
 -----------------------------
 Lightweight scanner built on the community-maintained WhatsMyName
 dataset (github.com/WebBreacher/WhatsMyName).
 
-Loads ``wmn-data.json`` (downloaded on first use, cached locally,
-refreshed weekly), probes each site's ``uri_check`` endpoint with the
-target username, and returns the ones that respond affirmatively.
-
-Unlike Blackbird this:
-  • has no local repo dependency (no `git clone`)
-  • caches the dataset in investigation_cache/ with a 7-day TTL
-  • runs concurrently with a modest worker pool
-  • returns the raw ``uri_check`` URL — many of them ARE JSON APIs that
-    the existing api_response pipeline can fetch and mine for data
+Change log
+----------
+- ``_probe_site`` routes requests through the shared ``http_session``
+  instead of a bare ``requests.get``. The WMN scan probes hundreds of
+  sites per run; connection reuse and the retry adapter are worth
+  having. It also keeps this module inside the "no bare requests
+  outside the allowlist" invariant enforced by
+  ``tests/test_ssrf_routing.py``.
 """
 
 from __future__ import annotations
@@ -22,54 +21,126 @@ import json
 import os
 import threading
 import time
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Optional
 
-from .utils import CACHE_DIR
+from .utils import CACHE_DIR, http_session
 
-
-# ──────────────────────────────────────────────────────────────────────
-# Constants
-# ──────────────────────────────────────────────────────────────────────
 
 _WMN_URL          = ("https://raw.githubusercontent.com/WebBreacher/"
                      "WhatsMyName/main/wmn-data.json")
 _WMN_CACHE_PATH   = os.path.join(CACHE_DIR, "wmn-data.json")
-_WMN_TTL_SECONDS  = 7 * 24 * 3600   # refresh weekly
+_WMN_TTL_SECONDS  = 7 * 24 * 3600
 
-_DEFAULT_TIMEOUT  = 8               # seconds per request
+_DEFAULT_TIMEOUT  = 8
 _DEFAULT_WORKERS  = 30
 
-# Sites we never probe: they always fail or return false positives.
+# Hard cap on the downloaded dataset (it is ~1 MB in practice).
+_WMN_MAX_BYTES    = 16 * 1024 * 1024
+
 _SKIP_PROTECTIONS = ("cloudflare", "captcha", "recaptcha")
 
-
-# ──────────────────────────────────────────────────────────────────────
-# Dataset loading
-# ──────────────────────────────────────────────────────────────────────
 
 _load_lock = threading.Lock()
 _cached_data: dict | None = None
 
 
-def _download_wmn_data() -> dict | None:
-    """Fetch a fresh copy and store it in the cache dir."""
+def fetch_wmn_dataset_bytes() -> bytes | None:
+    """
+    Download the WhatsMyName dataset and return the raw bytes, or None.
+
+    Public because ``username_search.run_blackbird`` needs the same
+    file in Blackbird's own data directory. It previously used
+    ``urllib.request.urlretrieve``, which writes whatever the server
+    returns — including a 404 page — straight to disk with no status
+    check and no size limit.
+
+    Guarantees for the caller:
+      * HTTP status was 200.
+      * The body is under ``_WMN_MAX_BYTES``.
+      * The body parses as JSON with a ``sites`` list.
+
+    urllib.request.urlopen bypassed both the shared session and the
+    SSRF routing check. The host is fixed, so ``http_session`` is the
+    right level: connection reuse, the retry adapter, and a call site
+    the routing test can see.
+    """
     try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        req = urllib.request.Request(
+        resp = http_session.get(
             _WMN_URL,
-            headers={"User-Agent": "Mozilla/5.0 WhoCord/1.1"},
+            headers={"User-Agent": "WhoCord-OSINT/1.1"},
+            timeout=30,
+            stream=True,
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read()
-        # Sanity check: must be valid JSON with a "sites" list
+    except Exception as exc:
+        print(f"  WMN: download failed ({exc}).")
+        return None
+
+    if resp.status_code != 200:
+        print(f"  WMN: download failed (HTTP {resp.status_code}).")
+        return None
+
+    # The dataset is ~1 MB. Cap the read so a compromised or
+    # misbehaving host cannot stream an unbounded body into memory.
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        for chunk in resp.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > _WMN_MAX_BYTES:
+                print(
+                    f"  WMN: dataset exceeded "
+                    f"{_WMN_MAX_BYTES // (1024 * 1024)} MB – refusing to load."
+                )
+                return None
+    except Exception as exc:
+        print(f"  WMN: read failed ({exc}).")
+        return None
+
+    raw = b"".join(chunks)
+
+    try:
         data = json.loads(raw.decode("utf-8"))
-        if not isinstance(data, dict) or not isinstance(data.get("sites"), list):
-            print("  WMN: downloaded dataset is malformed – ignoring.")
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        print(f"  WMN: downloaded dataset is not valid JSON ({exc}).")
+        return None
+
+    if not isinstance(data, dict) or not isinstance(data.get("sites"), list):
+        print("  WMN: downloaded dataset is malformed – ignoring.")
+        return None
+
+    return raw
+
+
+def _download_wmn_data() -> dict | None:
+    try:
+        os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(CACHE_DIR, 0o700)
+        except OSError:
+            pass
+
+        raw = fetch_wmn_dataset_bytes()
+        if raw is None:
             return None
-        with open(_WMN_CACHE_PATH, "wb") as f:
+
+        data = json.loads(raw.decode("utf-8"))
+
+        # Write to a temp file and rename, so an interrupted download
+        # cannot leave a truncated cache file that the TTL check will
+        # then happily treat as fresh for the next seven days.
+        tmp_path = _WMN_CACHE_PATH + ".part"
+        with open(tmp_path, "wb") as f:
             f.write(raw)
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp_path, _WMN_CACHE_PATH)
+
         print(f"  WMN: downloaded {len(data['sites'])} sites "
               f"({len(raw) // 1024} KB).")
         return data
@@ -79,20 +150,11 @@ def _download_wmn_data() -> dict | None:
 
 
 def _load_wmn_data() -> dict | None:
-    """
-    Return the parsed wmn-data.json, using the cache when it's fresh.
-
-    Refresh policy:
-      • Cache missing         → download
-      • Cache older than TTL  → download (fall back to cache on failure)
-      • Cache valid           → use cache
-    """
     global _cached_data
     with _load_lock:
         if _cached_data is not None:
             return _cached_data
 
-        # Fresh cache?
         if os.path.isfile(_WMN_CACHE_PATH):
             try:
                 age = time.time() - os.path.getmtime(_WMN_CACHE_PATH)
@@ -103,7 +165,6 @@ def _load_wmn_data() -> dict | None:
                         _cached_data = data
                         return data
                 else:
-                    # Stale — try to refresh, fall back to disk
                     fresh = _download_wmn_data()
                     if fresh:
                         _cached_data = fresh
@@ -116,7 +177,6 @@ def _load_wmn_data() -> dict | None:
             except Exception as exc:
                 print(f"  WMN: cache read error ({exc}); re-downloading.")
 
-        # No cache — download
         fresh = _download_wmn_data()
         if fresh:
             _cached_data = fresh
@@ -124,45 +184,28 @@ def _load_wmn_data() -> dict | None:
         return None
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Single-site probe
-# ──────────────────────────────────────────────────────────────────────
-
 def _is_hit(resp, site: dict) -> bool:
-    """
-    Decide whether *resp* means 'username exists on this site'.
-
-    Uses the site's e_string/m_string (body substrings) and
-    e_code/m_code (HTTP status codes). Miss signals take priority over
-    hit signals so a page that says "not found" but happens to contain
-    the hit substring still resolves as a miss.
-    """
     body     = resp.text or ""
     e_string = site.get("e_string") or ""
     m_string = site.get("m_string") or ""
     e_code   = site.get("e_code")
     m_code   = site.get("m_code")
 
-    # Explicit miss signals
     if m_code is not None and resp.status_code == m_code:
         return False
     if m_string and m_string in body:
         return False
 
-    # Explicit hit signals
     if e_string and e_string in body:
         return True
     if e_code is not None and resp.status_code == e_code:
-        # When e_code is 200 we only trust it if there's no e_string to
-        # confirm against; otherwise require the e_string match above.
         return not e_string
 
     return False
 
 
 def _probe_site(site: dict, username: str, timeout: int) -> dict | None:
-    """Return a hit dict or None."""
-    # Skip POST-only and protected sites
+    """Return a hit dict or None. Uses the shared http_session."""
     method = str(site.get("request_method") or "GET").upper()
     if method != "GET":
         return None
@@ -190,9 +233,12 @@ def _probe_site(site: dict, username: str, timeout: int) -> dict | None:
                 headers.setdefault(k, v.replace("{account}", username))
 
     try:
-        import requests
-        resp = requests.get(url, headers=headers, timeout=timeout,
-                            allow_redirects=True)
+        resp = http_session.get(
+            url,
+            headers=headers,
+            timeout=timeout,
+            allow_redirects=True,
+        )
     except Exception:
         return None
 
@@ -208,23 +254,12 @@ def _probe_site(site: dict, username: str, timeout: int) -> dict | None:
     }
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Public entry point
-# ──────────────────────────────────────────────────────────────────────
-
 def run_wmn_scan(
     username: str,
     max_workers: int = _DEFAULT_WORKERS,
     timeout: int = _DEFAULT_TIMEOUT,
     emit: Optional[Callable[[str, dict], None]] = None,
 ) -> list[dict]:
-    """
-    Scan *username* across every site in the WhatsMyName dataset.
-
-    Returns a list of hit dicts:
-        {"site": str, "url": str, "pretty_url": str,
-         "category": str, "status": int}
-    """
     if not username:
         return []
 
@@ -258,7 +293,6 @@ def run_wmn_scan(
             except Exception:
                 pass
 
-            # Progress every 50 checks
             if completed % 50 == 0 and emit:
                 emit("progress", {
                     "message": f"WMN: {completed}/{total} checked "

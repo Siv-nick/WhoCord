@@ -1,3 +1,4 @@
+
 """
 discord_osint/pipeline/__init__.py
 ------------------------------------
@@ -13,6 +14,11 @@ Cancellation
 ``_common_setup()`` reads ``config._cancel_event`` (set by the web layer
 for each job) and threads it into ``pipeline.run(..., cancel_event=...)``
 so a ``/stop`` POST aborts at the next stage boundary.
+
+When the pipeline is cancelled, ReportingStage is skipped. It used to
+run unconditionally, producing a report file with a "cancelled" pipeline
+result and an intel snapshot that would sit next to full-run reports
+looking indistinguishable in the history panel.
 """
 
 from __future__ import annotations
@@ -67,14 +73,13 @@ def run_osint_pipeline(config=None) -> None:
         if not username and not manual_email:
             print("MANUAL_USERNAME is empty and no email supplied. Exiting.")
             return
-        # Bug 12 fix: if we somehow get here with only an email, switch
-        # explicitly and record the change so the caller sees the actual mode.
         if not username and manual_email:
             print("Only email provided – switching to email module.")
             config.MODE = "email"
             run_module_pipeline("email", config)
             return
-        target_id = hash(username) & 0x7FFFFFFF
+        from .. import utils
+        target_id = utils.stable_target_id(username)
         target_user_id = None
         target_guild_id = None
 
@@ -141,6 +146,14 @@ def run_osint_pipeline(config=None) -> None:
             f"{len(pivot_reports)} sub-report(s) merged."
         )
 
+    # Skip reporting when the pipeline was cancelled. Reporting is a
+    # local template render so it would succeed, but producing a
+    # "cancelled" report file clutters the history panel with an entry
+    # that looks like a finished run.
+    if cancel_event is not None and cancel_event.is_set():
+        print("[pipeline] cancelled — skipping reporting stage.")
+        return
+
     from .stages.reporting_stage import ReportingStage
     ReportingStage().run(ctx, emit=emitter or (lambda *_: None))
 
@@ -158,7 +171,8 @@ def run_module_pipeline(mode: str, config=None) -> None:
     pivot_config, seed_queue, emitter, cancel_event = _common_setup(config)
 
     target_value = _resolve_target(mode, config)
-    target_id    = hash(target_value) & 0x7FFFFFFF
+    from .. import utils
+    target_id    = utils.stable_target_id(target_value)
 
     from .. import utils
     if utils.DEBUG_MODE:
@@ -199,6 +213,10 @@ def run_module_pipeline(mode: str, config=None) -> None:
         pivot_confirm_fn=confirm_fn,
         cancel_event=cancel_event,
     )
+
+    if cancel_event is not None and cancel_event.is_set():
+        print("[pipeline] cancelled — skipping reporting stage.")
+        return
 
     from .stages.reporting_stage import ReportingStage
     ReportingStage().run(ctx, emit=emitter or (lambda *_: None))

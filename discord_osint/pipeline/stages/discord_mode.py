@@ -6,9 +6,14 @@ DiscordModeStage – fetch and enrich a Discord user profile.
 Only executes when ctx.mode == "discord".  In manual mode this stage
 adds a minimal intel entry and exits immediately.
 
-On failure to fetch the profile (invalid token / user not in guild)
-this stage raises PipelineAbortError so the rest of the pipeline
-doesn't run with no data to work from.
+Change log
+----------
+- Phase 4: CordCat enrichment. When ``ENABLE_CORD_CAT`` is on and a
+  ``CORD_CAT_API_KEY`` is stored, the stage calls cord.cat after the
+  Discord profile is fetched and emits findings for every section
+  that has data. The raw result is stored under
+  ``intel["cordcat"]["lookup"]`` for the report renderer.
+- On failure to fetch the profile, raises PipelineAbortError.
 """
 
 from __future__ import annotations
@@ -24,6 +29,11 @@ from ...discord_api import (
     snowflake_to_datetime,
 )
 from ...scraping import is_valid_personal_email
+from ...utils import log_trace
+
+# CordCat is imported lazily inside the stage run so a missing module
+# (should not happen, but for safety) does not break CLI imports.
+from ...config import get_flag as _flag
 
 
 class DiscordModeStage(Stage):
@@ -31,7 +41,6 @@ class DiscordModeStage(Stage):
 
     def run(self, ctx: InvestigationContext, emit: EmitFn = lambda *_: None) -> None:
         if ctx.mode != "discord":
-            # Manual mode: just record the username and move on
             ctx.intel_core.add_intel(
                 "discord", "username", ctx.username, source="manual_input"
             )
@@ -61,9 +70,7 @@ class DiscordModeStage(Stage):
         print(f"Discord: {handle}")
         emit("finding", {"type": "discord_handle", "value": handle})
 
-        # Update context username with the resolved value
         ctx.username = username
-
         ctx.intel_core.add_intel(
             "discord", "username", username, source="discord_api"
         )
@@ -88,7 +95,6 @@ class DiscordModeStage(Stage):
                 "discord", "bio", bio, source="discord_enrich"
             )
 
-            # Connected social accounts (public)
             for acc in enriched.get("connected_accounts", []):
                 acc_type = acc.get("type", "")
                 acc_name = acc.get("name", "")
@@ -105,7 +111,6 @@ class DiscordModeStage(Stage):
                         "value": acc_name,
                     })
 
-            # Emails mentioned in bio
             if bio:
                 emails = re.findall(
                     r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", bio
@@ -117,7 +122,6 @@ class DiscordModeStage(Stage):
                         )
                         emit("finding", {"type": "email", "value": email})
 
-                # Try to extract a real name from the first line of bio
                 name_match = re.search(
                     r"^([A-Z][a-z]+)\s+([A-Z][a-z]+)", bio.split("\n")[0]
                 )
@@ -134,7 +138,6 @@ class DiscordModeStage(Stage):
                         "source": "discord_bio",
                     })
 
-            # Avatar CDN URL
             avatar_hash = enriched.get("avatar")
             if avatar_hash:
                 cdn_url = (
@@ -155,3 +158,92 @@ class DiscordModeStage(Stage):
             "discord", "account_created", account_age, source="snowflake"
         )
         print(f"  Account created: {account_age}")
+
+        # ------------------------------------------------------------------ #
+        # 4. CordCat enrichment (Phase 4)                                     #
+        # ------------------------------------------------------------------ #
+        self._maybe_cordcat(ctx, emit)
+
+    # ------------------------------------------------------------------ #
+    # CordCat
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _maybe_cordcat(ctx: InvestigationContext, emit: EmitFn) -> None:
+        """
+        Run a CordCat lookup if enabled and configured.
+
+        Never raises — a CordCat failure is logged and the
+        investigation continues. The Discord profile fetch is the
+        load-bearing step; CordCat is enrichment.
+        """
+        if not _flag("ENABLE_CORD_CAT"):
+            return
+
+        api_key = getattr(ctx.config, "CORD_CAT_API_KEY", "") or ""
+        if not api_key:
+            print("  CordCat: ENABLE_CORD_CAT is on but no API key stored — skipping.")
+            return
+
+        try:
+            from ... import cord_cat
+        except ImportError as exc:
+            log_trace(f"cord_cat: import failed: {exc}")
+            return
+
+        print("  CordCat lookup…")
+        emit("progress", {"message": "CordCat: Discord enrichment"})
+
+        try:
+            result = cord_cat.lookup(
+                str(ctx.target_user_id),
+                api_key=api_key,
+            )
+        except cord_cat.CordCatRateLimitError as exc:
+            print(f"  CordCat: {exc}")
+            log_trace(f"cord_cat: rate limit hit for {ctx.target_user_id}: {exc}")
+            return
+        except Exception as exc:
+            log_trace(f"cord_cat: unexpected exception: {type(exc).__name__}: {exc}")
+            print(f"  CordCat: unexpected error — {exc}")
+            return
+
+        if not result.ok:
+            print(f"  CordCat: {result.error}")
+            log_trace(f"cord_cat: lookup failed for {ctx.target_user_id}: {result.error}")
+            return
+
+        # Store the raw result for the report renderer.
+        try:
+            ctx.intel_core.add_intel(
+                "cordcat", "lookup", result.to_dict(), source="cord_cat",
+            )
+        except Exception as exc:
+            log_trace(f"cord_cat: could not store result: {exc}")
+
+        # Emit findings. A malformed section inside emit_findings is
+        # the caller's problem — we let exceptions propagate to the
+        # outer handler rather than swallowing per-section.
+        try:
+            cord_cat.emit_findings(result, emit)
+        except Exception as exc:
+            log_trace(f"cord_cat: emit_findings raised: {type(exc).__name__}: {exc}")
+
+        # Brief console summary for the operator.
+        bits: list[str] = []
+        if result.has_breach:
+            try:
+                count = int(result.breach.get("count") or 0)
+            except (TypeError, ValueError):
+                count = 0
+            bits.append(f"breach={count}")
+        if result.has_fivem:
+            bits.append("fivem=yes")
+        if result.has_statements:
+            bits.append(f"dsa={len(result.statements)}")
+        if result.score:
+            bits.append(f"score={result.score.get('value') or '?'}")
+        if bits:
+            print(f"  CordCat: {', '.join(bits)}")
+        else:
+            print("  CordCat: no data for this ID.")

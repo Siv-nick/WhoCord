@@ -1,29 +1,19 @@
+
 """
 discord_osint/config_service.py
 -------------------------------
 ConfigService – a stable, typed facade over the existing Config class.
 
-The __setattr__ override dispatches through property setters when a
-class-level descriptor exists, so `config_service.mode = "manual"` and
-`config_service.llm_model = "..."` both persist correctly.
-
-LLM provider selection
-----------------------
-``get_llm_endpoint()`` returns ``(base_url, api_key, extra_headers)``
-for whichever OpenAI-compatible backend is active. Currently supported:
-
-  • ``"groq"``       → https://api.groq.com/openai/v1
-  • ``"openrouter"`` → https://openrouter.ai/api/v1
-
-Every LLM call site (narrative generation, persona summary, structured
-report, chat) routes through this helper so switching providers is a
-one-key config change.
-
-Contact enrichment
-------------------
-``apollo_api_key`` / ``lusha_api_key`` and the associated enable flags
-are exposed here so the enrichment stage, the config UI, and the
-"Test connection" endpoints all read and write through the same facade.
+Change log
+----------
+- Phase 4: ``LLM_PROVIDER`` accepts a third value, ``"ollama"``, for a
+  local Ollama instance. ``get_llm_endpoint`` returns the local base
+  URL and a placeholder API key; the OpenAI client is happy with any
+  non-empty key for a local endpoint. No traffic leaves the machine.
+- Phase 2: added ``retention_days`` property.
+- ``token_status()`` now reports ``CORD_CAT_API_KEY`` and
+  ``TINEYE_API_KEY`` so the Config panel can display their stored/empty
+  state.
 """
 
 from __future__ import annotations
@@ -34,22 +24,27 @@ from .config import Config, DEFAULT_CONFIG, SENSITIVE_KEYS
 from .errors import ConfigurationError
 
 
-# ---------------------------------------------------------------------------
-# LLM endpoint resolution
-# ---------------------------------------------------------------------------
-
 _GROQ_BASE_URL       = "https://api.groq.com/openai/v1"
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+_OLLAMA_BASE_URL     = "http://localhost:11434/v1"
 
 _OPENROUTER_HEADERS = {
     "HTTP-Referer":      "https://github.com/sivnick/whocord",
     "X-OpenRouter-Title": "WhoCord",
 }
 
+_ALLOWED_PROVIDERS = frozenset({"groq", "openrouter", "ollama"})
+
 
 def get_llm_endpoint(cfg: Any = None) -> tuple[str, str, dict]:
     """
-    Return ``(base_url, api_key, extra_headers)`` for the active provider.
+    Return ``(base_url, api_key, extra_headers)`` for the active
+    provider.
+
+    The three providers share an OpenAI-compatible request shape.
+    Ollama's local server speaks the same protocol on
+    ``http://localhost:11434/v1`` and ignores the API key, so a
+    placeholder string is returned.
     """
     if cfg is None:
         from .config import config as _singleton
@@ -61,22 +56,22 @@ def get_llm_endpoint(cfg: Any = None) -> tuple[str, str, dict]:
         key = getattr(cfg, "OPENROUTER_API_KEY", "") or ""
         return _OPENROUTER_BASE_URL, key, dict(_OPENROUTER_HEADERS)
 
+    if provider == "ollama":
+        # The OpenAI client library refuses an empty api_key, but the
+        # local Ollama server never checks it. A literal placeholder is
+        # the standard convention.
+        return _OLLAMA_BASE_URL, "ollama", {}
+
     key = getattr(cfg, "GROQ_API_KEY", "") or ""
     return _GROQ_BASE_URL, key, {}
 
 
 class ConfigService:
-    """Typed wrapper around the existing Config dataclass."""
-
     def __init__(self, config: Config | None = None) -> None:
         if config is None:
             from .config import config as _singleton
             config = _singleton
         object.__setattr__(self, "_cfg", config)
-
-    # ------------------------------------------------------------------ #
-    # Internal helpers
-    # ------------------------------------------------------------------ #
 
     def _g(self, key: str) -> Any:
         return self._cfg.get(key, DEFAULT_CONFIG.get(key))
@@ -84,9 +79,7 @@ class ConfigService:
     def _s(self, key: str, value: Any) -> None:
         setattr(self._cfg, key, value)
 
-    # ------------------------------------------------------------------ #
-    # Sensitive / token properties
-    # ------------------------------------------------------------------ #
+    # ── Tokens ─────────────────────────────────────────────────────────
 
     @property
     def discord_token(self) -> str:
@@ -128,8 +121,6 @@ class ConfigService:
     def instagram_session(self, v: str) -> None:
         self._cfg.INSTAGRAM_SESSION = v
 
-    # ── Contact-enrichment provider keys ─────────────────────────────
-
     @property
     def apollo_api_key(self) -> str:
         return getattr(self._cfg, "APOLLO_API_KEY", "") or ""
@@ -146,9 +137,23 @@ class ConfigService:
     def lusha_api_key(self, v: str) -> None:
         self._cfg.LUSHA_API_KEY = v
 
-    # ------------------------------------------------------------------ #
-    # Mode / target properties
-    # ------------------------------------------------------------------ #
+    @property
+    def cord_cat_api_key(self) -> str:
+        return getattr(self._cfg, "CORD_CAT_API_KEY", "") or ""
+
+    @cord_cat_api_key.setter
+    def cord_cat_api_key(self, v: str) -> None:
+        self._cfg.CORD_CAT_API_KEY = v
+
+    @property
+    def tineye_api_key(self) -> str:
+        return getattr(self._cfg, "TINEYE_API_KEY", "") or ""
+
+    @tineye_api_key.setter
+    def tineye_api_key(self, v: str) -> None:
+        self._cfg.TINEYE_API_KEY = v
+
+    # ── Mode / target ──────────────────────────────────────────────────
 
     @property
     def mode(self) -> str:
@@ -226,9 +231,7 @@ class ConfigService:
     def blackbird_dir(self) -> str:
         return self._cfg.BLACKBIRD_DIR
 
-    # ------------------------------------------------------------------ #
-    # Contact-enrichment configuration
-    # ------------------------------------------------------------------ #
+    # ── Enrichment ─────────────────────────────────────────────────────
 
     @property
     def enable_apollo(self) -> bool:
@@ -268,19 +271,17 @@ class ConfigService:
     def enrichment_phone_reveal(self, v: bool) -> None:
         self._cfg.ENABLE_ENRICHMENT_PHONE_REVEAL = bool(v)
 
-    # ------------------------------------------------------------------ #
-    # LLM configuration (Groq / OpenRouter)
-    # ------------------------------------------------------------------ #
+    # ── LLM ────────────────────────────────────────────────────────────
 
     @property
     def llm_provider(self) -> str:
         v = (getattr(self._cfg, "LLM_PROVIDER", "groq") or "groq").strip().lower()
-        return v if v in ("groq", "openrouter") else "groq"
+        return v if v in _ALLOWED_PROVIDERS else "groq"
 
     @llm_provider.setter
     def llm_provider(self, v: str) -> None:
         v = (v or "groq").strip().lower()
-        self._cfg.LLM_PROVIDER = v if v in ("groq", "openrouter") else "groq"
+        self._cfg.LLM_PROVIDER = v if v in _ALLOWED_PROVIDERS else "groq"
 
     def llm_endpoint(self) -> tuple[str, str, dict]:
         return get_llm_endpoint(self._cfg)
@@ -359,9 +360,27 @@ class ConfigService:
     def llm_intel_exclude_meta(self, v: bool) -> None:
         self._cfg.LLM_INTEL_EXCLUDE_META = bool(v)
 
-    # ------------------------------------------------------------------ #
-    # Tool enable/disable
-    # ------------------------------------------------------------------ #
+    # ── Retention ──────────────────────────────────────────────────────
+
+    @property
+    def retention_days(self) -> int:
+        try:
+            v = int(getattr(self._cfg, "RETENTION_DAYS", 0))
+        except (TypeError, ValueError):
+            return 0
+        if v <= 0:
+            return 0
+        return min(v, 3650)
+
+    @retention_days.setter
+    def retention_days(self, v: int) -> None:
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            n = 0
+        self._cfg.RETENTION_DAYS = max(0, min(n, 3650))
+
+    # ── Tools ──────────────────────────────────────────────────────────
 
     def is_enabled(self, tool_key: str) -> bool:
         return bool(self._cfg.get(tool_key, False))
@@ -369,10 +388,6 @@ class ConfigService:
     def set_tool(self, tool_key: str, enabled: bool) -> None:
         self._s(tool_key, bool(enabled))
         self._cfg.save()
-
-    # ------------------------------------------------------------------ #
-    # Sensitive key management
-    # ------------------------------------------------------------------ #
 
     def set_sensitive(self, key: str, value: str) -> None:
         if key not in SENSITIVE_KEYS:
@@ -390,6 +405,8 @@ class ConfigService:
             "HIBP_API_KEY":       bool(getattr(self._cfg, "HIBP_API_KEY", "")),
             "APOLLO_API_KEY":     bool(self.apollo_api_key),
             "LUSHA_API_KEY":      bool(self.lusha_api_key),
+            "CORD_CAT_API_KEY":   bool(self.cord_cat_api_key),
+            "TINEYE_API_KEY":     bool(self.tineye_api_key),
         }
 
     def tools_list(self) -> list[dict]:
@@ -399,22 +416,43 @@ class ConfigService:
             for key, desc in TOOLS_LIST
         ]
 
-    # ------------------------------------------------------------------ #
-    # Persistence
-    # ------------------------------------------------------------------ #
-
     def save(self) -> None:
         self._cfg.save()
 
     def get(self, key: str, default: Any = None) -> Any:
         return self._cfg.get(key, default)
 
+    def set(self, key: str, value: Any, *, save: bool = False) -> None:
+        """
+        Write a config key by name.
+
+        The counterpart to :meth:`get`, which existed without it —
+        callers wanting a dynamic write had to reach for ``setattr``
+        on the facade (which enforces the key check) or on ``.raw``
+        (which does not). This routes through the same
+        ``DEFAULT_CONFIG`` membership check as ``__setattr__``, so an
+        unrecognised key raises instead of silently vanishing.
+
+        Sensitive keys must go through :meth:`set_sensitive` so they
+        land in the keyring rather than config.json.
+        """
+        if key in SENSITIVE_KEYS:
+            raise ConfigurationError(
+                f"{key!r} is sensitive; use set_sensitive() so the value "
+                f"goes to the keyring instead of config.json"
+            )
+        if key not in DEFAULT_CONFIG:
+            raise ConfigurationError(
+                f"{key!r} is not a recognised config key"
+            )
+        setattr(object.__getattribute__(self, "_cfg"), key, value)
+        if save:
+            self._cfg.save()
+
     def to_dict(self) -> dict:
         return self._cfg.to_dict()
 
-    # ------------------------------------------------------------------ #
-    # Attribute protocol
-    # ------------------------------------------------------------------ #
+    # ── Attribute protocol ─────────────────────────────────────────────
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
@@ -430,9 +468,20 @@ class ConfigService:
             return
 
         descriptor = getattr(type(self), name, None)
+
         if isinstance(descriptor, property) and descriptor.fset is not None:
             object.__setattr__(self, name, value)
             return
+
+        if isinstance(descriptor, property) and descriptor.fset is None:
+            raise AttributeError(f"{name!r} is a read-only property")
+
+        if name not in DEFAULT_CONFIG:
+            raise AttributeError(
+                f"{name!r} is not a recognised config key. "
+                f"Typoed config writes now raise instead of silently "
+                f"vanishing."
+            )
 
         setattr(object.__getattribute__(self, "_cfg"), name, value)
 

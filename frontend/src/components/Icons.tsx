@@ -59,6 +59,7 @@ export const ICONS = {
   chevronDown: [p("m6 9 6 6 6-6")],
   chevronUp:   [p("m18 15-6-6-6 6")],
   chevronRight:[p("m9 18 6-6-6-6")],
+  chevronLeft: [p("m15 18-6-6 6-6")],
   play:        [p("M6 4l14 8-14 8z")],
   stop:        [r(6, 6, 12, 12, 2)],
   eye:         [p("M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"), c(12, 12, 3)],

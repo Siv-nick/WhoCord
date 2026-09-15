@@ -26,14 +26,31 @@ const STAGE_ICON: Record<string, IconName> = {
   data_probe:           "search",
 };
 
-export default function LiveLogPanel({
+function LiveLogPanel({
   logs, isOpen, onToggle, currentStage,
 }: Props) {
   const endRef = useRef<HTMLDivElement>(null);
+  const scrollRaf = useRef<number | null>(null);
 
+  // A busy scraping stage emits many lines per second, and each one
+  // started a fresh smooth-scroll animation on top of the last, so the
+  // animations visibly fought each other. Coalescing to one scroll per
+  // frame means a burst of lines produces a single animation.
+  // InvestigationLive.tsx already does this; the two log views should
+  // really be one component (see the audit notes) — until then they at
+  // least behave the same.
   useEffect(() => {
-    if (isOpen) endRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (!isOpen) return;
+    if (scrollRaf.current !== null) return;
+    scrollRaf.current = requestAnimationFrame(() => {
+      scrollRaf.current = null;
+      endRef.current?.scrollIntoView({ behavior: "smooth" });
+    });
   }, [logs.length, isOpen]);
+
+  useEffect(() => () => {
+    if (scrollRaf.current !== null) cancelAnimationFrame(scrollRaf.current);
+  }, []);
 
   const stageIcon: IconName | null = currentStage
     ? (STAGE_ICON[currentStage] ?? "play")
@@ -116,3 +133,8 @@ export default function LiveLogPanel({
     </div>
   );
 }
+
+// Memoised: the canvas re-renders on graph interactions that have
+// nothing to do with the log, and this panel stays mounted (hidden via
+// width) even when closed.
+export default React.memo(LiveLogPanel);

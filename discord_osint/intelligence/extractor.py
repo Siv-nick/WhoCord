@@ -4,15 +4,19 @@ discord_osint/intelligence/extractor.py
 Parse the raw ``intel`` dict (and ``avatar_urls`` set) produced by the
 pipeline into typed :class:`BaseEntity` objects with confidence scores.
 
-Design notes
-------------
-- All input comes from ``InvestigationContext.intel_core.intel``, whose
-  values are stored as ``{"value": <data>, "source": <str>}`` dicts by
-  ``InvestigationCore.add_intel()``.
-- Confidence is assigned per-source using ``_SOURCE_CONFIDENCE``; the
-  value degrades gracefully for unrecognised sources via prefix matching.
-- This module is pure data transformation – no network calls, no side
-  effects.  Tests can call it with a handcrafted ``intel`` dict.
+Change log
+----------
+- ``_try_phash`` now routes every fetch through
+  ``utils.url_safety.safe_get_pinned``. The previous implementation used
+  a bare ``requests.get`` on the URL, which is attacker-influenced: an
+  avatar URL scraped from an external profile page could point at
+  ``http://169.254.169.254/…`` and this function would fetch it
+  unguarded. Body size is now capped so a slow-drip or oversize
+  response cannot exhaust memory.
+- ``_try_phash`` distinguishes a missing optional dependency
+  (``imagehash`` / ``Pillow``) from an actual failure. The previous
+  bare ``except Exception: return None`` silently discarded every
+  failure mode.
 """
 
 from __future__ import annotations
@@ -29,17 +33,18 @@ from .entities import (
     PlatformProfileEntity,
     UsernameEntity,
 )
+from ..utils import log_trace
+from ..utils.url_safety import safe_get_pinned, UnsafeURLError
+
 
 # ---------------------------------------------------------------------------
 # Confidence table  (source string → confidence float)
 # ---------------------------------------------------------------------------
 _SOURCE_CONFIDENCE: dict[str, float] = {
-    # Direct user input and confirmed API responses are most reliable
     "manual_input":         0.92,
     "discord_api":          0.88,
     "discord_enrich":       0.82,
     "snowflake":            0.82,
-    # Semi-reliable automated sources
     "gitfive":              0.72,
     "scrape_github":        0.72,
     "smtp_verify":          0.70,
@@ -48,39 +53,40 @@ _SOURCE_CONFIDENCE: dict[str, float] = {
     "h8mail":               0.65,
     "holehe":               0.65,
     "emailrep":             0.62,
-    # Discord bio / social scrapes
     "discord_bio":          0.60,
     "scrape_twitter":       0.60,
     "scrape_reddit":        0.58,
-    "scrape_":              0.55,   # prefix match fallback for all scrape_*
-    # Third-party lookups and enrichment
+    "scrape_":              0.55,
     "gravatar":             0.55,
     "socid-extractor":      0.52,
     "wayback":              0.50,
     "nametrace":            0.48,
     "whois":                0.47,
-    # Weakest signals
     "location_inference":   0.44,
     "langdetect":           0.44,
     "naminter":             0.40,
     "generic_scrape":       0.36,
-    "avatar_collection":    0.70,   # avatars are generally trustworthy
+    "avatar_collection":    0.70,
 }
 
 _DEFAULT_CONFIDENCE: float = 0.38
 _URL_PREFIX_RE = re.compile(r"^https?://")
+
+# Largest avatar this will accept. Real profile avatars are well under
+# 2 MB; the cap exists so a malicious host cannot stream until the
+# process is OOM-killed.
+_MAX_PHASH_BYTES = 8 * 1024 * 1024
 
 
 def _source_conf(source: str) -> float:
     """
     Look up confidence for *source*.
 
-    Falls back to prefix matching (covers ``"scrape_github"``, ``"scrape_*"``
-    etc.) and then to ``_DEFAULT_CONFIDENCE``.
+    Falls back to prefix matching (covers ``"scrape_github"``,
+    ``"scrape_*"`` etc.) and then to ``_DEFAULT_CONFIDENCE``.
     """
     if source in _SOURCE_CONFIDENCE:
         return _SOURCE_CONFIDENCE[source]
-    # Prefix scan – longest key that is a prefix of source wins
     best_key = ""
     best_val = _DEFAULT_CONFIDENCE
     for key, val in _SOURCE_CONFIDENCE.items():
@@ -100,7 +106,6 @@ def _unpack(entry: Any) -> tuple[str, str]:
     if isinstance(entry, dict):
         val = entry.get("value", "")
         src = entry.get("source", "unknown")
-        # value may itself be a dict (e.g. Holehe result); stringify it
         if not isinstance(val, str):
             val = str(val) if val else ""
     else:
@@ -124,12 +129,6 @@ _KNOWN_PLATFORMS = frozenset({
 def _platform_from_key(key: str) -> str | None:
     """
     Derive a platform name from a social_profiles dict key.
-
-    Examples::
-
-        "github/user/bio"             → "github"
-        "discord_connected_spotify"   → "spotify"
-        "gravatar_email@example.com"  → "gravatar"
     """
     if key.startswith("discord_connected_"):
         candidate = key.replace("discord_connected_", "").split("_")[0]
@@ -151,30 +150,15 @@ def extract_entities(
 ) -> list[BaseEntity]:
     """
     Parse *intel* and *avatar_urls* and return a flat list of typed entities.
-
-    Parameters
-    ----------
-    intel:
-        ``InvestigationCore.intel`` dict.
-    avatar_urls:
-        ``InvestigationContext.avatar_urls`` set (optional).
-
-    Returns
-    -------
-    list[BaseEntity]
-        Mixed list of ``EmailEntity``, ``UsernameEntity``,
-        ``PlatformProfileEntity``, ``NameEntity``, ``LocationEntity``,
-        and ``AvatarEntity`` objects.
     """
     entities: list[BaseEntity] = []
-    seen_values: dict[str, BaseEntity] = {}   # deduplicate by (type, value)
+    seen_values: dict[str, BaseEntity] = {}
     avatar_urls = avatar_urls or set()
 
     def _add(ent: BaseEntity) -> None:
         """Add entity only if we haven't seen this (type, value) pair yet."""
         dedup_key = f"{ent.entity_type}:{ent.value.lower()}"
         if dedup_key in seen_values:
-            # Keep the higher-confidence copy
             existing = seen_values[dedup_key]
             if ent.confidence > existing.confidence:
                 entities.remove(existing)
@@ -184,9 +168,7 @@ def extract_entities(
             seen_values[dedup_key] = ent
             entities.append(ent)
 
-    # ------------------------------------------------------------------ #
-    # 1. Email addresses                                                    #
-    # ------------------------------------------------------------------ #
+    # 1. Email addresses
     for _key, entry in intel.get("emails", {}).items():
         val, src = _unpack(entry)
         if val and "@" in val and len(val) < 254:
@@ -196,17 +178,13 @@ def extract_entities(
                 confidence=_source_conf(src),
             ))
 
-    # ------------------------------------------------------------------ #
-    # 2. Social profiles → PlatformProfileEntity or UsernameEntity         #
-    # ------------------------------------------------------------------ #
+    # 2. Social profiles
     for key, entry in intel.get("social_profiles", {}).items():
         val, src = _unpack(entry)
-        # Skip internal raw dumps (socid_raw etc.) and bios stored here
         if not val or "socid_raw" in key or "bio" in key:
             continue
 
         if _URL_PREFIX_RE.match(val):
-            # It's a profile URL
             platform = _platform_from_key(key) or "unknown"
             _add(PlatformProfileEntity(
                 value=val,
@@ -216,7 +194,6 @@ def extract_entities(
                 url=val,
             ))
         else:
-            # It's a plain username / handle
             platform = _platform_from_key(key)
             _add(UsernameEntity(
                 value=val,
@@ -225,9 +202,7 @@ def extract_entities(
                 platform=platform,
             ))
 
-    # ------------------------------------------------------------------ #
-    # 3. Identity clues → NameEntity or LocationEntity                     #
-    # ------------------------------------------------------------------ #
+    # 3. Identity clues
     for key, entry in intel.get("identity_clues", {}).items():
         val, src = _unpack(entry)
         if not val:
@@ -240,7 +215,6 @@ def extract_entities(
                 confidence=_source_conf(src),
             ))
         elif key == "language":
-            # Language is metadata, not a linkable entity – skip it here
             pass
         elif key.startswith("name_"):
             _add(NameEntity(
@@ -249,9 +223,7 @@ def extract_entities(
                 confidence=_source_conf(src),
             ))
 
-    # ------------------------------------------------------------------ #
-    # 4. Discord username (top-level)                                       #
-    # ------------------------------------------------------------------ #
+    # 4. Discord username
     for key, entry in intel.get("discord", {}).items():
         if key != "username":
             continue
@@ -264,9 +236,7 @@ def extract_entities(
                 platform="discord",
             ))
 
-    # ------------------------------------------------------------------ #
-    # 5. Avatar URLs                                                        #
-    # ------------------------------------------------------------------ #
+    # 5. Avatar URLs
     for url in avatar_urls:
         if url and _URL_PREFIX_RE.match(url):
             _add(AvatarEntity(
@@ -284,19 +254,61 @@ def _try_phash(url: str) -> str | None:
     """
     Attempt a perceptual hash of an image at *url*.
 
-    Returns ``None`` if ``imagehash``/``Pillow`` is not installed or the
-    download fails.  This keeps the package optional and avoids crashing
-    the extraction phase for missing optional deps.
+    Returns ``None`` when the optional dependency is missing — that case
+    is not logged, because it would fire once per avatar and the operator
+    has no action to take on the message anyway. Every other failure is
+    logged via ``log_trace``.
+
+    SSRF and resource-exhaustion hardening
+    --------------------------------------
+    The URL originates from scraped profile data and is therefore
+    attacker-influenced. It goes through ``safe_get_pinned`` so a
+    redirect to ``http://169.254.169.254/…`` (or any other blocked
+    range) is rejected with ``UnsafeURLError`` before the connect, and
+    the body is read in bounded chunks so a drip or an oversize
+    response cannot exhaust memory. ``Content-Length`` is checked when
+    present as a fast rejection path.
     """
     try:
         import io
         import imagehash
         from PIL import Image
-        import requests as _req
+    except ImportError:
+        return None
 
-        resp = _req.get(url, timeout=8, stream=True)
+    try:
+        resp = safe_get_pinned(url, timeout=8, stream=True)
         resp.raise_for_status()
-        img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+
+        declared = resp.headers.get("Content-Length")
+        if declared is not None:
+            try:
+                if int(declared) > _MAX_PHASH_BYTES:
+                    log_trace(
+                        f"_try_phash: oversize Content-Length "
+                        f"{declared} for {url[:80]}"
+                    )
+                    return None
+            except (TypeError, ValueError):
+                pass
+
+        buf = bytearray()
+        for chunk in resp.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            buf.extend(chunk)
+            if len(buf) > _MAX_PHASH_BYTES:
+                log_trace(
+                    f"_try_phash: body exceeded {_MAX_PHASH_BYTES} bytes "
+                    f"for {url[:80]} — aborting"
+                )
+                return None
+
+        img = Image.open(io.BytesIO(bytes(buf))).convert("RGB")
         return str(imagehash.phash(img))
-    except Exception:
+    except UnsafeURLError as exc:
+        log_trace(f"_try_phash: SSRF BLOCKED {url[:80]} — {exc}")
+        return None
+    except Exception as exc:
+        log_trace(f"_try_phash: {type(exc).__name__}: {exc} for {url[:80]}")
         return None

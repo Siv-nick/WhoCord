@@ -4,6 +4,7 @@ import { useNavigate } from "react-router-dom";
 import { useGraphState, newNodeId } from "../hooks/useGraphState";
 import { openMapFilePicker } from "../utils/export";
 import { Icon, type IconName } from "../components/Icons";
+import BatchModal from "../components/BatchModal";
 import type { GraphNode } from "../types/graph";
 
 const FEATURES: Array<{ icon: IconName; title: string; text: string }> = [
@@ -19,6 +20,7 @@ export default function StartPage() {
   const [loadError, setErr]   = useState("");
   const [loading,   setLoad]  = useState(false);
   const [mounted,   setMnt]   = useState(false);
+  const [showBatch, setShowBatch] = useState(false);
 
   useEffect(() => { requestAnimationFrame(() => setMnt(true)); }, []);
 
@@ -83,7 +85,7 @@ export default function StartPage() {
       </div>
 
       {/* Action cards */}
-      <div className={`w-full max-w-3xl grid grid-cols-1 md:grid-cols-2 gap-4 transition-all duration-700 delay-100 ${mounted ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4"}`}>
+      <div className={`w-full max-w-4xl grid grid-cols-1 md:grid-cols-3 gap-4 transition-all duration-700 delay-100 ${mounted ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4"}`}>
         <ActionCard
           icon="sparkle"
           badge="New"
@@ -101,6 +103,15 @@ export default function StartPage() {
           cta="Open file"
           onClick={handleLoad}
           disabled={loading}
+          variant="secondary"
+        />
+        <ActionCard
+          icon="list"
+          badge="Many"
+          title="Batch run"
+          subtitle="Run the same module against a list of targets, grouped into one case."
+          cta="Configure batch"
+          onClick={() => setShowBatch(true)}
           variant="secondary"
         />
       </div>
@@ -132,6 +143,8 @@ export default function StartPage() {
                     hover:underline transition-colors">
         Open legacy dashboard →
       </a>
+
+      {showBatch && <BatchModal onClose={() => setShowBatch(false)} />}
     </div>
   );
 }

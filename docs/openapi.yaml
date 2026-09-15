@@ -1,0 +1,622 @@
+openapi: 3.0.3
+info:
+  title: WhoCord
+  description: |
+    Local OSINT investigation tool. All endpoints require the
+    `X-WhoCord-Token` header (or `?token=` query parameter for
+    top-level navigation and EventSource-style clients) carrying the
+    shared secret from `~/.whocord/session_secret`.
+
+    Cross-origin requests are rejected via the `Origin` and
+    `Sec-Fetch-Site` headers regardless of token validity.
+  version: "1.0.0"
+servers:
+  - url: http://127.0.0.1:5000
+    description: Default local bind
+security:
+  - TokenHeader: []
+  - TokenQuery: []
+
+paths:
+  /:
+    get:
+      summary: SPA shell
+      description: Serves the React index (with an injected token meta tag) or the legacy Jinja dashboard.
+      security: []
+      responses:
+        "200": { description: HTML }
+
+  /assets/{path}:
+    get:
+      summary: Static SPA assets
+      security: []
+      parameters:
+        - in: path
+          name: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Asset }
+        "404": { description: Not found }
+
+  /get_config:
+    get:
+      summary: Read the full config surface
+      responses:
+        "200":
+          description: Config as consumed by the SPA
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Config" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/CrossOrigin" }
+
+  /config:
+    post:
+      summary: Dispatch a config action
+      description: |
+        All config mutations go through this endpoint. The `action`
+        field selects the handler; see the `ConfigAction` schema for
+        the accepted values.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ConfigAction" }
+      responses:
+        "200":
+          description: |
+            `{"success": true}` on success, or `{"success": false,
+            "error": "..."}` on handler failure. The HTTP status is
+            200 in both cases; the SPA branches on the body.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  error:   { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /run:
+    post:
+      summary: Start an investigation and stream its events
+      description: |
+        POST a `RunRequest` body. The response is a
+        `text/event-stream` of JSON envelopes, one per event:
+
+        ```
+        data: {"type": "stage_start", "payload": {"stage": "discovery"}}
+        ```
+
+        The stream ends with a `stream_end` event carrying the final
+        status (`done` | `cancelled` | `error`) and the report URL.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RunRequest" }
+      responses:
+        "200":
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  SSE frames. Each frame's `data:` field is a JSON
+                  object `{"type": str, "payload": dict}`. Event types:
+                  `job_start`, `stage_start`, `stage_done`,
+                  `stage_error`, `progress`, `finding`,
+                  `profile_enrichment`, `report_ready`, `pivot_start`,
+                  `pivot_done`, `pivot_error`, `pivot_skipped`,
+                  `pivot_confirm_request`, `pivot_confirm_timeout`,
+                  `abort`, `log`, `heartbeat`, `done`, `error`,
+                  `stream_end`.
+        "400": { description: Invalid mode or missing required target }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /stop:
+    post:
+      summary: Signal an investigation to abort
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                job_id:
+                  type: string
+                  description: Omit to stop the most recently started running job.
+      responses:
+        "200": { description: Cancel event set }
+        "404": { description: No such job, or no running jobs }
+        "409": { description: Job is not in the running state }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/pivot/confirm/{job_id}:
+    post:
+      summary: Deliver a pivot confirmation decision
+      parameters:
+        - in: path
+          name: job_id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                approved_seeds:
+                  type: array
+                  items: { $ref: "#/components/schemas/PivotSeed" }
+      responses:
+        "200": { description: Decision delivered }
+        "404": { description: No pending pivot for this job }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/ai/chat:
+    post:
+      summary: Chat with the AI analyst
+      description: |
+        Streams the LLM response as SSE. Each frame is
+        `data: {"token": "..."}`. Terminates with `data: [DONE]`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                message: { type: string }
+                job_id:  { type: string, nullable: true }
+                map:
+                  type: object
+                  description: Live canvas state; see ChatMap in the source.
+      responses:
+        "200":
+          description: SSE stream of token deltas
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "400": { description: Empty message }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { description: LLM API key not configured }
+
+  /api/investigations:
+    get:
+      summary: List investigations
+      parameters:
+        - in: query
+          name: case_id
+          required: false
+          schema: { type: string }
+          description: Filter to a single case.
+      responses:
+        "200":
+          description: Job summaries, newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/JobSummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/investigations/{job_id}:
+    get:
+      summary: Fetch the intel snapshot for a job
+      parameters:
+        - in: path
+          name: job_id
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Raw intel JSON
+          content:
+            application/json:
+              schema: { type: object }
+        "404": { description: Job not found, or no snapshot }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    delete:
+      summary: Delete a job and its artifacts
+      description: |
+        Writes an `investigation_deleted` audit event before removing
+        anything. Secure-deletes the report, intel snapshot, and
+        evidence manifest. Running jobs return 409.
+      parameters:
+        - in: path
+          name: job_id
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Deletion summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  job_id:  { type: string }
+                  files_removed:
+                    type: array
+                    items: { type: string }
+        "404": { description: Job not found }
+        "409": { description: Job is running }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/investigations/{job_id}/report:
+    get:
+      summary: Fetch the HTML report for a job
+      parameters:
+        - in: path
+          name: job_id
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Self-contained HTML report
+          content:
+            text/html:
+              schema: { type: string }
+        "404": { description: Job not found, or report not yet available }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/cases:
+    get:
+      summary: List cases
+      responses:
+        "200":
+          description: One summary per case_id
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/CaseSummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/cases/{case_id}:
+    get:
+      summary: List jobs in a case
+      parameters:
+        - in: path
+          name: case_id
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Case detail
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  case_id:   { type: string }
+                  job_count: { type: integer }
+                  jobs:
+                    type: array
+                    items: { $ref: "#/components/schemas/JobSummary" }
+        "404": { description: No jobs in this case }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/audit:
+    get:
+      summary: Read recent audit-log entries
+      parameters:
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, default: 100, minimum: 1, maximum: 1000 }
+      responses:
+        "200":
+          description: Audit entries, oldest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:   { type: integer }
+                  entries:
+                    type: array
+                    items: { type: object }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/audit/verify:
+    get:
+      summary: Verify the audit-log hash chain
+      responses:
+        "200":
+          description: Verification result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok, tampered]
+                  valid_entries:  { type: integer }
+                  tampered_lines:
+                    type: array
+                    items: { type: integer }
+                  total_lines:    { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/retention/run:
+    post:
+      summary: Trigger one retention pass immediately
+      responses:
+        "200":
+          description: Retention pass summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ran:     { type: boolean }
+                  days:    { type: integer }
+                  deleted: { type: integer }
+                  failed:  { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/llm/models:
+    get:
+      summary: Fetch the available model list for the active provider
+      responses:
+        "200":
+          description: Model list, with a `source` of `live` or `fallback`
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  models:
+                    type: array
+                    items: { $ref: "#/components/schemas/LLMModel" }
+                  source: { type: string, enum: [live, fallback] }
+                  reason: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/enrichment/test/{provider}:
+    post:
+      summary: Test a stored enrichment provider API key
+      description: |
+        Apollo and Lusha both expose a 0-cost account/profile
+        endpoint. This call never spends a credit.
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema: { type: string, enum: [apollo, lusha] }
+      responses:
+        "200":
+          description: Connection test result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:      { type: boolean }
+                  balance:
+                    nullable: true
+                    description: Credit count (Lusha) or per-bucket dict (Apollo).
+                  error:   { type: string, nullable: true }
+        "400": { description: No API key stored for this provider }
+        "404": { description: Unknown provider }
+        "500": { description: Provider connection error }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /upgrade_tools:
+    post:
+      summary: Upgrade every pip-installable external OSINT tool
+      responses:
+        "200":
+          description: SSE stream of upgrade log lines
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /shutdown:
+    post:
+      summary: Terminate the server
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirm]
+              properties:
+                confirm:
+                  type: string
+                  enum: ["yes"]
+                  description: Explicit confirmation to prevent accidental kills.
+      responses:
+        "200": { description: Process is exiting }
+        "400": { description: Confirmation missing or wrong }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+components:
+  securitySchemes:
+    TokenHeader:
+      type: apiKey
+      in: header
+      name: X-WhoCord-Token
+    TokenQuery:
+      type: apiKey
+      in: query
+      name: token
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid shared-secret token
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error: { type: string, example: unauthorized }
+    CrossOrigin:
+      description: |
+        Request came from a cross-origin or cross-site context. The
+        Origin and Sec-Fetch-Site headers are checked before the token.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error: { type: string, example: cross-origin request rejected }
+
+  schemas:
+    Config:
+      type: object
+      properties:
+        tokens: { $ref: "#/components/schemas/TokenStatus" }
+        tools:
+          type: array
+          items:
+            type: object
+            properties:
+              key:     { type: string }
+              desc:    { type: string }
+              enabled: { type: boolean }
+        mode:               { type: string }
+        multi_guild_search: { type: boolean }
+        debug:              { type: boolean }
+        output_format:      { type: string, enum: [html, markdown, json] }
+        retention_days:     { type: integer }
+        pivot:              { $ref: "#/components/schemas/PivotConfig" }
+        llm:                { $ref: "#/components/schemas/LLMConfig" }
+        enrichment:         { $ref: "#/components/schemas/EnrichmentConfig" }
+
+    TokenStatus:
+      type: object
+      description: |
+        Booleans only — the token values are never returned over the
+        wire, only whether each is set.
+      properties:
+        DISCORD_TOKEN:      { type: boolean }
+        GITHUB_TOKEN:       { type: boolean }
+        GROQ_API_KEY:       { type: boolean }
+        OPENROUTER_API_KEY: { type: boolean }
+        INSTAGRAM_SESSION:  { type: boolean }
+        HIBP_API_KEY:       { type: boolean }
+        APOLLO_API_KEY:     { type: boolean }
+        LUSHA_API_KEY:      { type: boolean }
+
+    PivotConfig:
+      type: object
+      properties:
+        enabled:         { type: boolean }
+        pivot_email:     { type: boolean }
+        pivot_username:  { type: boolean }
+        max_depth:       { type: integer, minimum: 1, maximum: 5 }
+        max_seeds:       { type: integer, minimum: 1, maximum: 20 }
+        require_confirm: { type: boolean }
+
+    LLMConfig:
+      type: object
+      properties:
+        provider:           { type: string, enum: [groq, openrouter] }
+        model:              { type: string }
+        temperature:        { type: number, minimum: 0, maximum: 2 }
+        max_tokens:         { type: integer }
+        system_prompt:      { type: string }
+        intel_budget:       { type: integer }
+        intel_include_raw:  { type: boolean }
+        intel_exclude_meta: { type: boolean }
+
+    EnrichmentConfig:
+      type: object
+      properties:
+        max_identifiers: { type: integer, minimum: 1, maximum: 100 }
+        phone_reveal:    { type: boolean }
+        enabled:
+          type: object
+          properties:
+            apollo: { type: boolean }
+            lusha:  { type: boolean }
+        keys_stored:
+          type: object
+          properties:
+            apollo: { type: boolean }
+            lusha:  { type: boolean }
+
+    ConfigAction:
+      type: object
+      required: [action]
+      properties:
+        action:
+          type: string
+          enum:
+            - set_token
+            - toggle_tool
+            - set_mode
+            - set_multi_guild
+            - toggle_debug
+            - set_pivot
+            - set_pivot_config
+            - set_enrichment
+            - set_llm
+            - set_output_format
+
+    RunRequest:
+      type: object
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [manual, discord, email, domain, phone, image, url, probe]
+        case_id:     { type: string, maxLength: 64 }
+        username:    { type: string }
+        email:       { type: string }
+        user_id:     { type: string }
+        guild_id:    { type: string }
+        multi_guild: { type: boolean }
+        target:      { type: string }
+
+    JobSummary:
+      type: object
+      properties:
+        id:            { type: string }
+        target:        { type: string }
+        mode:          { type: string }
+        case_id:       { type: string }
+        started_at:    { type: string, format: date-time }
+        status:        { type: string, enum: [running, done, cancelled, error] }
+        has_report:    { type: boolean }
+        has_intel:     { type: boolean }
+        has_manifest:  { type: boolean }
+
+    CaseSummary:
+      type: object
+      properties:
+        case_id:       { type: string }
+        job_count:     { type: integer }
+        first_started: { type: string, format: date-time }
+        last_started:  { type: string, format: date-time }
+        targets:
+          type: array
+          items: { type: string }
+        job_ids:
+          type: array
+          items: { type: string }
+
+    PivotSeed:
+      type: object
+      properties:
+        value: { type: string }
+        type:  { type: string, enum: [email, username] }
+
+    LLMModel:
+      type: object
+      properties:
+        id:       { type: string }
+        owned_by: { type: string }
+        free:     { type: boolean }

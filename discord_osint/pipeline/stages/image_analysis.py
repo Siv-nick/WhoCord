@@ -3,15 +3,11 @@ discord_osint/pipeline/stages/image_analysis.py
 -------------------------------------------------
 ImageAnalysisStage – Phase 4 image analysis module.
 
-Reads from ctx
---------------
-ctx.manual_image_url  – direct image URL to analyse
-
-Writes to ctx
--------------
-ctx.intel_core        – EXIF metadata, GPS coords, perceptual hash,
-                        reverse-image search results, OCR text
-ctx.avatar_urls       – the target image (for consistent rendering)
+Permissions
+-----------
+The avatar directory is created with mode 0700 and chmod'd on entry.
+Downloaded images can contain GPS EXIF from the target's camera; on a
+shared workstation they must not be readable by other local users.
 """
 
 from __future__ import annotations
@@ -43,13 +39,14 @@ class ImageAnalysisStage(Stage):
         ctx.intel_core.add_intel("target", "image_url", image_url, source="manual_input")
         ctx.add_avatar(image_url)
 
-        # ------------------------------------------------------------------ #
-        # Download                                                             #
-        # ------------------------------------------------------------------ #
         print("\n-- Downloading image --")
         emit("progress", {"message": "Downloading image"})
         avatar_dir = os.path.join(CACHE_DIR, "avatars")
-        os.makedirs(avatar_dir, exist_ok=True)
+        os.makedirs(avatar_dir, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(avatar_dir, 0o700)
+        except OSError:
+            pass
         fpath = download_avatar(image_url, avatar_dir)
 
         if not fpath:
@@ -59,9 +56,6 @@ class ImageAnalysisStage(Stage):
         print(f"  Saved to: {fpath}")
         emit("finding", {"type": "avatar_downloaded", "path": fpath})
 
-        # ------------------------------------------------------------------ #
-        # EXIF metadata                                                        #
-        # ------------------------------------------------------------------ #
         print("\n-- EXIF extraction --")
         emit("progress", {"message": "Extracting EXIF metadata"})
         fname = os.path.basename(fpath)
@@ -89,9 +83,6 @@ class ImageAnalysisStage(Stage):
         except Exception as exc:
             print(f"  EXIF error: {exc}")
 
-        # ------------------------------------------------------------------ #
-        # Perceptual hash                                                      #
-        # ------------------------------------------------------------------ #
         print("\n-- Perceptual hash --")
         emit("progress", {"message": "Computing perceptual hash"})
         phash = self._compute_phash(fpath)
@@ -100,9 +91,6 @@ class ImageAnalysisStage(Stage):
             emit("finding", {"type": "perceptual_hash", "file": fname, "value": phash})
             print(f"  pHash: {phash}")
 
-        # ------------------------------------------------------------------ #
-        # Reverse image search                                                 #
-        # ------------------------------------------------------------------ #
         cfg = ctx.config
         if cfg.ENABLE_REVERSE_IMG:
             print("\n-- Reverse image search --")
@@ -124,18 +112,14 @@ class ImageAnalysisStage(Stage):
             except Exception as exc:
                 print(f"  Reverse image error: {exc}")
 
-        # ------------------------------------------------------------------ #
-        # OCR (optional, tesseract-based)                                     #
-        # ------------------------------------------------------------------ #
         ocr_text = self._run_ocr(fpath)
         if ocr_text:
-            ctx.intel_core.add_intel("media", f"ocr_{fname}", ocr_text[:2000], source="tesseract")
-            emit("finding", {"type": "ocr_text", "file": fname, "preview": ocr_text[:100]})
+            ctx.intel_core.add_intel("media", f"ocr_{fname}", ocr_text[:2000],
+                                     source="tesseract")
+            emit("finding", {"type": "ocr_text", "file": fname,
+                             "preview": ocr_text[:100]})
             print(f"  OCR text extracted ({len(ocr_text)} chars).")
 
-        # ------------------------------------------------------------------ #
-        # Image metadata (dimensions, format, mode)                           #
-        # ------------------------------------------------------------------ #
         img_info = self._get_image_info(fpath)
         if img_info:
             ctx.intel_core.add_intel("media", f"info_{fname}", img_info, source="pillow")
@@ -145,14 +129,10 @@ class ImageAnalysisStage(Stage):
 
         print(f"\n== Image analysis complete ==")
 
-    # ------------------------------------------------------------------ #
-    # Private helpers                                                       #
-    # ------------------------------------------------------------------ #
-
     @staticmethod
     def _compute_phash(fpath: str) -> str:
         try:
-            import imagehash  # type: ignore
+            import imagehash
             from PIL import Image
             img = Image.open(fpath).convert("RGB")
             return str(imagehash.phash(img))
@@ -165,7 +145,7 @@ class ImageAnalysisStage(Stage):
     @staticmethod
     def _run_ocr(fpath: str) -> str:
         try:
-            import pytesseract  # type: ignore
+            import pytesseract
             from PIL import Image
             img = Image.open(fpath)
             return pytesseract.image_to_string(img).strip()

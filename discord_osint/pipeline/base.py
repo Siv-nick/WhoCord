@@ -7,13 +7,21 @@ Cancellation
 ------------
 ``Pipeline.run()`` accepts an optional ``cancel_event`` (a
 ``threading.Event``). When set, the pipeline stops at the next stage
-boundary and emits an ``abort`` event with ``reason="cancelled by user"``.
-The web layer's ``/stop`` handler sets the same event.
+boundary and emits an ``abort`` event.
 
-Sub-pipelines launched by the pivot machinery inherit the cancel token
-automatically: if ``cancel_event`` isn't passed explicitly, the runner
-falls back to ``getattr(self.context.config, "_cancel_event", None)``,
-which ``web_app.py`` sets once per job.
+Evidence snapshot
+-----------------
+After ``save_state()``, the runner records the returned path on
+``context.intel_snapshot_path``. The reporting stage reads it to
+include the raw intel JSON in the signed evidence manifest.
+
+Spend cap
+---------
+Between stages, if the job config carries a ``CostAccumulator`` whose
+``exceeded()`` returns True, the pipeline aborts with a
+``spend_cap`` reason. This is a checkpoint — the LLM call sites also
+check the cap directly so a single expensive call cannot overshoot by
+more than one call's worth.
 """
 
 from __future__ import annotations
@@ -62,32 +70,10 @@ class Pipeline:
         pivot_confirm_fn: Optional["ConfirmFn"] = None,
         cancel_event=None,
     ) -> None:
-        """
-        Run all stages sequentially.
-
-        Parameters
-        ----------
-        emit:
-            Structured event callback.
-        pivot_config:
-            Phase 2 pivot settings.
-        seed_queue:
-            Shared seed registry.
-        pivot_confirm_fn:
-            Optional callable; when supplied and ``pivot_config.require_confirm``
-            is True, it is called before each pivot depth batch to let the user
-            approve or filter the seeds.  Passed recursively to sub-pipelines.
-        cancel_event:
-            Optional ``threading.Event``. When set, the runner stops at
-            the next stage boundary and emits an ``abort`` event. If not
-            supplied, the runner reads ``config._cancel_event`` (set by
-            web_app.py's ``/run`` handler) so sub-pipelines inherit
-            cancellation without threading the token manually.
-        """
-        # Resolve cancel token: explicit param wins, otherwise fall back
-        # to the one the web layer attached to the config object.
         if cancel_event is None:
             cancel_event = getattr(self.context.config, "_cancel_event", None)
+
+        cost_acc = getattr(self.context.config, "_cost_accumulator", None)
 
         _pivot_active = (
             pivot_config is not None
@@ -97,20 +83,10 @@ class Pipeline:
 
         depth_label = f" [d={self.context.depth}]" if self.context.depth else ""
 
-        # ------------------------------------------------------------------ #
-        # Stage loop                                                           #
-        # ------------------------------------------------------------------ #
         aborted = False
-        last_stage_name = None
 
         for stage in self.stages:
-            last_stage_name = stage.name
-
             # --- Cancellation check between stages ---
-            # The check is at the stage boundary rather than inside each
-            # stage, so a long-running stage can still overrun. That's a
-            # deliberate tradeoff: adding checks mid-stage means touching
-            # every stage implementation and every tool wrapper.
             if cancel_event is not None and cancel_event.is_set():
                 print(
                     f"\n[!] Cancellation requested before stage '{stage.name}'"
@@ -123,6 +99,25 @@ class Pipeline:
                 })
                 aborted = True
                 break
+
+            # --- Spend cap check between stages ---
+            if cost_acc is not None:
+                try:
+                    exceeded, reason = cost_acc.exceeded()
+                except Exception:
+                    exceeded, reason = False, ""
+                if exceeded:
+                    print(
+                        f"\n[!] Spend cap reached before stage '{stage.name}'"
+                        f"{depth_label} — stopping. {reason}"
+                    )
+                    emit("abort", {
+                        "stage":  stage.name,
+                        "depth":  self.context.depth,
+                        "reason": f"spend_cap: {reason}",
+                    })
+                    aborted = True
+                    break
 
             try:
                 emit("stage_start", {"stage": stage.name, "depth": self.context.depth})
@@ -171,6 +166,7 @@ class Pipeline:
         # Save (even on abort — partial state is still useful)               #
         # ------------------------------------------------------------------ #
         saved = self.context.intel_core.save_state()
+        self.context.intel_snapshot_path = saved
 
         cancelled = (
             aborted
@@ -182,15 +178,8 @@ class Pipeline:
         print(f"\n== Pipeline{depth_label} {status_word} – intel saved to {saved} ==")
         emit("done", {"intel_path": saved, "depth": self.context.depth})
 
-        # ------------------------------------------------------------------ #
-        # Pivot processing (skipped on cancel/abort)                          #
-        # ------------------------------------------------------------------ #
         if _pivot_active and not aborted:
             self._process_pivot_seeds(pivot_config, seed_queue, emit, pivot_confirm_fn)
-
-    # ------------------------------------------------------------------ #
-    # Private helpers                                                      #
-    # ------------------------------------------------------------------ #
 
     def _scan_seeds(self, pivot_config: "PivotConfig", seed_queue: "SeedQueue") -> int:
         from .pivot import scan_for_new_seeds

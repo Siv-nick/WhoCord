@@ -1,0 +1,48 @@
+#
+# WhoCord pinned dependency lock.
+#
+# This file pins the direct requirements from requirements.txt to
+# specific versions. It is what CI and the Dockerfile install from,
+# so a build failure caused by an upstream release is caught here
+# rather than mid-investigation.
+#
+# Regenerate after changing requirements.txt:
+#
+#     pip install pip-tools
+#     pip-compile --output-file=requirements.lock requirements.txt
+#
+# To add wheel hashes for a fully hermetic install:
+#
+#     pip-compile --generate-hashes \
+#         --output-file=requirements.lock \
+#         requirements.txt
+#
+# The pinned versions below are known-good as of the last manual
+# audit. Transitive dependencies are not listed — they float within
+# the bounds the direct deps declare. Run pip-compile to promote them
+# to pinned entries.
+#
+
+Flask==3.0.3
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.3.0
+Jinja2==3.1.4
+keyring==25.4.1
+python-dotenv==1.0.1
+networkx==3.4.2
+openai==1.54.4
+dnspython==2.7.0
+validate_email==1.3
+email-validator==2.2.0
+Pillow==11.0.0
+imagehash==4.3.1
+exifread==3.0.0
+pytesseract==0.3.13
+phonenumbers==8.13.50
+rapidfuzz==3.10.1
+langdetect==1.0.9
+socid-extractor==0.0.27
+
+# ---- Dev / CI ----
+pytest==8.3.3

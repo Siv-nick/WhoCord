@@ -4,51 +4,29 @@ discord_osint/pipeline/stages/scraping_stage.py
 ScrapingStage – concurrently scrape known-platform profiles and
 generic profile URLs discovered by DiscoveryStage.
 
-Phase 5 addition
-----------------
-After storing scraped data into intel_core, this stage now emits a
-``profile_enrichment`` event for every scraped profile that has useful
-data (bio, avatar, name, extra fields).  This allows the Investigation
-Canvas frontend to update the already-created ``profile_url`` nodes
-with rich details in real time.
-
-``profile_enrichment`` payload::
-
-    {
-      "type":       "profile_enrichment",
-      "url":        "https://github.com/OneOfOne",      # matches the profile_url node
-      "site":       "github",
-      "username":   "OneOfOne",
-      "name":       "Ahmed W.",
-      "bio":        "Coder and gamer.",
-      "blog":       "https://oneofone.dev",
-      "avatar_url": "https://avatars.githubusercontent.com/u/1080443?v=4",
-      "location":   "Texas, USA",
-      "company":    "@AlpineIQ",
-      "followers":  "127",
-      "created_at": "2011-09-26T11:58:18Z",
-      "twitter":    "10F1",
-      "extra":      {"public_repos": "149", ...}
-    }
-
-Reads from ctx
---------------
-ctx.all_urls      – built by DiscoveryStage
-
-Writes to ctx
--------------
-ctx.intel_core    – names, emails, bios, socid, avatar URLs
-ctx.avatar_urls   – any avatar image URLs found during scraping
+Change log
+----------
+- Platform routing now reads from :mod:`discord_osint.platforms`. The
+  old hardcoded ``_skip_platforms`` set is replaced with
+  ``Platform.scrape_skip``. The routing decision also now falls
+  through to generic scraping for platforms the registry knows about
+  but which have no dedicated scraper (twitch, steam, gitlab, ...) —
+  previously those URLs were classified and then silently dropped.
+- ``ThreadPoolExecutor`` submit sites wrap the callable with
+  ``contextvars.copy_context().run`` so ``_flag()`` inside the
+  workers sees the active JobConfig.
 """
 
 from __future__ import annotations
 
+import contextvars
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..base import Stage, EmitFn
 from ..context import InvestigationContext
 from ...utils import MAX_SCRAPE_WORKERS
+from ...platforms import PLATFORMS
 from ...discord_api import classify_url
 from ...scraping import (
     scrape_profile_info,
@@ -65,25 +43,24 @@ class ScrapingStage(Stage):
     def run(self, ctx: InvestigationContext, emit: EmitFn = lambda *_: None) -> None:
         cfg = ctx.config
 
-        # ------------------------------------------------------------------ #
-        # Split URLs into known-platform vs generic                           #
-        # ------------------------------------------------------------------ #
-        scrape_tasks: list[tuple[str, str, str]] = []  # (platform, slug, original_url)
+        scrape_tasks: list[tuple[str, str, str]] = []
         generic_urls: list[str] = []
         seen: set[str] = set()
-
-        _skip_platforms = {
-            "facebook", "instagram", "tiktok", "pinterest", "snapchat", "linkedin"
-        }
 
         for url in ctx.all_urls:
             if url in seen:
                 continue
             seen.add(url)
             plat, slug = classify_url(url)
-            if plat and slug and plat not in _skip_platforms:
-                scrape_tasks.append((plat, slug, url))
-            elif is_likely_profile_url_v2(url):
+            if plat and slug:
+                p = PLATFORMS.get(plat)
+                if p is not None:
+                    if p.scrape_skip:
+                        continue
+                    if p.scrape_supported:
+                        scrape_tasks.append((plat, slug, url))
+                        continue
+            if is_likely_profile_url_v2(url):
                 generic_urls.append(url)
 
         print(
@@ -94,15 +71,13 @@ class ScrapingStage(Stage):
             "message": f"Scraping {len(scrape_tasks)} known + {len(generic_urls)} generic profiles"
         })
 
-        # ------------------------------------------------------------------ #
-        # Platform-specific scraping                                          #
-        # ------------------------------------------------------------------ #
-        scraped: list[tuple[str, str, str, dict]] = []  # (plat, slug, url, info)
+        scraped: list[tuple[str, str, str, dict]] = []
+
         with ThreadPoolExecutor(max_workers=MAX_SCRAPE_WORKERS) as ex:
-            futures = {
-                ex.submit(scrape_profile_info, p, s): (p, s, u)
-                for p, s, u in scrape_tasks
-            }
+            futures = {}
+            for p, s, u in scrape_tasks:
+                worker_ctx = contextvars.copy_context()
+                futures[ex.submit(worker_ctx.run, scrape_profile_info, p, s)] = (p, s, u)
             for fut in as_completed(futures):
                 p, s, u = futures[fut]
                 try:
@@ -112,12 +87,12 @@ class ScrapingStage(Stage):
                 except Exception as exc:
                     print(f"  Scrape failed {p}/{s}: {exc}")
 
-        # ------------------------------------------------------------------ #
-        # Generic URL scraping                                                #
-        # ------------------------------------------------------------------ #
         generic_scraped: list[tuple[str, dict]] = []
         with ThreadPoolExecutor(max_workers=MAX_SCRAPE_WORKERS) as ex:
-            futures_g = {ex.submit(scrape_generic_url, url): url for url in generic_urls}
+            futures_g = {}
+            for url in generic_urls:
+                worker_ctx = contextvars.copy_context()
+                futures_g[ex.submit(worker_ctx.run, scrape_generic_url, url)] = url
             for fut in as_completed(futures_g):
                 url = futures_g[fut]
                 try:
@@ -127,9 +102,6 @@ class ScrapingStage(Stage):
                 except Exception as exc:
                     print(f"  Generic scrape failed {url}: {exc}")
 
-        # ------------------------------------------------------------------ #
-        # Store platform-scrape results + emit enrichment events             #
-        # ------------------------------------------------------------------ #
         for plat, slug, original_url, info in scraped:
             name  = info.get("name")  or ""
             email = info.get("email") or ""
@@ -182,13 +154,11 @@ class ScrapingStage(Stage):
             avatar_url = info.get("avatar", "")
             if avatar_url:
                 ctx.add_avatar(avatar_url)
-                # Store in profile_avatars so the enrichment event can include it
                 ctx.intel_core.add_intel(
                     "profile_avatars", f"{plat}/{slug}",
                     avatar_url, source=f"scrape_{plat}",
                 )
 
-            # ── Emit enrichment event so the canvas can update the node ───
             self._emit_enrichment(
                 emit=emit,
                 url=original_url,
@@ -199,9 +169,6 @@ class ScrapingStage(Stage):
                 avatar_url=avatar_url,
             )
 
-        # ------------------------------------------------------------------ #
-        # Store generic-scrape results + emit enrichment events              #
-        # ------------------------------------------------------------------ #
         for url, info in generic_scraped:
             email = info.get("email") or ""
             if email and is_valid_personal_email(email):
@@ -238,7 +205,6 @@ class ScrapingStage(Stage):
                     avatar_url, source="generic_scrape",
                 )
 
-            # Emit enrichment event for generic scraped URLs too
             self._emit_enrichment(
                 emit=emit,
                 url=url,
@@ -252,10 +218,6 @@ class ScrapingStage(Stage):
         print(f"  Scraping complete. "
               f"{len(scraped)} platform + {len(generic_scraped)} generic results stored.")
 
-    # ------------------------------------------------------------------ #
-    # Helper: emit profile_enrichment                                      #
-    # ------------------------------------------------------------------ #
-
     @staticmethod
     def _emit_enrichment(
         emit: EmitFn,
@@ -266,11 +228,6 @@ class ScrapingStage(Stage):
         name: str,
         avatar_url: str,
     ) -> None:
-        """
-        Emit a ``profile_enrichment`` event if there is anything useful
-        to show beyond the bare URL.  The frontend listens for this to
-        update existing ``profile_url`` nodes.
-        """
         bio      = info.get("bio",      "")
         blog     = info.get("blog",     "")
         location = info.get("location", "")
@@ -281,26 +238,23 @@ class ScrapingStage(Stage):
         repos    = info.get("public_repos", "")
         gists    = info.get("public_gists", "")
 
-        # Build extra dict for any remaining useful fields
         extra: dict = {}
         if repos:    extra["public_repos"]  = str(repos)
         if gists:    extra["public_gists"]  = str(gists)
         if twitter:  extra["twitter"]       = str(twitter)
 
-        # Derive the canonical human URL (strip API prefix)
         human_url = url
         if "api.github.com/users/" in url:
             user = url.split("/users/")[-1].split("/")[0]
             human_url = f"https://github.com/{user}"
 
-        # Only emit if we have at least one useful piece of data
         has_data = any([name, bio, avatar_url, location, company, blog, followers])
         if not has_data:
             return
 
         emit("profile_enrichment", {
-            "url":        url,        # matches the profile_url node label
-            "human_url":  human_url,  # cleaned URL for display
+            "url":        url,
+            "human_url":  human_url,
             "site":       plat,
             "username":   slug,
             "name":       name or "",

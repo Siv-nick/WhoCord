@@ -1,36 +1,24 @@
+
 """
 discord_osint/pipeline/pivot.py
 ---------------------------------
-Adaptive recursive pivoting – Phase 2 (updated for Phase 3 edits).
+Adaptive recursive pivoting.
 
-New in this version
--------------------
-``SeedQueue.pop_batch`` no longer discards seeds beyond the batch limit.
-The old implementation popped the entire depth bucket but only returned
-the first ``limit`` items — everything past that vanished silently. Any
-target with more than ``max_seeds_per_depth`` discovered emails/usernames
-would lose the excess with no log line and no chance to investigate them
-in a later pass.
+Cancellation
+------------
+``process_pending_seeds`` checks the pipeline's cancel event before
+each batch and between each seed inside a batch. A cancelled run stops
+launching new sub-investigations at the next boundary. This does not
+cancel a subprocess already running inside a sub-pipeline (that is the
+deferred mid-stage item), but it does prevent the fan-out that is the
+expensive part in practice.
 
-Fix summary
------------
-* ``SeedQueue.pop_batch``         — returns a batch and *keeps* the
-                                    remainder in the pending bucket.
-* ``SeedQueue.drain_depth``       — new helper that atomically removes
-                                    and returns ALL pending seeds at a
-                                    depth (used when we want to plan
-                                    the whole depth before launching).
-* ``process_pending_seeds``       — now drains the full depth, confirms
-                                    once over the whole set (if
-                                    confirmation is enabled), then
-                                    launches sub-investigations in
-                                    batches of ``max_seeds_per_depth``.
-                                    Nothing is dropped.
-
-Sub-pipelines now also run :class:`EnrichmentStage` so a pivot off a
-discovered email can also benefit from Apollo / Lusha when those
-providers are enabled. The stage is a no-op when neither provider is
-enabled, so this is purely additive.
+SeedQueue
+---------
+``pop_batch`` retains excess seeds in the pending bucket rather than
+discarding them; ``drain_depth`` atomically removes the whole bucket
+without marking processed so the confirm gate can reject individual
+seeds before they are consumed.
 """
 
 from __future__ import annotations
@@ -41,10 +29,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Tuple
 
 
-# ---------------------------------------------------------------------------
-# Type aliases
-# ---------------------------------------------------------------------------
-
 EmitFn       = Callable[[str, dict], None]
 ConfirmFn    = Callable[
     [List[Tuple[str, str]], int, EmitFn],
@@ -53,28 +37,8 @@ ConfirmFn    = Callable[
 _NOOP: EmitFn = lambda *_: None
 
 
-# ---------------------------------------------------------------------------
-# PivotConfig
-# ---------------------------------------------------------------------------
-
 @dataclass(frozen=True)
 class PivotConfig:
-    """
-    Immutable pivot settings.
-
-    Attributes
-    ----------
-    enabled:              Master toggle.
-    pivot_email:          Follow newly discovered email addresses.
-    pivot_username:       Follow newly discovered plain usernames.
-    max_depth:            Maximum recursion depth (root = 0).
-    max_seeds_per_depth:  Batch size per launch wave. The full depth set
-                          is now processed across multiple waves rather
-                          than truncated to this number.
-    require_confirm:      When True, pause before each depth and wait for
-                          user approval via confirm_fn.
-    """
-
     enabled:             bool = False
     pivot_email:         bool = True
     pivot_username:      bool = True
@@ -93,10 +57,6 @@ class PivotConfig:
             require_confirm=     bool(getattr(config, "PIVOT_REQUIRE_CONFIRM",   False)),
         )
 
-
-# ---------------------------------------------------------------------------
-# SeedQueue
-# ---------------------------------------------------------------------------
 
 class SeedQueue:
     """
@@ -131,9 +91,8 @@ class SeedQueue:
         """
         Return up to *limit* seeds from *depth*.
 
-        Anything beyond *limit* stays in the pending bucket for a later
-        call — it is NOT discarded. Seeds in the returned batch are
-        marked as processed.
+        Anything beyond *limit* stays pending for a later call — it is
+        NOT discarded. Seeds in the returned batch are marked processed.
         """
         all_at_depth = self._pending.get(depth, [])
         if not all_at_depth:
@@ -155,8 +114,8 @@ class SeedQueue:
         """
         Remove and return ALL pending seeds at *depth*.
 
-        Returned seeds are NOT marked as processed — the caller is
-        expected to mark them (or gate them through confirmation first).
+        Returned seeds are NOT marked processed — the caller marks them
+        (or gates them through confirmation first).
         """
         return self._pending.pop(depth, [])
 
@@ -261,7 +220,8 @@ def build_sub_pipeline(
     cfg          = parent_ctx.config
     username     = seed_value.split("@")[0] if seed_type == "email" else seed_value
     manual_email = seed_value if seed_type == "email" else ""
-    target_id    = hash(seed_value) & 0x7FFFFFFF
+    from .. import utils
+    target_id    = utils.stable_target_id(seed_value)
     intel_core   = InvestigationCore(target_id)
 
     sub_ctx = InvestigationContext(
@@ -350,6 +310,10 @@ def process_pending_seeds(
 ) -> int:
     """
     Run sub-pipelines for all seeds pending at ``ctx.depth + 1``.
+
+    Cancel checks run before every batch and between seeds within a
+    batch, so a Stop request during a fan-out of ten sub-investigations
+    stops launching new ones at the next seed boundary.
     """
     if not pivot_config.enabled:
         return 0
@@ -361,6 +325,8 @@ def process_pending_seeds(
     all_seeds = seed_queue.drain_depth(next_depth)
     if not all_seeds:
         return 0
+
+    cancel_event = getattr(ctx.config, "_cancel_event", None)
 
     print(
         f"\n{'=' * 60}\n"
@@ -397,6 +363,13 @@ def process_pending_seeds(
     launched   = 0
 
     for batch_start in range(0, len(all_seeds), batch_size):
+        if cancel_event is not None and cancel_event.is_set():
+            print(
+                f"\n  [PIVOT d={next_depth}] cancelled before batch "
+                f"{batch_start // batch_size + 1}"
+            )
+            break
+
         batch = all_seeds[batch_start : batch_start + batch_size]
 
         print(
@@ -406,6 +379,10 @@ def process_pending_seeds(
         )
 
         for seed_value, seed_type in batch:
+            if cancel_event is not None and cancel_event.is_set():
+                print(f"  [PIVOT d={next_depth}] cancelled mid-batch")
+                break
+
             seed_queue.mark_processed(seed_value)
 
             print(f"\n  [PIVOT d={next_depth}] {seed_type}={seed_value!r}")

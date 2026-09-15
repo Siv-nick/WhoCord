@@ -12,7 +12,7 @@ interface Props {
 const BASE  = 40;
 const DOT_R = 0.9;
 
-export default function CanvasGrid({ viewport, width, height }: Props) {
+function CanvasGrid({ viewport, width, height }: Props) {
   const { canvasBackground, gridColor } = useTheme();
   const { x: panX, y: panY, zoom } = viewport;
   const spacing = BASE * zoom;
@@ -68,3 +68,6 @@ export default function CanvasGrid({ viewport, width, height }: Props) {
     </svg>
   );
 }
+
+// Memoised: Redrawn on every canvas render despite depending only on viewport/size.
+export default React.memo(CanvasGrid);

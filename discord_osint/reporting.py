@@ -4,33 +4,33 @@ discord_osint/reporting.py
 Report helpers: identity confidence scoring, name analysis, AI persona
 summaries, AI structured reports, and markdown formatting.
 
-LLM provider resolution
------------------------
-Every LLM call routes through ``config_service.get_llm_endpoint()``,
-which returns the base URL, API key, and extra headers for whichever
-provider (``LLM_PROVIDER``) is active. Switching from Groq to
-OpenRouter is a single config-key change with no code edits required.
+Spend cap
+---------
+Both ``generate_persona_summary`` and ``generate_ai_report`` check the
+accumulator's ``exceeded()`` immediately after the LLM call. If the
+cap was reached during the call, the function returns None rather than
+continuing to build on a partial result. The pipeline's between-stage
+checkpoint aborts the run.
 """
 
 import json
 import re
 import os
 import datetime
+from typing import Any, Optional
 
 from .scraping import looks_like_real_name_v2, is_valid_email
 from .utils import CACHE_DIR
 from .config_service import get_llm_endpoint
 
 
-# ---------------------------------------------------------------------------
-# LLM settings helper
-# ---------------------------------------------------------------------------
-
-def _llm_settings() -> tuple[str, float, int, str, int, bool, bool]:
-    try:
-        from .config import config as _cfg
-    except Exception:
-        return ("llama3-8b-8192", 0.25, 4096, "", 60000, True, True)
+def _llm_settings(cfg=None) -> tuple[str, float, int, str, int, bool, bool]:
+    if cfg is None:
+        try:
+            from .config import config as _cfg
+            cfg = _cfg
+        except Exception:
+            return ("llama3-8b-8192", 0.25, 4096, "", 60000, True, True)
 
     def _f(v, d):
         try:
@@ -51,28 +51,65 @@ def _llm_settings() -> tuple[str, float, int, str, int, bool, bool]:
             return v.strip().lower() in ("1", "true", "yes", "on")
         return bool(v)
 
-    model  = getattr(_cfg, "LLM_MODEL", "llama3-8b-8192") or "llama3-8b-8192"
-    temp   = _f(getattr(_cfg, "LLM_TEMPERATURE", 0.25), 0.25)
-    tokens = _i(getattr(_cfg, "LLM_MAX_TOKENS", 4096), 4096)
-    prompt = getattr(_cfg, "LLM_SYSTEM_PROMPT", "") or ""
-    budget = _i(getattr(_cfg, "LLM_INTEL_BUDGET", 60000), 60000)
-    raw    = _b(getattr(_cfg, "LLM_INTEL_INCLUDE_RAW", True), True)
-    meta   = _b(getattr(_cfg, "LLM_INTEL_EXCLUDE_META", True), True)
+    model  = getattr(cfg, "LLM_MODEL", "llama3-8b-8192") or "llama3-8b-8192"
+    temp   = _f(getattr(cfg, "LLM_TEMPERATURE", 0.25), 0.25)
+    tokens = _i(getattr(cfg, "LLM_MAX_TOKENS", 4096), 4096)
+    prompt = getattr(cfg, "LLM_SYSTEM_PROMPT", "") or ""
+    budget = _i(getattr(cfg, "LLM_INTEL_BUDGET", 60000), 60000)
+    raw    = _b(getattr(cfg, "LLM_INTEL_INCLUDE_RAW", True), True)
+    meta   = _b(getattr(cfg, "LLM_INTEL_EXCLUDE_META", True), True)
     return model, temp, tokens, prompt, budget, raw, meta
 
 
 def _build_system_prompt(base_prompt: str) -> str:
-    """
-    Combine a caller-supplied (or default) base prompt with the
-    untrusted-data contract. The contract is always appended, so a
-    custom prompt cannot reopen the injection surface.
-    """
     from .intelligence.intel_dump import UNTRUSTED_DATA_RULES
-
     base = (base_prompt or "").strip()
     if base:
         return base + "\n\n" + UNTRUSTED_DATA_RULES
     return UNTRUSTED_DATA_RULES
+
+
+def _provider_label(cfg) -> str:
+    if cfg is None:
+        try:
+            from .config import config as _cfg
+            cfg = _cfg
+        except Exception:
+            return "unknown"
+    return (getattr(cfg, "LLM_PROVIDER", "groq") or "groq").strip().lower()
+
+
+def _safe_emit_contact(log: Optional[Any], cfg: Any, endpoint: str, model: str,
+                       bytes_sent: int, bytes_received: int,
+                       status: int, ok: bool) -> None:
+    if log is None:
+        return
+    try:
+        log.event(
+            "third_party_contacted",
+            service=_provider_label(cfg),
+            endpoint=endpoint,
+            model=model,
+            bytes_sent=bytes_sent,
+            bytes_received=bytes_received,
+            status=status,
+            ok=ok,
+        )
+    except Exception:
+        pass
+
+
+def _spend_exceeded(cfg: Any) -> tuple[bool, str]:
+    """Read the job's accumulator state, if there is one."""
+    if cfg is None:
+        return False, ""
+    acc = getattr(cfg, "_cost_accumulator", None)
+    if acc is None:
+        return False, ""
+    try:
+        return acc.exceeded()
+    except Exception:
+        return False, ""
 
 
 # -------------------------------------------------------------------
@@ -192,16 +229,14 @@ def run_name_analysis(name_list):
 # -------------------------------------------------------------------
 #  AI Persona Summary
 # -------------------------------------------------------------------
-def generate_persona_summary(intel, groq_api_key=None):
+def generate_persona_summary(intel, groq_api_key=None, config=None, log=None):
     """
     Ask the LLM to summarise the subject's persona using the FULL intel
-    dump rather than just bios and emails.
+    dump. Emits third_party_contacted when ``log`` is provided.
 
-    The *groq_api_key* argument is accepted for backwards compatibility
-    but ignored — the active provider and its key are read from the
-    config via ``get_llm_endpoint()``.
+    If the spend cap was reached during the call, returns None.
     """
-    base_url, api_key, extra_headers = get_llm_endpoint()
+    base_url, api_key, extra_headers = get_llm_endpoint(config)
     if not api_key:
         return None
 
@@ -216,7 +251,7 @@ def generate_persona_summary(intel, groq_api_key=None):
         )
 
         model, temp, tokens, custom_prompt, budget, include_raw, exclude_meta = \
-            _llm_settings()
+            _llm_settings(config)
 
         dump = build_intel_dump(
             intel,
@@ -243,33 +278,69 @@ def generate_persona_summary(intel, groq_api_key=None):
                "Respond with plain prose, no markdown fences."
         )
 
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ]
+        try:
+            bytes_sent = len(json.dumps(
+                {"model": model, "messages": messages},
+                ensure_ascii=False,
+            ).encode("utf-8"))
+        except Exception:
+            bytes_sent = 0
+
         response = client.chat.completions.create(
             model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_prompt},
-            ],
+            messages=messages,
             max_tokens=min(tokens, 4000),
             temperature=temp,
         )
+
+        try:
+            bytes_received = len(json.dumps(
+                response.model_dump() if hasattr(response, "model_dump")
+                else str(response),
+                ensure_ascii=False, default=str,
+            ).encode("utf-8"))
+        except Exception:
+            bytes_received = 0
+
+        _safe_emit_contact(
+            log, config, endpoint="chat/completions", model=model,
+            bytes_sent=bytes_sent, bytes_received=bytes_received,
+            status=200, ok=True,
+        )
+
+        # Post-call spend-cap check: if this call pushed us over the
+        # cap, do not return content the pipeline will immediately
+        # discard.
+        exceeded, reason = _spend_exceeded(config)
+        if exceeded:
+            print(f"  [!] Persona summary aborted after call: {reason}")
+            return None
+
         return response.choices[0].message.content.strip()
     except Exception as e:
         print(f"  Persona summary error: {e}")
+        _safe_emit_contact(
+            log, config, endpoint="chat/completions", model="",
+            bytes_sent=0, bytes_received=0, status=0, ok=False,
+        )
         return None
 
 
 # -------------------------------------------------------------------
 #  AI structured report (JSON)
 # -------------------------------------------------------------------
-def generate_ai_report(core, groq_api_key=None):
+def generate_ai_report(core, groq_api_key=None, config=None, log=None):
     """
     Generate a structured JSON report using the FULL intel dump.
+    Emits third_party_contacted when ``log`` is provided.
 
-    The *groq_api_key* argument is accepted for backwards compatibility
-    but ignored — the active provider and its key are read from the
-    config via ``get_llm_endpoint()``.
+    If the spend cap was reached during the call, returns None.
     """
-    base_url, api_key, extra_headers = get_llm_endpoint()
+    base_url, api_key, extra_headers = get_llm_endpoint(config)
     if not api_key:
         print("  AI report skipped – no API key set for the active provider.")
         return None
@@ -293,7 +364,7 @@ def generate_ai_report(core, groq_api_key=None):
         )
 
         model, temp, tokens, custom_prompt, budget, include_raw, exclude_meta = \
-            _llm_settings()
+            _llm_settings(config)
 
         dump = build_intel_dump(
             intel,
@@ -325,15 +396,45 @@ def generate_ai_report(core, groq_api_key=None):
                "no markdown fences, no preamble."
         )
 
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ]
+        try:
+            bytes_sent = len(json.dumps(
+                {"model": model, "messages": messages},
+                ensure_ascii=False,
+            ).encode("utf-8"))
+        except Exception:
+            bytes_sent = 0
+
         response = client.chat.completions.create(
             model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_prompt},
-            ],
+            messages=messages,
             max_tokens=min(tokens, 5500),
             temperature=temp,
         )
+
+        try:
+            bytes_received = len(json.dumps(
+                response.model_dump() if hasattr(response, "model_dump")
+                else str(response),
+                ensure_ascii=False, default=str,
+            ).encode("utf-8"))
+        except Exception:
+            bytes_received = 0
+
+        _safe_emit_contact(
+            log, config, endpoint="chat/completions", model=model,
+            bytes_sent=bytes_sent, bytes_received=bytes_received,
+            status=200, ok=True,
+        )
+
+        exceeded, reason = _spend_exceeded(config)
+        if exceeded:
+            print(f"  [!] AI report aborted after call: {reason}")
+            return None
+
         raw = response.choices[0].message.content.strip()
         cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE)
 
@@ -359,6 +460,10 @@ def generate_ai_report(core, groq_api_key=None):
         import traceback
         print(f"  AI report error: {e}")
         traceback.print_exc()
+        _safe_emit_contact(
+            log, config, endpoint="chat/completions", model="",
+            bytes_sent=0, bytes_received=0, status=0, ok=False,
+        )
         return None
 
 

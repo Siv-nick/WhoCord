@@ -3,13 +3,19 @@ discord_osint/core.py
 ----------------------
 InvestigationCore – the per-investigation intel accumulator.
 
+Permissions
+-----------
+The cache directory is created with mode 0700 and chmod'd on entry.
+Intel snapshots contain the target's emails, breach data, and
+identity clues; on a shared workstation they must not be readable by
+other local users. Each snapshot file is chmod'd to 0600 after write.
+
 Change log
 ----------
 - ``load_latest_state()`` no longer uses a bare ``except:`` around the
-  file read. A corrupt / partially-written intel snapshot now prints a
-  warning on stderr instead of silently returning ``None`` (which the
-  caller would interpret as "no prior intel," potentially discarding
-  usable case data without any trace).
+  file read. A corrupt / partially-written intel snapshot prints a
+  warning on stderr instead of silently returning ``None``.
+- ``cache_dir`` gets mode 0700; snapshot files get mode 0600.
 """
 
 import os
@@ -25,7 +31,11 @@ class InvestigationCore:
     def __init__(self, target_id, cache_dir=CACHE_DIR):
         self.target_id = target_id
         self.cache_dir = cache_dir
-        os.makedirs(cache_dir, exist_ok=True)
+        os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(cache_dir, 0o700)
+        except OSError:
+            pass
         self.intel = {
             "discord": {},
             "social_profiles": {},
@@ -54,6 +64,10 @@ class InvestigationCore:
         )
         with open(fn, 'w', encoding='utf-8') as f:
             json.dump(self.intel, f, indent=2)
+        try:
+            os.chmod(fn, 0o600)
+        except OSError:
+            pass
         return fn
 
     def load_latest_state(self):
@@ -67,9 +81,6 @@ class InvestigationCore:
             with open(latest, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError) as exc:
-            # A corrupt or partially-written snapshot used to vanish into
-            # a bare `except: pass`. Surface it so the operator knows the
-            # cached state was not applied.
             print(
                 f"[core] WARNING: could not read cached intel at {latest!r}: "
                 f"{type(exc).__name__}: {exc}",

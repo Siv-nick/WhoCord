@@ -72,3 +72,7 @@ whocord_source*.txt
 # ── OS noise ───────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+# ── Personal / local files ────────────────────────────────
+config.json
+discord_osint/config.json
+push_to_github.sh

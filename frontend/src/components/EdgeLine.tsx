@@ -2,8 +2,18 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Renders a single edge between two nodes.
 //
-// Perf: memoized; draw-in animation removed (was creating a style tick per
-// edge); hover-driven glow remains, driven by node hover via graph store.
+// Perf: the path is computed in GRAPH space and the viewport transform is
+// applied once by the parent <g> in GraphCanvas. Previously each edge
+// transformed every node itself (allNodes.map(tx) — an N-object allocation
+// per edge) and the memo listed `viewport` as a dependency, so a single pan
+// frame invalidated all E memos and cost O(N x E) allocations plus O(N x E)
+// obstacle tests. Pan and zoom are now pure SVG transforms: zero JS recompute.
+//
+// This also fixes a latent visual bug. GraphNode draws at r = NODE_RADIUS *
+// zoom, but calculateEdgePath trimmed endpoints by a constant NODE_RADIUS.
+// At zoom != 1 the edge ends did not meet the node boundary — short of it
+// when zoomed out, inside the circle when zoomed in. Computing in graph
+// space makes the trim scale with the node automatically.
 
 import React, { useMemo } from "react";
 import type { GraphEdge, GraphNode } from "../types/graph";
@@ -16,12 +26,18 @@ interface Props {
   source:    GraphNode;
   target:    GraphNode;
   allNodes:  GraphNode[];
-  viewport:  { x: number; y: number; zoom: number };
+  /**
+   * Signature of all node positions, supplied by the canvas. Used as
+   * the memo key instead of `allNodes` identity — the store rebuilds
+   * the nodes array on every update, so keying on the array made any
+   * node change invalidate every edge's path.
+   */
+  nodePosKey: string;
   dimmed?:   boolean;
 }
 
 function EdgeLine({
-  edge, source, target, allNodes, viewport, dimmed = false,
+  edge, source, target, allNodes, nodePosKey, dimmed = false,
 }: Props) {
   // Read hovered node — the store only notifies when the id changes.
   const hoveredNodeId = useGraphState(s => s.hoveredNodeId);
@@ -34,17 +50,21 @@ function EdgeLine({
     edgeHoverGlow,
   } = useTheme();
 
-  const { zoom } = viewport;
-  const screenPath = useMemo(() => {
-    const tx = (n: GraphNode) => ({
-      ...n,
-      position: {
-        x: n.position.x * zoom + viewport.x,
-        y: n.position.y * zoom + viewport.y,
-      },
-    });
-    return calculateEdgePath(tx(source), tx(target), allNodes.map(tx));
-  }, [source, target, allNodes, viewport]);
+  // Graph-space path. Independent of pan and zoom, so this only
+  // recomputes when a node actually moves.
+  // `allNodes` is intentionally absent from the dependency list:
+  // nodePosKey already changes whenever any position moves, and the
+  // obstacle scan only reads positions. Depending on the array itself
+  // would reintroduce the invalidate-everything behaviour.
+  const path = useMemo(
+    () => calculateEdgePath(source, target, allNodes),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [
+      source.id, source.position.x, source.position.y,
+      target.id, target.position.x, target.position.y,
+      nodePosKey,
+    ],
+  );
 
   const isGlowing = hoveredNodeId !== null
     && (hoveredNodeId === source.id || hoveredNodeId === target.id);
@@ -56,12 +76,16 @@ function EdgeLine({
   return (
     <g style={{ opacity: dimmed ? 0.08 : 1, transition: "opacity .2s" }}>
       <path
-        d={screenPath}
+        d={path}
         fill="none"
         stroke={stroke}
         strokeWidth={width}
         strokeOpacity={opacity}
         strokeLinecap="round"
+        // The parent <g> scales by zoom; without this the stroke would
+        // scale too, which is a behaviour change from the old
+        // screen-space rendering.
+        vectorEffect="non-scaling-stroke"
         style={{
           filter: isGlowing
             ? `drop-shadow(0 0 ${4 * edgeHoverGlow}px ${edgeHoverColor})`

@@ -2,7 +2,7 @@
 import React, { useRef, useState } from "react";
 import CanvasConfigPanel from "../components/CanvasConfigPanel";
 import { Icon } from "../components/Icons";
-import { upgradeToolsUrl, shutdownServer } from "../utils/api";
+import { apiFetch, upgradeToolsUrl, shutdownServer } from "../utils/api";
 
 export default function Config() {
   const [upgradeLog, setLog]      = useState<string[]>([]);
@@ -14,7 +14,7 @@ export default function Config() {
     setLog([]);
     setUpgrading(true);
     try {
-      const res    = await fetch(upgradeToolsUrl(), { method: "POST" });
+      const res    = await apiFetch(upgradeToolsUrl(), { method: "POST" });
       const reader = res.body?.getReader();
       const dec    = new TextDecoder();
       if (!reader) {

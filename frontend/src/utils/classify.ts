@@ -1,17 +1,15 @@
 // src/utils/classify.ts
 // ─────────────────────────────────────────────────────────────────────────────
 // Frontend mirror of the backend DataProbe classification logic, plus the
-// canonical entity → icon name mapping used by the whole UI.
+// canonical entity → icon name mapping used by the whole UI, plus the
+// source → confidence table that powers the node confidence indicator.
 //
 // Change log
 // ----------
-// - `findingTypeToEntityType` map brought up to date with every finding
-//   type the backend emits. `hibp_skipped` and `intelligence_narrative`
-//   were previously falling through to "unknown", which made the
-//   "HIBP could not check" case visually indistinguishable from an
-//   unrecognised tool output.
-// - Added module-level documentation of which backend module emits each
-//   finding type so the map stays in sync when new stages are added.
+// - Added ``sourceConfidence()`` mirroring the backend
+//   ``intelligence/extractor.py`` _SOURCE_CONFIDENCE table. Used by
+//   GraphNode and InfoCard to derive a per-node confidence when the
+//   finding payload does not carry one explicitly.
 
 import type { IconName } from "../components/Icons";
 import type { NodeEntityType, NodeModule } from "../types/graph";
@@ -51,37 +49,6 @@ export function classifyInput(raw: string): ClassifyResult {
 }
 
 // ─── Finding type → entity type ──────────────────────────────────────
-//
-// Backend sources, kept as a comment so this table is easy to audit when
-// a stage gains a new finding type:
-//
-//   email_investigation.py / email_intel.py:
-//     email, holehe, h8mail, hibp, hibp_skipped, emailrep, ghunt,
-//     gravatar, scylla
-//   discord_mode.py:
-//     discord_handle, avatar_url, connected_account, name_clue
-//   scraping_stage.py / media.py:
-//     avatar_downloaded, exif_gps, exif_date, exif_camera,
-//     exif_metadata, reverse_image, perceptual_hash, image_info, ocr_text
-//   analysis.py / extras.py:
-//     whois, wayback, name_similarity, confidence_scores, location,
-//     language
-//   domain_investigation.py:
-//     dns, ip_address, ip_geolocation, ssl_certificate, subdomains,
-//     harvester_emails, harvester_hosts
-//   url_analysis.py:
-//     http_metadata, page_metadata, emails_on_page, interesting_links,
-//     url_domain, safe_browsing
-//   phone_investigation.py:
-//     phone_metadata, phone_carrier, phoneinfoga
-//   intelligence/engine.py:
-//     correlations, intelligence_report, intelligence_narrative,
-//     persona_summary
-//   username_search / mosint:
-//     mosint_profiles, social_profiles_found
-//   pivot.py (status — handled as separate events, not `finding`):
-//     pivot_start, pivot_done, pivot_error, pivot_skipped
-//
 const FINDING_TO_ENTITY: Record<string, NodeEntityType> = {
   // ── Email ────────────────────────────────────────────────────────
   email:               "email",
@@ -93,17 +60,23 @@ const FINDING_TO_ENTITY: Record<string, NodeEntityType> = {
   holehe:              "breach",
   h8mail:              "breach",
   scylla:              "breach",
+  cordcat_breach:      "breach",
 
   // ── Social / identity ────────────────────────────────────────────
-  gravatar:            "social_profile",
-  ghunt:               "social_profile",
-  connected_account:   "social_profile",
+  gravatar:             "social_profile",
+  ghunt:                "social_profile",
+  connected_account:    "social_profile",
   social_profiles_found:"social_profile",
-  mosint_profiles:     "social_profile",
-  discord_handle:      "username",
-  name_clue:           "name",
-  name_similarity:     "name",
-  confidence_scores:   "unknown",
+  mosint_profiles:      "social_profile",
+  cordcat_fivem:        "social_profile",
+  cordcat_user:         "username",
+  discord_handle:       "username",
+  name_clue:            "name",
+  name_similarity:      "name",
+  confidence_scores:    "unknown",
+  activity_profile:     "unknown",
+  cordcat_dsa_statement:"unknown",
+  cordcat_score:        "unknown",
 
   // ── Media ────────────────────────────────────────────────────────
   avatar_url:          "image",
@@ -202,3 +175,85 @@ export const MODULE_ICONS: Record<NodeModule, IconName> = {
   probe:   "search",
   root:    "target",
 };
+
+// ─── Source → confidence ─────────────────────────────────────────────
+// Mirrors discord_osint/intelligence/extractor.py::_SOURCE_CONFIDENCE.
+// Used when a finding payload does not carry an explicit confidence
+// field. The values are the same the backend uses when building the
+// intelligence graph, so a node's confidence here matches the entity
+// confidence there for the same source string.
+const SOURCE_CONFIDENCE: Record<string, number> = {
+  manual_input:         0.92,
+  discord_api:          0.88,
+  discord_enrich:       0.82,
+  snowflake:            0.82,
+  gitfive:              0.72,
+  scrape_github:        0.72,
+  smtp_verify:          0.70,
+  ghunt:                0.68,
+  cord_cat:             0.66,
+  hibp:                 0.65,
+  h8mail:               0.65,
+  holehe:               0.65,
+  emailrep:             0.62,
+  discord_bio:          0.60,
+  scrape_twitter:       0.60,
+  scrape_reddit:        0.58,
+  scrape_:              0.55,
+  gravatar:             0.55,
+  "socid-extractor":    0.52,
+  wayback:              0.50,
+  activity_inference:   0.50,
+  nametrace:            0.48,
+  whois:                0.47,
+  location_inference:   0.44,
+  langdetect:           0.44,
+  naminter:             0.40,
+  generic_scrape:       0.36,
+  api_fetch:            0.44,
+  crtsh:                0.60,
+  avatar_collection:    0.70,
+};
+
+const DEFAULT_CONFIDENCE = 0.38;
+
+/**
+ * Return the confidence for a finding source string, or undefined when
+ * the source is empty. Mirrors the backend's longest-prefix lookup so
+ * "scrape_github" and "scrape_twitter" both resolve to their specific
+ * values rather than the shorter "scrape_" prefix.
+ */
+export function sourceConfidence(source: string | undefined | null): number | undefined {
+  if (!source) return undefined;
+  const s = String(source).toLowerCase();
+  if (s in SOURCE_CONFIDENCE) return SOURCE_CONFIDENCE[s];
+
+  let bestKey = "";
+  let bestVal = DEFAULT_CONFIDENCE;
+  for (const [key, val] of Object.entries(SOURCE_CONFIDENCE)) {
+    if (s.startsWith(key) && key.length > bestKey.length) {
+      bestKey = key;
+      bestVal = val;
+    }
+  }
+  return bestVal;
+}
+
+/**
+ * Coerce a raw finding payload into a confidence value. Prefers an
+ * explicit ``confidence`` field if the payload carries one, otherwise
+ * derives from ``source``. Returns undefined when neither is available.
+ */
+export function confidenceForFinding(
+  payload: Record<string, unknown>,
+): number | undefined {
+  const explicit = payload["confidence"];
+  if (typeof explicit === "number" && explicit >= 0 && explicit <= 1) {
+    return explicit;
+  }
+  const source = payload["source"];
+  if (typeof source === "string") {
+    return sourceConfidence(source);
+  }
+  return undefined;
+}

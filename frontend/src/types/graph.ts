@@ -45,8 +45,8 @@ export interface InfoField {
   value:    string;
   editable: boolean;
   url?:     string;
-  isImage?: boolean;   // added
-  isLink?:  boolean;   // added
+  isImage?: boolean;
+  isLink?:  boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -55,26 +55,17 @@ export interface InfoField {
 
 export interface GraphNode {
   id:         string;
-  /** Display label shown under the node icon */
   label:      string;
-  /** Classified entity type – drives the icon */
   entityType: NodeEntityType;
-  /** Which module produced / should investigate this node */
   module:     NodeModule;
-  /** Canvas position in logical (unscaled) coordinates */
   position:   { x: number; y: number };
-  /** Fill colour – CSS colour string, default "#ffffff" */
   colour:     string;
-  /** Whether an investigation is currently running from this node */
   investigating: boolean;
-  /** 0–100, shown when investigating === true */
   progress:   number;
-  /** Structured data for the Info Card */
   infoFields: InfoField[];
-  /** Raw finding payload for reference */
   rawData:    Record<string, unknown>;
-  /** Timestamp when node was added (ms) */
   createdAt:  number;
+  confidence?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -85,11 +76,8 @@ export interface GraphEdge {
   id:       string;
   sourceId: string;
   targetId: string;
-  /** Optional label shown mid-edge */
   label?:   string;
-  /** Edge colour – CSS colour string, default "#000000" */
   colour:   string;
-  /** Whether this edge is animated (newly created) */
   animated: boolean;
 }
 
@@ -98,9 +86,9 @@ export interface GraphEdge {
 // ---------------------------------------------------------------------------
 
 export interface Viewport {
-  x:    number;   // pan offset in px
+  x:    number;
   y:    number;
-  zoom: number;   // 0.2 – 3.0
+  zoom: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -109,7 +97,7 @@ export interface Viewport {
 
 export interface MapSaveFile {
   version:  string;
-  savedAt:  string;    // ISO timestamp
+  savedAt:  string;
   nodes:    GraphNode[];
   edges:    GraphEdge[];
   viewport: Viewport;
@@ -136,9 +124,23 @@ export type NodePopupAction = "connect" | "view_details" | "investigate" | null;
 
 export type ChatRole = "user" | "assistant";
 
+export type ChatErrorKind =
+  | "not_configured"
+  | "rate_limited"
+  | "provider_error"
+  | "network";
+
 export interface ChatMessage {
   id:      string;
   role:    ChatRole;
   content: string;
   ts:      number;
+  /**
+   * Set when the message is an error notice rather than content. The
+   * UI uses this to render an icon and a friendlier tone; the raw
+   * provider detail lives in errorRaw so a developer can still see it.
+   */
+  errorKind?: ChatErrorKind;
+  /** Raw provider text, kept for debugging. Not rendered by default. */
+  errorRaw?: string;
 }

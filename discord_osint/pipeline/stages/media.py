@@ -4,14 +4,13 @@ discord_osint/pipeline/stages/media.py
 MediaStage – download avatar images, extract EXIF metadata, and
 optionally run reverse-image search.
 
-Reads from ctx
---------------
-ctx.avatar_urls   – populated by DiscordModeStage and ScrapingStage
-
-Writes to ctx
--------------
-ctx.intel_core    – EXIF GPS coords, camera model, date taken,
-                    reverse-image search domain hits
+Permissions
+-----------
+The avatars directory is created with mode 0700 and chmod'd on entry
+so cached images — which contain the target's photographs and
+sometimes GPS EXIF — are not readable by other local users on a
+shared workstation. Individual files are chmod'd to 0600 by
+``download_avatar``.
 """
 
 from __future__ import annotations
@@ -20,8 +19,13 @@ import os
 
 from ..base import Stage, EmitFn
 from ..context import InvestigationContext
-from ...utils import CACHE_DIR
-from ...extras import download_avatar, extract_metadata, reverse_image_search
+from ...utils import CACHE_DIR, log_trace
+from ...extras import (
+    download_avatar,
+    extract_metadata,
+    reverse_image_search,
+    reverse_image_search_tineye,
+)
 
 
 class MediaStage(Stage):
@@ -38,7 +42,11 @@ class MediaStage(Stage):
         emit("progress", {"message": f"Processing {len(ctx.avatar_urls)} avatar image(s)"})
 
         avatar_dir = os.path.join(CACHE_DIR, "avatars")
-        os.makedirs(avatar_dir, exist_ok=True)
+        os.makedirs(avatar_dir, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(avatar_dir, 0o700)
+        except OSError:
+            pass
 
         avatar_files: list[str] = []
         for avatar_url in ctx.avatar_urls:
@@ -47,12 +55,13 @@ class MediaStage(Stage):
                 avatar_files.append(fpath)
                 emit("finding", {"type": "avatar_downloaded", "path": fpath})
 
+        tineye_key = (
+            getattr(cfg, "TINEYE_API_KEY", "") or ""
+        ) if getattr(cfg, "ENABLE_TINEYE", False) else ""
+
         for fpath in avatar_files:
             fname = os.path.basename(fpath)
 
-            # ---------------------------------------------------------------- #
-            # EXIF extraction                                                  #
-            # ---------------------------------------------------------------- #
             if cfg.ENABLE_EXIF:
                 meta = extract_metadata(fpath)
                 if meta:
@@ -77,20 +86,48 @@ class MediaStage(Stage):
                             "media", f"exif_camera_{fname}", camera, source="exif"
                         )
 
-            # ---------------------------------------------------------------- #
-            # Reverse image search                                             #
-            # ---------------------------------------------------------------- #
             if cfg.ENABLE_REVERSE_IMG:
-                results = reverse_image_search(fpath)
-                if results:
+                saucenao_results: list[str] = []
+                try:
+                    saucenao_results = reverse_image_search(fpath) or []
+                except Exception as exc:
+                    log_trace(f"MediaStage: saucenao raised "
+                              f"{type(exc).__name__}: {exc}")
+
+                if saucenao_results:
                     ctx.intel_core.add_intel(
-                        "media", f"reverse_img_{fname}", results, source="saucenao"
+                        "media", f"reverse_img_{fname}",
+                        saucenao_results, source="saucenao",
                     )
                     emit("finding", {
                         "type": "reverse_image",
                         "file": fname,
-                        "domains": results,
+                        "domains": saucenao_results,
+                        "provider": "saucenao",
                     })
-                    print(f"  Reverse image match domains: {results}")
+                    print(f"  SauceNAO match domains: {saucenao_results}")
+
+                if not saucenao_results and tineye_key:
+                    try:
+                        tineye_results = reverse_image_search_tineye(
+                            fpath, api_key=tineye_key,
+                        )
+                    except Exception as exc:
+                        log_trace(f"MediaStage: tineye raised "
+                                  f"{type(exc).__name__}: {exc}")
+                        tineye_results = []
+
+                    if tineye_results:
+                        ctx.intel_core.add_intel(
+                            "media", f"reverse_img_tineye_{fname}",
+                            tineye_results, source="tineye",
+                        )
+                        emit("finding", {
+                            "type": "reverse_image",
+                            "file": fname,
+                            "domains": tineye_results,
+                            "provider": "tineye",
+                        })
+                        print(f"  TinEye match domains: {tineye_results}")
 
         print(f"  Media stage complete. {len(avatar_files)} image(s) processed.")

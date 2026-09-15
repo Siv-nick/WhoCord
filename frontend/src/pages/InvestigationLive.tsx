@@ -1,14 +1,28 @@
 // src/pages/InvestigationLive.tsx
-import React, { useCallback, useReducer, useRef, useState } from "react";
+//
+// Legacy live view. Reads its params from nav state (passed by
+// Dashboard) and streams /run with POST + fetch + ReadableStream.
+//
+// Change log
+// ----------
+// - /run is POST-only as of Tier 2, item 1.2. Replaced the previous
+//   `useSSE(sseUrl, ...)` with an inline fetch loop that mirrors the
+//   pattern in hooks/useInvestigation.ts. The reducer, dispatch flow,
+//   and rendering are unchanged.
+// - Fixed a stale closure: the finding handler used to read
+//   `state.currentStage` captured at first render, so every finding
+//   was recorded with an empty stage. Now reads a ref that mirrors
+//   the current value.
+
+import React, { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { useSSE } from "../hooks/useSSE";
+import { apiFetch, runUrl, stopInvestigation } from "../utils/api";
 import LiveProgress from "../components/LiveProgress";
 import StageList from "../components/StageList";
 import ResultCard from "../components/ResultCard";
 import IntelCard from "../components/IntelCard";
 import PivotConfirmModal from "../components/PivotConfirmModal";
 import { Icon } from "../components/Icons";
-import { stopInvestigation } from "../utils/api";
 import type {
   Finding,
   FindingCategory,
@@ -16,6 +30,7 @@ import type {
   InvestigationState,
   PivotConfirmRequestPayload,
   PivotInfo,
+  RunParams,
   SSEEvent,
   StageState,
   StageStatus,
@@ -208,7 +223,6 @@ function reducer(state: ExtendedState, action: Action): ExtendedState {
       };
 
     case "STOP_FAILED":
-      // Server refused; assume we're still running.
       return {
         ...state,
         runStatus: "running",
@@ -225,7 +239,7 @@ function reducer(state: ExtendedState, action: Action): ExtendedState {
     case "SSE_INTERRUPTED":
       return {
         ...state,
-        logs: [...state.logs, "[sse] connection interrupted — retrying…"].slice(-500),
+        logs: [...state.logs, "[sse] connection interrupted"].slice(-500),
       };
 
     case "SSE_RECONNECTED":
@@ -254,7 +268,7 @@ export default function InvestigationLive() {
   const location  = useLocation();
   const navigate  = useNavigate();
   const nav_state = location.state as
-    | { sseUrl?: string; mode?: string; target?: string }
+    | { params?: RunParams; mode?: string; target?: string }
     | null;
 
   const [state, dispatch]       = useReducer(reducer, INITIAL);
@@ -262,19 +276,14 @@ export default function InvestigationLive() {
   const [curMsg, setCurMsg]     = useState("");
   const [stopBusy, setStopBusy] = useState(false);
   const logsEndRef              = useRef<HTMLDivElement>(null);
+  const abortRef                = useRef<AbortController | null>(null);
 
-  if (!nav_state?.sseUrl) {
-    return (
-      <div className="p-8">
-        <p className="text-zinc-400 text-sm mb-4">No investigation in progress.</p>
-        <button onClick={() => navigate("/")} className="btn btn-primary">
-          <Icon name="arrowLeft" size={12} /> Back to Dashboard
-        </button>
-      </div>
-    );
-  }
+  // Live mirror of currentStage so the finding handler doesn't read a
+  // stale closure value.
+  const currentStageRef = useRef<string | null>(null);
+  currentStageRef.current = state.currentStage;
 
-  const sseUrl = nav_state.sseUrl;
+  const params = nav_state?.params ?? null;
 
   const handleEvent = useCallback((event: SSEEvent) => {
     const p = event.payload as Record<string, unknown>;
@@ -312,7 +321,7 @@ export default function InvestigationLive() {
           type: "FINDING",
           finding: {
             id:        nextId(),
-            stage:     String(state.currentStage ?? ""),
+            stage:     String(currentStageRef.current ?? ""),
             type:      ftype,
             category:  categorise(ftype),
             label:     ftype,
@@ -374,7 +383,7 @@ export default function InvestigationLive() {
         dispatch({ type: "PIVOT_CONFIRM_RESOLVED" });
         dispatch({
           type: "LOG",
-          line: `[pivot] confirmation window elapsed at depth ${p.depth ?? "?"} — running full seed set`,
+          line: `[pivot] confirmation window elapsed at depth ${p.depth ?? "?"} — skipping seeds`,
         });
         break;
 
@@ -399,27 +408,107 @@ export default function InvestigationLive() {
         break;
       }
     }
-  }, [state.currentStage, nav_state]);
+  }, [nav_state]);
 
-  const { closeStream } = useSSE(sseUrl, {
-    onEvent: handleEvent,
-    onError:  () => dispatch({ type: "SSE_INTERRUPTED" }),
-    onReconnect: () => dispatch({ type: "SSE_RECONNECTED" }),
-    onGiveUp: () => dispatch({ type: "SSE_GIVE_UP" }),
-    closeOn:  ["stream_end", "error"],
-    maxRetries: 10,
-  });
+  // ------------------------------------------------------------------ //
+  // Stream lifecycle
+  // ------------------------------------------------------------------ //
+  useEffect(() => {
+    if (!params) return;
 
-  /**
-   * Stop button handler. Sends the stop signal to the server (which
-   * cancels the pipeline), then waits for the stream to deliver
-   * `stream_end` with status="cancelled". We do NOT close the stream
-   * here — we need it open to receive the terminal event.
-   *
-   * If the server refuses (job already finished), we log it and let the
-   * stream settle naturally. If the stream never settles (network),
-   * the user can refresh.
-   */
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    (async () => {
+      try {
+        const res = await apiFetch(runUrl(), {
+          method:  "POST",
+          headers: { "Content-Type": "application/json" },
+          body:    JSON.stringify(params),
+          signal:  controller.signal,
+        });
+
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          dispatch({ type: "LOG", line: `[error] /run returned HTTP ${res.status}: ${text.slice(0, 200)}` });
+          dispatch({ type: "STREAM_END", reportUrl: null, status: "error" });
+          return;
+        }
+
+        if (!res.body) {
+          dispatch({ type: "LOG", line: "[error] /run returned no response body" });
+          dispatch({ type: "STREAM_END", reportUrl: null, status: "error" });
+          return;
+        }
+
+        const reader  = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer    = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const raw = line.slice(6).trim();
+            if (!raw) continue;
+
+            let parsed: SSEEvent;
+            try {
+              parsed = JSON.parse(raw) as SSEEvent;
+            } catch {
+              dispatch({ type: "LOG", line: raw });
+              continue;
+            }
+
+            handleEvent(parsed);
+
+            if (parsed.type === "stream_end" || parsed.type === "error") {
+              return;
+            }
+          }
+        }
+
+        // Stream ended without a stream_end event. Settle to error so
+        // the UI doesn't stay on "running".
+        dispatch({ type: "STREAM_END", reportUrl: null, status: "error" });
+      } catch (err) {
+        if ((err as Error)?.name === "AbortError") {
+          return;
+        }
+        dispatch({ type: "LOG", line: `[sse] error: ${err}` });
+        dispatch({ type: "STREAM_END", reportUrl: null, status: "error" });
+      } finally {
+        if (abortRef.current === controller) {
+          abortRef.current = null;
+        }
+      }
+    })();
+
+    return () => {
+      controller.abort();
+    };
+  }, [params, handleEvent]);
+
+  if (!params) {
+    return (
+      <div className="p-8">
+        <p className="text-zinc-400 text-sm mb-4">No investigation in progress.</p>
+        <button onClick={() => navigate("/dashboard")} className="btn btn-primary">
+          <Icon name="arrowLeft" size={12} /> Back to Dashboard
+        </button>
+      </div>
+    );
+  }
+
+  // ------------------------------------------------------------------ //
+  // Stop button handler
+  // ------------------------------------------------------------------ //
   const handleStop = useCallback(async () => {
     if (stopBusy) return;
     setStopBusy(true);
@@ -431,19 +520,18 @@ export default function InvestigationLive() {
         type: "LOG",
         line: `[stop] server refused: ${result.error ?? "unknown"}`,
       });
-      // If the job is already finished the stream will close shortly;
-      // otherwise we revert to running.
       if (result.error && !result.error.includes("not running")) {
         dispatch({ type: "STOP_FAILED" });
       }
     }
 
-    // Safety: if the server never sends stream_end, give up after 20s
-    // and force the local UI back to a settled state.
+    // Safety: if the stream never delivers stream_end, give up after
+    // 20s and force the local UI to settle.
     setTimeout(() => {
       setStopBusy(false);
       if (state.runStatus === "stopping") {
-        closeStream();
+        abortRef.current?.abort();
+        abortRef.current = null;
         dispatch({
           type: "LOG",
           line: "[stop] worker did not confirm exit within 20s — closing local stream",
@@ -455,7 +543,7 @@ export default function InvestigationLive() {
         });
       }
     }, 20_000);
-  }, [stopBusy, state.jobId, state.runStatus, closeStream]);
+  }, [stopBusy, state.jobId, state.runStatus]);
 
   const intelFinding    = state.findings.find(f => f.type === "intelligence_report");
   const regularFindings = state.findings.filter(f => f.type !== "intelligence_report");
@@ -474,7 +562,6 @@ export default function InvestigationLive() {
   return (
     <div className="p-6 max-w-5xl mx-auto">
 
-      {/* Pivot confirmation modal */}
       {state.pivotConfirmPending && (
         <PivotConfirmModal
           payload={state.pivotConfirmPending}
@@ -482,10 +569,9 @@ export default function InvestigationLive() {
         />
       )}
 
-      {/* Header */}
       <div className="flex items-center gap-4 mb-6">
         <button
-          onClick={() => navigate("/")}
+          onClick={() => navigate("/dashboard")}
           className="btn btn-ghost !p-2"
           aria-label="Back"
         >
@@ -502,7 +588,6 @@ export default function InvestigationLive() {
           )}
         </div>
 
-        {/* Stop — shown while running OR stopping (with a distinct label) */}
         {(isRunning || isStopping) && (
           <button
             onClick={handleStop}
@@ -514,7 +599,6 @@ export default function InvestigationLive() {
           </button>
         )}
 
-        {/* Report link when finished */}
         {(isDone || isCancelled) && state.reportUrl && (
           <a
             href={state.reportUrl}
@@ -527,7 +611,6 @@ export default function InvestigationLive() {
         )}
       </div>
 
-      {/* Cancelled banner */}
       {isCancelled && (
         <div className="mb-4 rounded-xl border border-amber-500/30 bg-amber-500/10
                         px-4 py-3 text-amber-200 text-sm flex items-center gap-2">
@@ -536,7 +619,6 @@ export default function InvestigationLive() {
         </div>
       )}
 
-      {/* Progress */}
       <LiveProgress
         currentStage={state.currentStage}
         currentMessage={curMsg}
@@ -550,10 +632,8 @@ export default function InvestigationLive() {
         pivotDepth={state.pivotDepth}
       />
 
-      {/* Main layout */}
       <div className="mt-6 grid grid-cols-1 lg:grid-cols-[1fr_280px] gap-6 items-start">
 
-        {/* Findings feed */}
         <div className="space-y-3">
           {intelFinding && <IntelCard payload={intelFinding.payload} />}
           {regularFindings.length === 0 && !intelFinding && (
@@ -564,7 +644,6 @@ export default function InvestigationLive() {
           {regularFindings.map(f => <ResultCard key={f.id} finding={f} />)}
         </div>
 
-        {/* Sidebar: stage list + console */}
         <div className="space-y-4">
           <StageList stages={state.stages} pivots={state.pivots} />
 

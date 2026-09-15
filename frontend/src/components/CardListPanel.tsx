@@ -1,5 +1,5 @@
 // src/components/CardListPanel.tsx
-import React, { useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import type { GraphNode } from "../types/graph";
 import { entityIconName, MODULE_LABELS } from "../utils/classify";
 import { Icon } from "./Icons";
@@ -13,21 +13,34 @@ interface Props {
 
 type Layout = "list" | "grid";
 
-export default function CardListPanel({ nodes, onSelectNode, onClose, isOpen }: Props) {
+function CardListPanel({ nodes, onSelectNode, onClose, isOpen }: Props) {
   const [layout, setLayout]   = useState<Layout>("list");
   const [details, setDetails] = useState(false);
   const [q, setQ]             = useState("");
 
-  const filtered = q.trim()
-    ? nodes.filter(n => {
-        const k = q.toLowerCase();
-        return (
-          n.label.toLowerCase().includes(k) ||
-          n.entityType.toLowerCase().includes(k) ||
-          n.infoFields.some(f => f.value.toLowerCase().includes(k))
-        );
-      })
-    : nodes;
+  // Debounced copy of the query. Every keystroke used to re-scan every
+  // node (and every infoField of every node) synchronously during the
+  // input's own render. Fine on a small graph; not on a large one, and
+  // the scan ran even when this panel was closed, because it stays
+  // mounted and is hidden with width: 0.
+  const [debouncedQ, setDebouncedQ] = useState("");
+  useEffect(() => {
+    const t = window.setTimeout(() => setDebouncedQ(q), 120);
+    return () => window.clearTimeout(t);
+  }, [q]);
+
+  const filtered = useMemo(() => {
+    const k = debouncedQ.trim().toLowerCase();
+    if (!k) return nodes;
+    // Skip the scan entirely while the panel is closed — the result is
+    // not visible and will be recomputed when it opens.
+    if (!isOpen) return nodes;
+    return nodes.filter(n =>
+      n.label.toLowerCase().includes(k) ||
+      n.entityType.toLowerCase().includes(k) ||
+      n.infoFields.some(f => f.value.toLowerCase().includes(k)),
+    );
+  }, [nodes, debouncedQ, isOpen]);
 
   return (
     <div
@@ -215,3 +228,6 @@ function Card({
     </div>
   );
 }
+
+// Memoised: The node search filter runs over every node; this panel stays mounted while closed.
+export default React.memo(CardListPanel);

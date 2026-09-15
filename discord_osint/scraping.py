@@ -1,3 +1,19 @@
+"""
+discord_osint/scraping.py
+-------------------------
+Platform-specific and generic profile scraping.
+
+Change log
+----------
+- ``scrape_profile_info`` and ``scrape_generic_url`` construct one
+  ``BeautifulSoup`` per fetch and reuse it for the og:image lookup and
+  the Twitter name extraction. ``run_socid_extractor`` still receives
+  the raw HTML and does its own parse internally; that is a documented
+  partial optimization, not a claim of a full one.
+- SSRF guard on every fetch: ``safe_get_pinned``.
+- Platform support comes from ``discord_osint.platforms``.
+"""
+
 import re
 import tempfile
 import os
@@ -7,28 +23,23 @@ import subprocess as _sp
 import requests
 
 from urllib.parse import urlparse
-from bs4 import BeautifulSoup
-
-from . import utils
-from .utils import http_session, github_session, resilient_task
-from .utils.mosint_wrapper import mosint_confirms_link
-from .utils import clean_username
-from .utils.url_safety import safe_get, UnsafeURLError
-
-# ── Bug 3 fix: never bind tool flags at import time. ──────────────────
-from . import config as _config_module
-
-
-def _flag(name: str, default: bool = False) -> bool:
-    """Read a config flag dynamically (Bug 3 fix)."""
-    return bool(getattr(_config_module, name, default))
-
 
 try:
     from bs4 import BeautifulSoup
     BS4_AVAILABLE = True
 except ImportError:
     BS4_AVAILABLE = False
+
+from . import utils
+from .utils import http_session, github_session, resilient_task
+from .utils.mosint_wrapper import mosint_confirms_link
+from .utils import clean_username
+from .utils.url_safety import safe_get_pinned, UnsafeURLError
+from .platforms import PLATFORMS
+
+from . import config as _config_module
+from .config import get_flag as _flag
+
 
 DOMAINS_TO_SKIP_GENERIC = {
     "accounts.google.com", "docs.github.com", "api.github.com", "collector.github.com",
@@ -66,7 +77,6 @@ GENERIC_WORDS = {"the","and","for","you","your","this","that","with","from","the
                  "all","many","more","most","other","some","such","what","them","then","than"}
 
 
-# ── Fix: reject HTML escape artifacts like `u003eguidelines@...` ──────
 _ESCAPE_PREFIX_RE = re.compile(r'^u00[0-9a-f]{2}', re.IGNORECASE)
 
 
@@ -126,7 +136,6 @@ def looks_like_real_name_v2(name: str) -> bool:
 def is_valid_email(email):
     if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
         return False
-    # ── Fix: reject HTML escape artifacts (`u003e`, `u0026`, etc.) ─────
     local = email.split('@', 1)[0]
     if _ESCAPE_PREFIX_RE.match(local):
         return False
@@ -151,13 +160,11 @@ _EXTRA_BAD_EMAILS = {
 
 
 def is_valid_personal_email(email: str) -> bool:
-    """Return True only if the email looks like a real personal address."""
     if not is_valid_email(email):
         return False
     local, domain = email.split('@', 1)
     domain = domain.lower()
 
-    # ── Fix: reject HTML escape prefixes ──────────────────────────────
     if _ESCAPE_PREFIX_RE.match(local):
         return False
 
@@ -190,7 +197,6 @@ def is_valid_personal_email(email: str) -> bool:
 
 
 def is_email_linked_to_target(email: str, target_username: str) -> bool:
-    """Return True if *email* is plausibly linked to *target_username*."""
     if not target_username:
         return True
 
@@ -216,21 +222,29 @@ def run_socid_extractor(html: str) -> dict:
         return {}
 
 
+def _parse_html(html_text: str):
+    """
+    Construct a BeautifulSoup for *html_text*, or None if bs4 is
+    unavailable. Central helper so the two call sites in this module
+    share one implementation.
+    """
+    if not BS4_AVAILABLE:
+        return None
+    try:
+        return BeautifulSoup(html_text, "html.parser")
+    except Exception:
+        return None
+
+
 @resilient_task(max_retries=2)
 def scrape_profile_info(platform, username):
     """
     Scrape a known-platform profile.
 
-    Bug 8 fix: the returned dict now includes the extra GitHub fields
-    (location / company / followers / created_at / twitter_username /
-    public_repos / public_gists) that ScrapingStage._emit_enrichment
-    expects.
-
-    SSRF note: GitHub's API endpoint is a fixed host, so no guard is
-    needed there. The GitHub profile *HTML* fetch (for socid) and the
-    Twitter/Reddit/YouTube fetches are also fixed hosts. Only the
-    ``scrape_generic_url`` path and the derived-API fetches accept
-    arbitrary hosts and are guarded.
+    Platform support decision comes from the registry. One bs4 parse
+    per fetch is reused for og:image and Twitter name extraction.
+    ``run_socid_extractor`` still receives raw HTML and parses it
+    internally — a partial optimization, not a complete one.
     """
     info = {
         "name": "", "email": "", "bio": "", "blog": "",
@@ -238,8 +252,11 @@ def scrape_profile_info(platform, username):
         "location": "", "company": "", "followers": "", "created_at": "",
         "twitter_username": "", "public_repos": "", "public_gists": "",
     }
-    if platform in {"facebook", "instagram", "tiktok", "pinterest", "snapchat", "linkedin"}:
+
+    registry_platform = PLATFORMS.get(platform)
+    if registry_platform is None or not registry_platform.scrape_supported:
         return info
+
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
     if platform == "github":
@@ -264,7 +281,6 @@ def scrape_profile_info(platform, username):
                 info["blog"]   = data.get("blog")   or ""
                 info["avatar"] = data.get("avatar_url")
 
-                # Bug 8: extra GitHub fields
                 info["location"]         = data.get("location")         or ""
                 info["company"]          = data.get("company")          or ""
                 info["followers"]        = str(data.get("followers")    or "")
@@ -296,11 +312,9 @@ def scrape_profile_info(platform, username):
 
     clean_user = username.lstrip("@") if platform == "youtube" else username
     url_map = {
-        "twitter":   f"https://twitter.com/{clean_user}",
-        "instagram": f"https://instagram.com/{clean_user}",
-        "tiktok":    f"https://tiktok.com/@{clean_user}",
-        "reddit":    f"https://reddit.com/user/{clean_user}",
-        "youtube":   f"https://youtube.com/@{clean_user}",
+        "twitter": f"https://twitter.com/{clean_user}",
+        "reddit":  f"https://reddit.com/user/{clean_user}",
+        "youtube": f"https://youtube.com/@{clean_user}",
     }
     if platform in url_map:
         try:
@@ -315,9 +329,9 @@ def scrape_profile_info(platform, username):
                     personal_emails = [e for e in emails if is_valid_personal_email(e)]
                     if personal_emails:
                         info["email"] = personal_emails[0]
-                try:
-                    from bs4 import BeautifulSoup
-                    soup = BeautifulSoup(r.text, 'html.parser')
+
+                soup = _parse_html(r.text)
+                if soup is not None:
                     og_image = soup.find("meta", property="og:image")
                     if og_image:
                         info["avatar"] = og_image.get("content")
@@ -325,7 +339,7 @@ def scrape_profile_info(platform, username):
                         name_tag = soup.find("div", {"data-testid": "UserName"})
                         if name_tag:
                             info["name"] = (name_tag.text.strip() or "")
-                except ImportError:
+                else:
                     m = re.search(
                         r'<meta property="og:image" content="([^"]+)"', r.text,
                     )
@@ -341,13 +355,7 @@ def scrape_generic_url(url):
     """
     Fetch a generic profile URL discovered by the discovery stage.
 
-    SSRF guard
-    ----------
-    The URL comes from scraped content — it is attacker-controlled. Every
-    request goes through ``safe_get``, which rejects private / loopback /
-    link-local / metadata targets on the initial URL and on every
-    redirect hop. A profile that links to ``http://127.0.0.1:8080`` no
-    longer causes the tool to probe its own host.
+    SSRF guard: every request goes through ``safe_get_pinned``.
     """
     info = {
         "name": "", "email": "", "bio": "", "blog": url,
@@ -367,7 +375,7 @@ def scrape_generic_url(url):
 
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        r = safe_get(url, headers=headers, timeout=10)
+        r = safe_get_pinned(url, headers=headers, timeout=10)
         if r.status_code != 200:
             return info
 
@@ -411,14 +419,12 @@ def scrape_generic_url(url):
             if is_valid_personal_email(email):
                 info["email"] = email
                 break
-        try:
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(r.text, 'html.parser')
+
+        soup = _parse_html(r.text)
+        if soup is not None:
             og_img = soup.find("meta", property="og:image")
             if og_img:
                 info["avatar"] = og_img.get("content")
-        except Exception:
-            pass
     except UnsafeURLError as exc:
         print(f"  Generic scrape blocked for {url[:60]}: {exc}")
     except Exception:

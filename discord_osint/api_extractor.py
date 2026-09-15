@@ -7,11 +7,12 @@ responses discovered during an investigation.
 Change log
 ----------
 ``fetch_api()`` now routes every request through
-``utils.url_safety.safe_get``, which validates the target host (and
-every redirect hop) against private / loopback / link-local / metadata
-ranges. Previously a scraped profile could point the fetcher at
-``127.0.0.1`` or ``169.254.169.254`` and the response would be folded
-into the report.
+``utils.url_safety.safe_get_pinned``, which resolves DNS once, validates
+every address, and pins the actual TCP connect to the validated IP for
+the duration of the request. This closes the validate-then-reconnect
+TOCTOU where an attacker could flip the DNS record between validation
+and the fetch. TLS SNI is preserved end-to-end, so certificate
+verification still checks the original hostname.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
-from .utils.url_safety import safe_get, UnsafeURLError
+from .utils.url_safety import safe_get_pinned, UnsafeURLError
 
 # ── Trace into the active debug log (safe no-op if none is set up) ──
 try:
@@ -392,16 +393,13 @@ def fetch_api(url: str, timeout: int = 6) -> dict | list | None:
     """
     Fetch *url* and return its parsed JSON, or ``None`` on any failure.
 
-    Every decision point is logged via ``log_trace()`` so a run with
-    DEBUG on leaves an auditable trail in ``investigation_cache/debug_logs/``.
-
     SSRF guard
     ----------
-    Requests go through ``utils.url_safety.safe_get``, which rejects
-    private / loopback / link-local / metadata targets on the initial
-    URL and on every redirect hop. A scraped profile linking to
-    ``http://169.254.169.254/…`` or ``http://127.0.0.1:8080/admin`` is
-    dropped with a debug-log line rather than fetched.
+    Requests go through ``utils.url_safety.safe_get_pinned``, which
+    resolves once, validates every address, and pins the actual TCP
+    connect to the validated IP for the duration of the request. Every
+    redirect hop is re-validated and re-pinned. TLS SNI is preserved,
+    so certificate verification still checks the original hostname.
     """
     log_trace(f"fetch_api: --> GET {url}")
 
@@ -417,7 +415,7 @@ def fetch_api(url: str, timeout: int = 6) -> dict | list | None:
     }
 
     try:
-        r = safe_get(url, headers=headers, timeout=timeout)
+        r = safe_get_pinned(url, headers=headers, timeout=timeout)
     except UnsafeURLError as exc:
         log_trace(f"fetch_api: SSRF BLOCKED {url} — {exc}")
         return None

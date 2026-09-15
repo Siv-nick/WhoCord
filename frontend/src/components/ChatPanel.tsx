@@ -7,7 +7,7 @@ import type {
   PivotInfo,
 } from "../types/investigation";
 import { useChat } from "../hooks/useChat";
-import { Icon } from "./Icons";
+import { Icon, type IconName } from "./Icons";
 
 interface Props {
   isOpen:  boolean;
@@ -25,7 +25,89 @@ interface Props {
   invFindings?:   Finding[];
 }
 
+// ---------------------------------------------------------------------------
+// Error styling
+// ---------------------------------------------------------------------------
+
+const ERROR_STYLES: Record<
+  NonNullable<ChatMessage["errorKind"]>,
+  { icon: IconName; ring: string; text: string; label: string }
+> = {
+  not_configured: {
+    icon: "key",
+    ring: "border-amber-500/30 bg-amber-500/[.06]",
+    text: "text-amber-200",
+    label: "Configuration",
+  },
+  rate_limited: {
+    icon: "alert",
+    ring: "border-amber-500/30 bg-amber-500/[.06]",
+    text: "text-amber-200",
+    label: "Rate limited",
+  },
+  provider_error: {
+    icon: "alert",
+    ring: "border-rose-500/30 bg-rose-500/[.06]",
+    text: "text-rose-200",
+    label: "Provider error",
+  },
+  network: {
+    icon: "wifi",
+    ring: "border-rose-500/30 bg-rose-500/[.06]",
+    text: "text-rose-200",
+    label: "Network",
+  },
+};
+
+function ErrorBubble({ msg }: { msg: ChatMessage }) {
+  const [showRaw, setShowRaw] = useState(false);
+  const kind = msg.errorKind ?? "provider_error";
+  const style = ERROR_STYLES[kind];
+
+  return (
+    <div className={`flex justify-start mb-3 anim-rise`}>
+      <div
+        className={`max-w-[85%] rounded-2xl rounded-bl-md border px-3.5 py-2.5
+                    ${style.ring}`}
+      >
+        <div className="flex items-center gap-2 mb-1.5">
+          <span className={style.text}>
+            <Icon name={style.icon} size={13} />
+          </span>
+          <span className={`text-[10px] font-bold uppercase tracking-wider ${style.text}`}>
+            {style.label}
+          </span>
+        </div>
+        <p className="text-[12.5px] text-zinc-200 leading-relaxed">
+          {msg.content}
+        </p>
+        {msg.errorRaw && (
+          <>
+            <button
+              onClick={() => setShowRaw(v => !v)}
+              className="mt-2 text-[10px] text-zinc-500 hover:text-zinc-300
+                         underline-offset-2 hover:underline"
+            >
+              {showRaw ? "Hide details" : "Show details"}
+            </button>
+            {showRaw && (
+              <pre className="mt-1.5 text-[10px] font-mono text-zinc-500
+                              whitespace-pre-wrap break-all leading-relaxed">
+                {msg.errorRaw}
+              </pre>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function Bubble({ msg }: { msg: ChatMessage }) {
+  if (msg.role === "assistant" && msg.errorKind) {
+    return <ErrorBubble msg={msg} />;
+  }
+
   const isUser = msg.role === "user";
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"} mb-3 anim-rise`}>
@@ -53,7 +135,7 @@ function Bubble({ msg }: { msg: ChatMessage }) {
   );
 }
 
-export default function ChatPanel({
+function ChatPanel({
   isOpen, onClose, nodes, edges,
   invStatus, invStage, invJobId, invTarget, invMode,
   invPivotDepth, invPivots, invLogs, invFindings,
@@ -105,7 +187,6 @@ export default function ChatPanel({
         pointerEvents: isOpen ? "auto" : "none",
       }}
     >
-      {/* Header */}
       <div className="flex items-center gap-3 px-4 py-3.5 border-b border-edge-0 shrink-0">
         <div className="relative">
           <div className="h-8 w-8 rounded-lg flex items-center justify-center
@@ -133,7 +214,6 @@ export default function ChatPanel({
         </button>
       </div>
 
-      {/* Context pill */}
       <div className="px-4 pt-3 pb-1 shrink-0">
         <div className="flex items-center gap-2 rounded-lg border border-violet-500/20
                         bg-violet-500/[.06] px-3 py-1.5">
@@ -148,7 +228,6 @@ export default function ChatPanel({
         </div>
       </div>
 
-      {/* Messages */}
       <div className="flex-1 overflow-y-auto px-4 py-3">
         {messages.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full gap-4 text-center anim-in">
@@ -188,7 +267,6 @@ export default function ChatPanel({
         )}
       </div>
 
-      {/* Composer */}
       <div className="px-3 pb-4 pt-2 border-t border-edge-0 shrink-0">
         <div className="flex items-end gap-2 rounded-xl border border-edge-1
                         bg-ink-850 px-3 py-2 transition-all
@@ -228,3 +306,6 @@ export default function ChatPanel({
     </div>
   );
 }
+
+// Memoised: Stays mounted while closed and holds streaming chat state.
+export default React.memo(ChatPanel);

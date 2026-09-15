@@ -1,4 +1,14 @@
 // src/hooks/useChat.ts
+//
+// Change log
+// ----------
+// - Stream errors are now classified. The LLM endpoint and the
+//   pipeline emit bracketed markers ([LLM 500: …], [LLM 429: …],
+//   [Stream error: …]) as ordinary token text. A non-technical user
+//   seeing raw HTTP status codes has no idea what to do. Messages now
+//   carry an errorKind and a friendly message; the raw detail is kept
+//   in a separate field for developers.
+
 import { useCallback, useRef, useState } from "react";
 import type { ChatMessage, GraphEdge, GraphNode } from "../types/graph";
 import type {
@@ -6,6 +16,7 @@ import type {
   InvestigationStatus,
   PivotInfo,
 } from "../types/investigation";
+import { apiFetch } from "../utils/api";
 
 let _msgSeq = 0;
 const newMsgId = () => `msg_${++_msgSeq}_${Date.now()}`;
@@ -39,6 +50,87 @@ interface UseChatResult {
   clearChat: () => void;
 }
 
+// ---------------------------------------------------------------------------
+// Error classification
+// ---------------------------------------------------------------------------
+
+type ErrorKind = "not_configured" | "rate_limited" | "provider_error" | "network";
+
+interface ClassifiedError {
+  kind:     ErrorKind;
+  friendly: string;
+  detail:   string;
+}
+
+const _LLM_ERR_RE = /^\[LLM (\d{3}): ([\s\S]*)\]$/;
+const _STREAM_ERR_RE = /^\[Stream error: ([\s\S]*)\]$/;
+
+function classifyErrorMarker(raw: string): ClassifiedError | null {
+  const llm = raw.match(_LLM_ERR_RE);
+  if (llm) {
+    const status = Number(llm[1]);
+    const detail = llm[2].trim();
+    if (status === 401 || status === 403) {
+      return {
+        kind: "not_configured",
+        friendly:
+          "The AI provider rejected the request. Check that the API key " +
+          "stored in Configuration is still valid.",
+        detail,
+      };
+    }
+    if (status === 429) {
+      return {
+        kind: "rate_limited",
+        friendly:
+          "The AI provider is rate-limiting requests. Wait a moment and " +
+          "try again — or switch to a smaller model in Configuration.",
+        detail,
+      };
+    }
+    if (status === 503) {
+      return {
+        kind: "not_configured",
+        friendly:
+          "No AI provider is configured. Add an API key in Configuration " +
+          "to enable the chat.",
+        detail,
+      };
+    }
+    if (status >= 500) {
+      return {
+        kind: "provider_error",
+        friendly:
+          "The AI provider returned an error. This is usually transient — " +
+          "try again in a few seconds.",
+        detail,
+      };
+    }
+    return {
+      kind: "provider_error",
+      friendly: `The AI provider returned HTTP ${status}.`,
+      detail,
+    };
+  }
+
+  const stream = raw.match(_STREAM_ERR_RE);
+  if (stream) {
+    return {
+      kind: "network",
+      friendly:
+        "The connection to the AI provider was interrupted. Check your " +
+        "network and try again.",
+      detail: stream[1].trim(),
+    };
+  }
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Payload trimming
+// ---------------------------------------------------------------------------
+
 function trimRawData(raw: unknown, maxKeys = 12, maxChars = 120): Record<string, unknown> {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const out: Record<string, unknown> = {};
@@ -52,6 +144,10 @@ function trimRawData(raw: unknown, maxKeys = 12, maxChars = 120): Record<string,
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// Hook
+// ---------------------------------------------------------------------------
 
 export function useChat(): UseChatResult {
   const [messages,  setMessages]  = useState<ChatMessage[]>([]);
@@ -135,8 +231,55 @@ export function useChat(): UseChatResult {
       },
     };
 
+    // Accumulate the raw stream separately from what we display, so we
+    // can classify the first chunk if it turns out to be an error
+    // marker rather than real content.
+    let accumulated = "";
+    let classified: ClassifiedError | null = null;
+
+    // Tokens arrive one SSE line at a time. Committing each one to
+    // state re-copied the whole messages array and re-rendered the
+    // chat tree per token — several hundred renders for a normal
+    // response, all while the canvas is mounted alongside. Coalesce
+    // into one commit per animation frame instead; the text still
+    // appears to stream, but at the display's refresh rate rather
+    // than the model's token rate.
+    let flushPending: number | null = null;
+
+    const commit = () => {
+      flushPending = null;
+      setMessages(prev =>
+        prev.map(m => {
+          if (m.id !== assistantId) return m;
+          if (classified) {
+            return {
+              ...m,
+              content:   classified.friendly,
+              errorKind: classified.kind,
+              errorRaw:  classified.detail,
+            };
+          }
+          return { ...m, content: accumulated };
+        }),
+      );
+    };
+
+    const flushAccumulated = () => {
+      if (flushPending !== null) return;
+      flushPending = requestAnimationFrame(commit);
+    };
+
+    /** Force an immediate commit and drop any queued frame. */
+    const flushNow = () => {
+      if (flushPending !== null) {
+        cancelAnimationFrame(flushPending);
+        flushPending = null;
+      }
+      commit();
+    };
+
     try {
-      const res = await fetch("/api/ai/chat", {
+      const res = await apiFetch("/api/ai/chat", {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
         body:    JSON.stringify(body),
@@ -166,34 +309,62 @@ export function useChat(): UseChatResult {
           try {
             const token = JSON.parse(raw) as { token?: string; text?: string };
             const chunk = token.token ?? token.text ?? "";
-            if (chunk) {
-              setMessages(prev =>
-                prev.map(m =>
-                  m.id === assistantId
-                    ? { ...m, content: m.content + chunk }
-                    : m,
-                ),
-              );
+            if (!chunk) continue;
+
+            accumulated += chunk;
+
+            // Classify as soon as we have a candidate marker.
+            if (!classified) {
+              const c = classifyErrorMarker(accumulated.trim());
+              if (c) {
+                classified = c;
+              }
             }
+
+            flushAccumulated();
           } catch {
             if (raw) {
-              setMessages(prev =>
-                prev.map(m =>
-                  m.id === assistantId
-                    ? { ...m, content: m.content + raw }
-                    : m,
-                ),
-              );
+              accumulated += raw;
+              flushAccumulated();
             }
           }
         }
       }
+
+      // Final pass — the accumulated string might have only become a
+      // complete marker on the last chunk.
+      if (!classified) {
+        const c = classifyErrorMarker(accumulated.trim());
+        if (c) {
+          classified = c;
+        }
+      }
+      // The stream is finished; commit synchronously so the last tokens
+      // cannot be stranded in a frame that never runs (e.g. the tab is
+      // backgrounded, where rAF is throttled or paused entirely).
+      flushNow();
     } catch (err: unknown) {
-      if ((err as Error)?.name !== "AbortError") {
+      // Drop any queued frame first: it would otherwise land after the
+      // error message below and overwrite it with partial content.
+      if (flushPending !== null) {
+        cancelAnimationFrame(flushPending);
+        flushPending = null;
+      }
+      if ((err as Error)?.name === "AbortError") {
+        // User cancelled — keep whatever had already streamed in.
+        commit();
+      } else {
         setMessages(prev =>
           prev.map(m =>
             m.id === assistantId
-              ? { ...m, content: "⚠️ Error: could not reach the AI endpoint." }
+              ? {
+                  ...m,
+                  content:
+                    "Could not reach the AI endpoint. The server may be " +
+                    "unavailable — try again in a moment.",
+                  errorKind: "network" as ErrorKind,
+                  errorRaw:  String(err),
+                }
               : m,
           ),
         );

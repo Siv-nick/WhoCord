@@ -50,13 +50,15 @@ export default function PivotConfirmModal({ payload, onClose }: Props) {
     onClose();
   }, [submitting, job_id, onClose, clearTimer]);
 
-  // Countdown
+  // Countdown to auto-skip. The server treats an unanswered prompt as
+  // "run zero seeds" and the client must match — an auto-approve here
+  // would let a slow user silently approve pivots they never saw.
   useEffect(() => {
     timerRef.current = setInterval(() => {
       setCD(prev => {
         if (prev <= 1) {
           clearTimer();
-          handleRun(true);
+          handleSkipAll();
           return 0;
         }
         return prev - 1;
@@ -82,7 +84,6 @@ export default function PivotConfirmModal({ payload, onClose }: Props) {
                     bg-black/70 backdrop-blur-sm anim-in">
       <div className="w-full max-w-md mx-4 surface anim-pop overflow-hidden">
 
-        {/* Header */}
         <div className="px-5 py-4 border-b border-edge-0
                         bg-gradient-to-r from-emerald-500/[.06] to-transparent">
           <div className="flex items-center gap-2 mb-1">
@@ -96,14 +97,15 @@ export default function PivotConfirmModal({ payload, onClose }: Props) {
             </span>
           </div>
           <p className="text-[11px] text-zinc-400 leading-relaxed mt-1">
-            New seeds were discovered. Select which to investigate, or skip all.
+            New seeds were discovered. Select which to investigate. If you
+            do not respond within {timeout_seconds}s, the investigation
+            continues without running any pivot seeds.
           </p>
         </div>
 
-        {/* Countdown bar */}
         <div className="px-5 pt-3">
           <div className="flex items-center justify-between text-[11px] text-zinc-500 mb-1">
-            <span>Auto-running in {countdown}s</span>
+            <span>Auto-skipping in {countdown}s</span>
             <span className="tabular-nums">
               {seeds.filter(s => checked.has(s.value)).length} / {seeds.length} selected
             </span>
@@ -116,7 +118,6 @@ export default function PivotConfirmModal({ payload, onClose }: Props) {
           </div>
         </div>
 
-        {/* Seeds */}
         <div className="px-5 py-4 space-y-2 max-h-72 overflow-y-auto">
           {seeds.map(seed => {
             const isChecked = checked.has(seed.value);
@@ -160,7 +161,6 @@ export default function PivotConfirmModal({ payload, onClose }: Props) {
           })}
         </div>
 
-        {/* Actions */}
         <div className="px-5 pb-5 flex gap-3 border-t border-edge-0 pt-4">
           <button
             onClick={() => handleRun(false)}

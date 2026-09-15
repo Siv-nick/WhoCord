@@ -6,14 +6,23 @@ Generate a structured AI intelligence narrative.
 Provider-agnostic
 -----------------
 The endpoint URL, API key, and extra headers are resolved at call time
-from ``config_service.get_llm_endpoint()``, so switching between Groq
-and OpenRouter is a config-key change, not a code change.
+from ``config_service.get_llm_endpoint(cfg)``, so switching providers
+is a config-key change, not a code change.
+
+Per-job config
+--------------
+``generate_narrative`` accepts an optional ``config`` object. When
+supplied, every read of an LLM setting comes from that object.
+
+Audit events
+------------
+When a ``log`` is passed, a ``third_party_contacted`` event is emitted
+after each LLM call. Fields: service, endpoint, model, bytes_sent,
+bytes_received, ok. Phase 2 will consume these for the audit log.
 
 Prompt-injection hardening
 --------------------------
-Every scraped string that reaches the model — bios, names, locations,
-GHunt output, page titles/descriptions, pivot sub-report summaries, raw
-intel dumps — is routed through ``_wrap_untrusted()``.
+Every scraped string is routed through ``_wrap_untrusted()``.
 """
 
 from __future__ import annotations
@@ -21,7 +30,7 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
-from typing import Any
+from typing import Any, Optional
 
 import requests
 
@@ -29,10 +38,6 @@ from .entities import BaseEntity
 from .correlations import Correlation
 from ..config_service import get_llm_endpoint
 
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 
 _LLM_MODEL_FALLBACK = "llama3-8b-8192"
 _MAX_TOKENS_CAP = 6000
@@ -64,10 +69,6 @@ _DEFAULT_SYSTEM_PROMPT = (
     + _UNTRUSTED_DATA_RULES
 )
 
-
-# ---------------------------------------------------------------------------
-# Untrusted-data wrapping
-# ---------------------------------------------------------------------------
 
 _CONTROL_RE = re.compile(
     r"[\x00-\x08\x0b-\x1f\x7f"
@@ -108,15 +109,14 @@ def _wrap_untrusted(text: Any, source: str, cap: int = 500) -> str:
     return f'<untrusted_data source="{source}">{cleaned}</untrusted_data>'
 
 
-# ---------------------------------------------------------------------------
-# LLM settings
-# ---------------------------------------------------------------------------
-
-def _llm_settings() -> tuple[str, float, int, str, int, bool, bool]:
-    try:
-        from ..config import config as _cfg
-    except Exception:
-        return (_LLM_MODEL_FALLBACK, 0.25, 6000, "", 40000, True, True)
+def _llm_settings(cfg: Any = None) -> tuple[str, float, int, str, int, bool, bool]:
+    """Return (model, temp, max_tokens, prompt, budget, raw, meta)."""
+    if cfg is None:
+        try:
+            from ..config import config as _cfg
+            cfg = _cfg
+        except Exception:
+            return (_LLM_MODEL_FALLBACK, 0.25, 6000, "", 40000, True, True)
 
     def _f(v, d):
         try:
@@ -137,19 +137,15 @@ def _llm_settings() -> tuple[str, float, int, str, int, bool, bool]:
             return v.strip().lower() in ("1", "true", "yes", "on")
         return bool(v)
 
-    model  = getattr(_cfg, "LLM_MODEL", _LLM_MODEL_FALLBACK) or _LLM_MODEL_FALLBACK
-    temp   = _f(getattr(_cfg, "LLM_TEMPERATURE", 0.25), 0.25)
-    tokens = _i(getattr(_cfg, "LLM_MAX_TOKENS", 6000), 6000)
-    prompt = getattr(_cfg, "LLM_SYSTEM_PROMPT", "") or ""
-    budget = _i(getattr(_cfg, "LLM_INTEL_BUDGET", 40000), 40000)
-    raw    = _b(getattr(_cfg, "LLM_INTEL_INCLUDE_RAW", True), True)
-    meta   = _b(getattr(_cfg, "LLM_INTEL_EXCLUDE_META", True), True)
+    model  = getattr(cfg, "LLM_MODEL", _LLM_MODEL_FALLBACK) or _LLM_MODEL_FALLBACK
+    temp   = _f(getattr(cfg, "LLM_TEMPERATURE", 0.25), 0.25)
+    tokens = _i(getattr(cfg, "LLM_MAX_TOKENS", 6000), 6000)
+    prompt = getattr(cfg, "LLM_SYSTEM_PROMPT", "") or ""
+    budget = _i(getattr(cfg, "LLM_INTEL_BUDGET", 40000), 40000)
+    raw    = _b(getattr(cfg, "LLM_INTEL_INCLUDE_RAW", True), True)
+    meta   = _b(getattr(cfg, "LLM_INTEL_EXCLUDE_META", True), True)
     return model, temp, tokens, prompt, budget, raw, meta
 
-
-# ---------------------------------------------------------------------------
-# Prompt construction (unchanged from previous revision)
-# ---------------------------------------------------------------------------
 
 def _fmt_entities(entities: list[BaseEntity], limit: int = 15) -> str:
     top = sorted(entities, key=lambda e: e.confidence, reverse=True)[:limit]
@@ -412,10 +408,6 @@ def _build_prompt(
     return "\n".join(prompt_parts)
 
 
-# ---------------------------------------------------------------------------
-# JSON parsing helpers
-# ---------------------------------------------------------------------------
-
 def _strip_fences(text: str) -> str:
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
@@ -431,9 +423,16 @@ def _extract_json(text: str) -> str:
     return text
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+def _provider_label(cfg: Any) -> str:
+    """Return 'groq' or 'openrouter' for the audit event."""
+    if cfg is None:
+        try:
+            from ..config import config as _cfg
+            cfg = _cfg
+        except Exception:
+            return "unknown"
+    return (getattr(cfg, "LLM_PROVIDER", "groq") or "groq").strip().lower()
+
 
 def generate_narrative(
     graph_summary: dict,
@@ -441,15 +440,24 @@ def generate_narrative(
     entities: list[BaseEntity],
     intel: dict[str, Any],
     groq_api_key: str = "",
+    config: Any = None,
+    log: Optional[Any] = None,
 ) -> dict:
     """
     Call the active LLM provider and return a parsed narrative dict.
 
-    The *groq_api_key* argument is retained for backwards compatibility
-    but ignored — the active provider and its key come from the config
-    via ``get_llm_endpoint()``.
+    Parameters
+    ----------
+    groq_api_key:
+        Retained for backwards compatibility; ignored.
+    config:
+        Optional per-job config object.
+    log:
+        Optional StructuredLogger. When supplied, a
+        ``third_party_contacted`` event is emitted after the call with
+        the service, endpoint, model, and byte counts.
     """
-    base_url, api_key, extra_headers = get_llm_endpoint()
+    base_url, api_key, extra_headers = get_llm_endpoint(config)
     if not api_key:
         return {}
 
@@ -458,7 +466,7 @@ def generate_narrative(
     from .intel_dump import build_intel_dump
 
     model, temp, tokens, custom_prompt, budget, include_raw, exclude_meta = \
-        _llm_settings()
+        _llm_settings(config)
 
     dump = build_intel_dump(
         intel,
@@ -491,10 +499,51 @@ def generate_narrative(
     url = f"{base_url}/chat/completions"
 
     try:
+        bytes_sent = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    except Exception:
+        bytes_sent = 0
+
+    ok = False
+    bytes_received = 0
+    status_code = 0
+
+    try:
         resp = requests.post(url, headers=headers, json=payload, timeout=90)
+        status_code = resp.status_code
+        bytes_received = len(resp.content)
+        ok = resp.status_code == 200
     except requests.RequestException as exc:
         print(f"  [!] Narrative – network error: {exc}")
+        if log is not None:
+            try:
+                log.event(
+                    "third_party_contacted",
+                    service=_provider_label(config),
+                    endpoint="chat/completions",
+                    model=model,
+                    bytes_sent=bytes_sent,
+                    bytes_received=0,
+                    ok=False,
+                    error=type(exc).__name__,
+                )
+            except Exception:
+                pass
         return {}
+
+    if log is not None:
+        try:
+            log.event(
+                "third_party_contacted",
+                service=_provider_label(config),
+                endpoint="chat/completions",
+                model=model,
+                bytes_sent=bytes_sent,
+                bytes_received=bytes_received,
+                status=status_code,
+                ok=ok,
+            )
+        except Exception:
+            pass
 
     if resp.status_code != 200:
         print(f"  [!] Narrative – LLM API {resp.status_code}: {resp.text[:200]}")

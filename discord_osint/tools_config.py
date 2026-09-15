@@ -6,10 +6,16 @@ web UI both render.
 
 Change log
 ----------
-- Added ``ENABLE_APOLLO`` and ``ENABLE_LUSHA``. Both default to off; the
-  descriptions make the paid-credit nature explicit so an analyst does
-  not enable them without understanding the cost.
+- Phase 4: added ``ENABLE_CORD_CAT``. Off by default; requires a
+  stored ``CORD_CAT_API_KEY``. Description names the sources the
+  lookup returns so an operator knows what they are enabling.
+- Added ``ENABLE_APOLLO`` and ``ENABLE_LUSHA``. Both default to off;
+  the descriptions make the paid-credit nature explicit so an analyst
+  does not enable them without understanding the cost.
 - HIBP description now states that a v3 API key is required.
+- Added ``ENABLE_TINEYE``. Off by default; requires a stored
+  ``TINEYE_API_KEY``. Complementary to SauceNAO (photographs vs
+  illustrations).
 """
 
 TOOLS_LIST = [
@@ -48,6 +54,10 @@ TOOLS_LIST = [
     # ── Paid contact-enrichment providers (both default OFF) ──────────
     ("ENABLE_APOLLO", "Apollo.io enrichment (PAID CREDITS — requires APOLLO_API_KEY)"),
     ("ENABLE_LUSHA",  "Lusha enrichment (PAID CREDITS — requires LUSHA_API_KEY)"),
+    # ── CordCat (Discord OSINT; free tier available) ──────────────────
+    ("ENABLE_CORD_CAT", "CordCat (Discord profile + breach + FiveM + EU DSA — requires CORD_CAT_API_KEY)"),
+    # ── TinEye (reverse image; paid API tier) ─────────────────────────
+    ("ENABLE_TINEYE",   "TinEye reverse image (PAID API — requires TINEYE_API_KEY)"),
     ("ENABLE_SHERLOCK", "[deprecated] Sherlock — replaced by User Scanner"),
     ("ENABLE_NAMINTER", "[deprecated] Naminter — replaced by User Scanner"),
     ("ENABLE_SOCIAL_ANALYZER", "[deprecated] Social Analyzer — replaced by User Scanner"),

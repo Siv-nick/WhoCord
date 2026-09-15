@@ -1,9 +1,11 @@
+import contextvars
 import json
 import os
 import sys
 
 import keyring
 
+from .errors import ConfigurationError
 from .utils import get_base_dir, get_data_dir
 
 CONFIG_FILE = os.path.join(get_base_dir(), "config.json")
@@ -22,6 +24,12 @@ DEFAULT_CONFIG = {
     "ENABLE_LUSHA":           False,
     "ENRICHMENT_MAX_IDENTIFIERS": 25,
     "ENABLE_ENRICHMENT_PHONE_REVEAL": False,
+    # ── CordCat (opt-in) ──────────────────────────────────────────────
+    "CORD_CAT_API_KEY":       "",
+    "ENABLE_CORD_CAT":        False,
+    # ── TinEye (opt-in; paid API tier) ────────────────────────────────
+    "TINEYE_API_KEY":         "",
+    "ENABLE_TINEYE":          False,
     "MULTI_GUILD_SEARCH":     False,
     "SKIP_GITHUB":            False,
     "ENABLE_USER_SCANNER":    True,
@@ -85,10 +93,31 @@ DEFAULT_CONFIG = {
     "LLM_MAX_TOKENS":         4096,
     "LLM_SYSTEM_PROMPT":      "",
 
+    # ── Cost tracking ───────────────────────────────────────────────────
+    # USD per 1,000 tokens. Leave at 0.0 to disable cost display and
+    # track token counts only.
+    "LLM_COST_PER_1K_INPUT":  0.0,
+    "LLM_COST_PER_1K_OUTPUT": 0.0,
+
+    # ── Spend caps ──────────────────────────────────────────────────────
+    # Hard ceilings for a single investigation. 0.0 = no cap. When a
+    # cap is reached, the pipeline aborts at the next checkpoint.
+    "MAX_LLM_SPEND_USD":      0.0,
+    "MAX_ENRICHMENT_CREDITS": 0.0,
+
     # ── Intel dump controls ─────────────────────────────────────────────
     "LLM_INTEL_BUDGET":       60000,
     "LLM_INTEL_INCLUDE_RAW":  True,
     "LLM_INTEL_EXCLUDE_META": True,
+
+    # ── Report redaction ────────────────────────────────────────────────
+    # List of finding ``type`` strings to strip from the HTML report
+    # before it is written. Empty list = no redaction.
+    "REDACTED_FINDINGS":      [],
+
+    # ── Retention ───────────────────────────────────────────────────────
+    # 0 = never auto-purge. Any positive integer is a number of days.
+    "RETENTION_DAYS":         0,
 
     # Deprecated — kept so old config.json files don't crash
     "ENABLE_SHERLOCK":        False,
@@ -105,9 +134,11 @@ SENSITIVE_KEYS = {
     "HIBP_API_KEY":       "discord-osint/hibp",
     "APOLLO_API_KEY":     "discord-osint/apollo",
     "LUSHA_API_KEY":      "discord-osint/lusha",
+    "CORD_CAT_API_KEY":   "discord-osint/cordcat",
+    "TINEYE_API_KEY":     "discord-osint/tineye",
 }
 
-# Module‑level globals (kept in sync by Config class)
+# Module‑level globals (kept in sync by Config class for the CLI path).
 USER_TOKEN          = ""
 GITHUB_TOKEN        = ""
 GROQ_API_KEY        = ""
@@ -116,8 +147,12 @@ INSTAGRAM_SESSION   = ""
 HIBP_API_KEY        = ""
 APOLLO_API_KEY      = ""
 LUSHA_API_KEY       = ""
+CORD_CAT_API_KEY    = ""
+TINEYE_API_KEY      = ""
 ENABLE_APOLLO       = False
 ENABLE_LUSHA        = False
+ENABLE_CORD_CAT     = False
+ENABLE_TINEYE       = False
 ENRICHMENT_MAX_IDENTIFIERS = 25
 ENABLE_ENRICHMENT_PHONE_REVEAL = False
 MULTI_GUILD_SEARCH  = False
@@ -176,7 +211,6 @@ PROBE_STRING        = ""
 OUTPUT_FORMAT       = "html"
 DEBUG               = False
 
-# LLM globals
 LLM_PROVIDER          = "groq"
 LLM_MODEL             = "llama3-8b-8192"
 LLM_TEMPERATURE       = 0.25
@@ -186,10 +220,59 @@ LLM_INTEL_BUDGET      = 60000
 LLM_INTEL_INCLUDE_RAW = True
 LLM_INTEL_EXCLUDE_META = True
 
-# Deprecated
+LLM_COST_PER_1K_INPUT  = 0.0
+LLM_COST_PER_1K_OUTPUT = 0.0
+
+MAX_LLM_SPEND_USD      = 0.0
+MAX_ENRICHMENT_CREDITS = 0.0
+
+REDACTED_FINDINGS      = []
+
+RETENTION_DAYS        = 0
+
 ENABLE_SHERLOCK     = False
 ENABLE_NAMINTER     = False
 ENABLE_SOCIAL_ANALYZER = False
+
+
+def _require_keyring_from_env() -> bool:
+    v = os.environ.get("WHOCORD_REQUIRE_KEYRING", "0")
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _coerce_env(raw: str, default):
+    """
+    Coerce an environment-variable string to the type of the default
+    value.
+
+    Without this, every env override is stored as a string, and
+    ``get_flag``'s ``bool(...)`` treats ``DEBUG=0`` as truthy. That is
+    a real correctness bug: an operator who exports ``DEBUG=0`` thinks
+    they disabled verbose logging and gets it anyway.
+    """
+    if isinstance(default, bool):
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+    if isinstance(default, int) and not isinstance(default, bool):
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return default
+
+    if isinstance(default, float):
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return default
+
+    if isinstance(default, list):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, list) else default
+        except Exception:
+            return [s.strip() for s in str(raw).split(",") if s.strip()]
+
+    return raw
 
 
 def _sync_globals_from_dict(data):
@@ -201,8 +284,17 @@ def _sync_globals_from_dict(data):
 
 
 class Config:
-    def __init__(self, config_file=CONFIG_FILE):
+    def __init__(
+        self,
+        config_file=CONFIG_FILE,
+        require_keyring: bool | None = None,
+    ):
         self._config_file = config_file
+        self._require_keyring = (
+            _require_keyring_from_env()
+            if require_keyring is None
+            else require_keyring
+        )
         self._data = {
             k: (list(v) if isinstance(v, list) else v)
             for k, v in DEFAULT_CONFIG.items()
@@ -210,13 +302,12 @@ class Config:
         self._load()
 
     def _load(self):
-        # 1. Environment variables first.
-        for key in DEFAULT_CONFIG:
+        # Env overrides, coerced to the type of the default.
+        for key, default in DEFAULT_CONFIG.items():
             env_val = os.environ.get(key)
             if env_val is not None:
-                self._data[key] = env_val
+                self._data[key] = _coerce_env(env_val, default)
 
-        # 2. File overrides (non-sensitive keys only).
         if os.path.exists(self._config_file):
             try:
                 with open(self._config_file, 'r', encoding='utf-8') as f:
@@ -239,29 +330,63 @@ class Config:
                     file=sys.stderr,
                 )
 
-        # 3. Sensitive keys: env var wins, else keyring.
         for key, service in SENSITIVE_KEYS.items():
             env_val = os.environ.get(key)
             if env_val:
                 self._data[key] = env_val
-            else:
-                try:
-                    stored = keyring.get_password(service, key)
-                except Exception as exc:
-                    print(
-                        f"[config] WARNING: keyring read failed for {key}: {exc}",
-                        file=sys.stderr,
-                    )
-                    stored = None
-                if stored:
-                    self._data[key] = stored
+                continue
+
+            try:
+                stored = keyring.get_password(service, key)
+            except Exception as exc:
+                if self._require_keyring:
+                    raise ConfigurationError(
+                        f"keyring backend unavailable for {key} "
+                        f"({type(exc).__name__}: {exc}); set "
+                        f"WHOCORD_REQUIRE_KEYRING=0 to allow empty keys"
+                    ) from exc
+                print(
+                    f"[config] WARNING: keyring read failed for {key}: {exc}",
+                    file=sys.stderr,
+                )
+                print(
+                    "[config]          sensitive keys will be empty. "
+                    "Set WHOCORD_REQUIRE_KEYRING=1 to fail hard instead.",
+                    file=sys.stderr,
+                )
+                stored = None
+
+            if stored:
+                self._data[key] = stored
 
         _sync_globals_from_dict(self._data)
 
     def save(self):
+        """
+        Write the non-sensitive config to disk with restrictive
+        permissions (dir 0700, file 0600).
+
+        The file contains the last investigation's target identifiers
+        (username, email, domain, phone, URL) and is world-readable
+        under a default umask. On a shared workstation that exposes
+        every case's target to every local user.
+        """
         clean = {k: v for k, v in self._data.items() if k not in SENSITIVE_KEYS}
+
+        parent = os.path.dirname(self._config_file) or "."
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(parent, 0o700)
+        except OSError:
+            pass
+
         with open(self._config_file, 'w', encoding='utf-8') as f:
             json.dump(clean, f, indent=2)
+        try:
+            os.chmod(self._config_file, 0o600)
+        except OSError:
+            pass
+
         for key, service in SENSITIVE_KEYS.items():
             value = self._data[key]
             if value:
@@ -301,3 +426,61 @@ class Config:
 
 
 config = Config()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Per-job config snapshot
+# ──────────────────────────────────────────────────────────────────────
+
+class JobConfig:
+    """A per-investigation config snapshot."""
+
+    def __init__(self, base: dict):
+        object.__setattr__(self, "_data", dict(base))
+
+    def __getattr__(self, name):
+        try:
+            return self._data[name]
+        except KeyError:
+            raise AttributeError(f"JobConfig has no attribute {name!r}")
+
+    def __setattr__(self, name, value):
+        if name == "_data":
+            object.__setattr__(self, name, value)
+            return
+        self._data[name] = value
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+    def keys(self):
+        return self._data.keys()
+
+    def to_dict(self):
+        return dict(self._data)
+
+
+_active_job_config: contextvars.ContextVar = contextvars.ContextVar(
+    "whocord_active_job_config", default=None,
+)
+
+
+def set_active_config(cfg: JobConfig):
+    return _active_job_config.set(cfg)
+
+
+def reset_active_config(token) -> None:
+    _active_job_config.reset(token)
+
+
+def get_active_config():
+    return _active_job_config.get()
+
+
+def get_flag(name: str, default: bool = False) -> bool:
+    cfg = _active_job_config.get()
+    if cfg is not None:
+        val = cfg.get(name, None)
+        if val is not None:
+            return bool(val)
+    return bool(globals().get(name, default))

@@ -2,21 +2,19 @@
 discord_osint/pipeline/stages/analysis.py
 ------------------------------------------
 AnalysisStage – WHOIS lookups, Wayback Machine, GitFive, name
-analysis, location/language inference, and identity confidence scoring.
+analysis, location/language inference, identity confidence scoring,
+and activity-pattern inference.
 
-This stage runs after scraping so it can work with the full set of
-collected intel.
-
-Reads from ctx
---------------
-ctx.intel_core.intel   – all gathered data
-ctx.all_urls           – to find GitHub usernames and blog domains
-
-Writes to ctx
--------------
-ctx.intel_core         – WHOIS, wayback, gitfive emails/names,
-                          name analysis, location, language,
-                          confidence_scores
+Change log
+----------
+- Phase 4: activity-pattern inference. After location and language
+  have been inferred, ``infer_activity_profile`` runs against the
+  timestamps already present in intel and writes
+  ``identity_clues["inferred_timezone"]``, ``identity_clues["active_hours"]``,
+  and ``identity_clues["posting_cadence"]``. Pure analysis — no new
+  data sources, no network calls.
+- Reads from ctx.intel_core.intel, ctx.all_urls.
+- Writes to ctx.intel_core.
 """
 
 from __future__ import annotations
@@ -32,7 +30,9 @@ from ...scraping import (
 from ...extras import whois_domain, wayback_available, infer_location, detect_language
 from ...scraping import run_gitfive
 from ...reporting import calculate_identity_confidence, run_name_analysis
+from ...intelligence.activity import infer_activity_profile
 from ...utils import tool_available, install_package
+
 
 class AnalysisStage(Stage):
     name = "analysis"
@@ -90,7 +90,6 @@ class AnalysisStage(Stage):
                 if pl == "github" and sl and is_likely_github_user(sl):
                     github_slugs.add(sl)
 
-            # Auto‑install gitfive if missing
             if not tool_available("gitfive"):
                 print("  gitfive not found – attempting to install via pip …")
                 if install_package("gitfive"):
@@ -116,7 +115,7 @@ class AnalysisStage(Stage):
                     )
 
         # ------------------------------------------------------------------ #
-        # 4. Name analysis (NameTrace + RapidFuzz)                           #
+        # 4. Name analysis (NameTrace + RapidFuzz)                            #
         # ------------------------------------------------------------------ #
         if cfg.ENABLE_NAME_ANALYSIS:
             print("\n-- Name analysis --")
@@ -169,7 +168,12 @@ class AnalysisStage(Stage):
                     print(f"  Detected language: {lang}")
 
         # ------------------------------------------------------------------ #
-        # 6. Confidence scoring (always runs)                                 #
+        # 6. Activity-pattern inference (Phase 4)                             #
+        # ------------------------------------------------------------------ #
+        self._infer_activity(ctx, emit)
+
+        # ------------------------------------------------------------------ #
+        # 7. Confidence scoring (always runs)                                 #
         # ------------------------------------------------------------------ #
         print("\n-- Identity confidence scoring --")
         scores = calculate_identity_confidence(intel)
@@ -179,3 +183,64 @@ class AnalysisStage(Stage):
             print(f"  Top identity candidate: {top.get('name')} "
                   f"(score {top.get('score')})")
             emit("finding", {"type": "confidence_scores", "data": scores})
+
+    # ------------------------------------------------------------------ #
+    # Activity-pattern inference
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _infer_activity(ctx: InvestigationContext, emit: EmitFn) -> None:
+        print("\n-- Activity-pattern inference --")
+        emit("progress", {"message": "Inferring activity pattern"})
+
+        try:
+            result = infer_activity_profile(ctx.intel_core.intel)
+        except Exception as exc:
+            print(f"  Activity inference error: {exc}")
+            return
+
+        if not result.has_signal:
+            print(f"  Not enough timestamped activity to infer a timezone "
+                  f"(sample size {result.sample_size}).")
+            return
+
+        if result.inferred_utc_offset_min is not None:
+            ctx.intel_core.add_intel(
+                "identity_clues", "inferred_timezone",
+                result.inferred_utc_offset_str,
+                source="activity_inference",
+            )
+        if result.active_hours:
+            ctx.intel_core.add_intel(
+                "identity_clues", "active_hours",
+                result.active_hours,
+                source="activity_inference",
+            )
+        if result.posting_cadence:
+            ctx.intel_core.add_intel(
+                "identity_clues", "posting_cadence",
+                result.posting_cadence,
+                source="activity_inference",
+            )
+
+        # Store the full result for the report.
+        ctx.intel_core.intel["activity_profile"] = result.to_dict()
+
+        emit("finding", {
+            "type":       "activity_profile",
+            "offset":     result.inferred_utc_offset_str,
+            "active":     result.active_hours,
+            "cadence":    result.posting_cadence,
+            "confidence": result.confidence,
+            "sample":     result.sample_size,
+        })
+
+        bits: list[str] = [result.inferred_utc_offset_str]
+        if result.inferred_timezone_hint:
+            bits.append(f"({result.inferred_timezone_hint})")
+        if result.active_hours:
+            bits.append(f"active {result.active_hours}")
+        if result.posting_cadence:
+            bits.append(f"{result.posting_cadence} cadence")
+        bits.append(f"confidence={result.confidence}")
+        print(f"  Inferred: {' '.join(bits)}")

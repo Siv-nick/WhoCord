@@ -3,33 +3,22 @@ discord_osint/enrichment/apollo_client.py
 -----------------------------------------
 Apollo.io people-enrichment client.
 
+Change log
+----------
+- Phase 5: requests calls route through the shared ``http_session``
+  from ``discord_osint.utils``. The shared session carries a
+  ``Retry`` adapter that retries on 429/5xx with exponential backoff,
+  so a transient rate-limit response from Apollo no longer fails the
+  batch. Connection pooling across the two endpoints is a secondary
+  benefit.
+
 Endpoint facts (as of the current docs):
 
 * ``POST /api/v1/people/bulk_match`` enriches up to **10** people per call.
 * Auth header is ``x-api-key: <key>``.
 * Accepted input identifiers: ``email``, ``linkedin_url``, ``name`` +
-  ``domain`` / ``organization_name``, ``id`` (Apollo person ID),
-  ``hashed_email``. **Phones are not an input** — they can only be
-  *revealed* on a person already matched.
-* Credit cost: 1–9 credits per person, **charged only when
-  credit-consuming data is found**. A miss costs 0 credits.
-* ``reveal_phone_number=true`` requires a webhook and delivers phone
-  numbers asynchronously, so this client leaves it off and relies on
-  whatever phones are already attached to the matched profile.
-
-Response shape (standard, non-waterfall)::
-
-    {
-      "status": "success",
-      "total_requested_enrichments": N,
-      "unique_enriched_records":    M,
-      "missing_records":            K,
-      "credits_consumed":           <decimal>,
-      "matches": [ { person object }, ... ]
-    }
-
-A 200 response with ``missing_records == N`` and an empty ``matches``
-array is a clean "nobody matched" — not an error.
+  ``domain`` / ``organization_name``, ``id``, ``hashed_email``.
+* Credit cost: 1–9 credits per person, charged only on a hit.
 """
 
 from __future__ import annotations
@@ -37,7 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import requests
+from ..utils import http_session
 
 try:
     from ..utils import log_trace
@@ -72,16 +61,12 @@ class ApolloClient:
         self.api_key = (api_key or "").strip()
         self.timeout = timeout
 
-    # ------------------------------------------------------------------ #
-    # Internal
-    # ------------------------------------------------------------------ #
-
     def _headers(self) -> dict:
         return {
-            "x-api-key":    self.api_key,
-            "Content-Type": "application/json",
+            "x-api-key":     self.api_key,
+            "Content-Type":  "application/json",
             "Cache-Control": "no-cache",
-            "Accept":       "application/json",
+            "Accept":        "application/json",
         }
 
     # ------------------------------------------------------------------ #
@@ -90,13 +75,8 @@ class ApolloClient:
 
     def enrich(self, identifiers: list[Any]) -> ApolloEnrichmentResult:
         """
-        Submit *identifiers* (trust-filter survivors) in batches of
-        ``_BULK_MAX``. Returns a merged result.
-
-        Each identifier must expose ``.kind`` and ``.value``. Phones are
-        already filtered out upstream — if one slips through it is
-        dropped here with a debug-log line rather than rejected by the
-        API.
+        Submit *identifiers* in batches of ``_BULK_MAX``. Returns a
+        merged result.
         """
         if not identifiers:
             return ApolloEnrichmentResult([], 0, 0.0, {})
@@ -119,21 +99,18 @@ class ApolloClient:
 
             body = {
                 "details": details,
-                # Work emails are returned by default; personal-email
-                # reveal is off to keep credit usage predictable.
                 "reveal_personal_emails": False,
-                # Phone reveal requires a webhook — deliberately off.
-                "reveal_phone_number": False,
+                "reveal_phone_number":    False,
             }
 
             try:
-                resp = requests.post(
+                resp = http_session.post(
                     _BULK_MATCH,
                     headers=self._headers(),
                     json=body,
                     timeout=self.timeout,
                 )
-            except requests.RequestException as exc:
+            except Exception as exc:
                 log_trace(f"apollo: network error on bulk_match: {exc}")
                 print(f"  [!] Apollo: network error ({exc}) — skipping batch.")
                 continue
@@ -149,9 +126,11 @@ class ApolloClient:
                 raise ApolloCreditError("Apollo credit balance exhausted")
 
             if resp.status_code == 429:
+                # The shared session's Retry adapter already backed off;
+                # if we're still here, retries are exhausted for this batch.
                 retry = resp.headers.get("Retry-After", "?")
                 log_trace(f"apollo: 429 rate limited (Retry-After={retry}).")
-                print(f"  [!] Apollo: rate limited — skipping batch.")
+                print("  [!] Apollo: rate limited — skipping batch.")
                 continue
 
             if resp.status_code != 200:
@@ -185,7 +164,6 @@ class ApolloClient:
 
     @staticmethod
     def _identifier_to_detail(ident: Any) -> dict | None:
-        """Map a trust-filter Identifier onto an Apollo ``details[]`` entry."""
         kind  = getattr(ident, "kind", "")
         value = (getattr(ident, "value", "") or "").strip()
         if not value:
@@ -194,7 +172,6 @@ class ApolloClient:
             return {"email": value}
         if kind == "linkedin":
             return {"linkedin_url": value}
-        # Phones are not an Apollo input — drop with a trace.
         log_trace(f"apollo: dropping unsupported identifier kind={kind!r}")
         return None
 
@@ -203,22 +180,14 @@ class ApolloClient:
     # ------------------------------------------------------------------ #
 
     def get_credit_balance(self) -> dict | None:
-        """
-        Return ``{"lead": int|None, "direct_dial": int|None, ...}`` or
-        ``None`` when the check could not be performed.
-
-        Uses ``GET /users/api_profile?include_credit_usage=true``. A
-        ``None`` return means "unknown", not "zero" — callers must treat
-        it as "proceed, but watch for 402".
-        """
         try:
-            resp = requests.get(
+            resp = http_session.get(
                 _PROFILE_URL,
                 headers=self._headers(),
                 params={"include_credit_usage": "true"},
                 timeout=self.timeout,
             )
-        except requests.RequestException as exc:
+        except Exception as exc:
             log_trace(f"apollo: credit-balance network error: {exc}")
             return None
 
@@ -253,19 +222,14 @@ class ApolloClient:
         }
 
     def test_connection(self) -> dict:
-        """
-        Return ``{"ok": bool, "balance": dict|None, "error": str|None}``.
-
-        Uses the 0-credit profile endpoint so the test never spends.
-        """
         try:
-            resp = requests.get(
+            resp = http_session.get(
                 _PROFILE_URL,
                 headers=self._headers(),
                 params={"include_credit_usage": "true"},
                 timeout=self.timeout,
             )
-        except requests.RequestException as exc:
+        except Exception as exc:
             return {"ok": False, "balance": None, "error": f"network error: {exc}"}
 
         if resp.status_code == 401:
